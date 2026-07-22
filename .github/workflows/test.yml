@@ -10,6 +10,10 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      # ffprobe is a HARD dependency of the media pool generator: it is what tells an
+      # animation from a video, and Telegram treats those differently. Without it every
+      # file is skipped and the manifest comes out empty.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - run: pnpm install --frozen-lockfile
       - run: nproc
       - run: pnpm test

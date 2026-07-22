@@ -140,6 +140,33 @@ async function ffprobe(file: string): Promise<Probed> {
   };
 }
 
+/**
+ * Did ffprobe FAIL TO RUN, or did it run and RETURN A VERDICT?
+ *
+ * This is the whole of the environment/file distinction (Phase 5a.1). An empty
+ * manifest is a LIE when the tool never ran — the pool may be full — and the TRUTH
+ * when it ran and rejected the file. The two must never resolve to the same object,
+ * so they must be told apart at the point of failure, not counted after the fact.
+ *
+ * The shapes are exact, verified against Node's child_process:
+ *   - spawn/stdio error  -> STRING errno `code`   (ENOENT, EACCES, EPERM,
+ *                           ERR_CHILD_PROCESS_STDIO_MAXBUFFER)   -> tool never ran
+ *   - killed by a signal -> `signal` set / `killed === true` (incl. timeout) -> ran, no verdict
+ *   - exited non-zero    -> NUMERIC `code`                        -> ran, gave a verdict (FILE)
+ *   - our own post-run
+ *     validation throw    -> no `code`, no `signal`               -> exited 0, we rejected it (FILE)
+ *
+ * So: a numeric exit code (or no code at all) is a verdict; anything else is the
+ * environment. Default is NOT environment — a bare Error we cannot classify came
+ * from a process that ran, so it is a FILE verdict and never wedges the timer.
+ */
+function isEnvironmentFailure(err: unknown): boolean {
+  const e = err as { code?: unknown; signal?: unknown; killed?: unknown };
+  if (e.signal != null || e.killed === true) return true; // killed by a signal, or timed out
+  if (typeof e.code === 'string') return true; // spawn/stdio errno — the tool never ran
+  return false; // numeric exit code, or a plain post-run throw: ffprobe returned a verdict
+}
+
 function kindFor(ext: string, hasAudio: boolean): MediaKind | null {
   if (PHOTO_EXTS.has(ext)) return 'photo';
   if (ext === '.gif') return 'animation';
@@ -214,13 +241,25 @@ export async function buildManifest(opts: BuildOptions): Promise<BuildResult> {
   }
   for (const [sha, label] of opts.labels ?? []) labelBySha.set(sha, label);
 
-  const bySha = new Map<string, ManifestItem>();
+  /** sha256 -> where we first saw it. Populated BEFORE ffprobe, so duplicate detection
+   *  does not depend on either copy being probeable. */
+  const seenBySha = new Map<string, { rel_path: string; tier: Tier; name: string }>();
+  const collected: ManifestItem[] = [];
+  /**
+   * Skips where the TOOL ITSELF failed — ffprobe missing, unrunnable, killed, timed
+   * out. Each is proof we learned nothing about that file. ANY entry here makes the
+   * whole run refuse to write, regardless of how many other files got through: a
+   * partial environment failure is still an environment failure. FILE-class skips
+   * (a verdict was reached) never land here and never throw.
+   */
+  const environmentFailures: string[] = [];
 
   for (const tier of TIER_DIRS) {
     const tierDir = path.join(mintDir, tier);
 
     for (const entry of await listDir(tierDir)) {
       const rel = path.join(opts.mint, tier, entry.name);
+      const relPosix = rel.split(path.sep).join('/');
 
       if (entry.isDirectory()) {
         throw new PoolError(
@@ -245,19 +284,15 @@ export async function buildManifest(opts: BuildOptions): Promise<BuildResult> {
         continue;
       }
 
-      let probed: Probed;
-      try {
-        probed = await ffprobe(file);
-      } catch (err) {
-        warn(`skip ${rel}: ffprobe could not parse it (${(err as Error).message.split('\n')[0]})`);
-        continue;
-      }
-
-      const kind = kindFor(ext, probed.hasAudio);
-      if (kind === null) {
-        warn(`skip ${rel}: unsupported extension ${ext}`);
-        continue;
-      }
+      // ---- CHEAP CHECKS FIRST. Nothing below here spawns a subprocess. ----
+      //
+      // Both of the next two checks are pure hash/filename comparisons, and both
+      // used to sit DOWNSTREAM of the ffprobe spawn. That cost more than time:
+      //   - a misnamed `foo.gif` was reported as "ffprobe could not parse it",
+      //     which names the wrong defect and sends the curator to the wrong fix;
+      //   - the duplicate check, specified as a HARD ERROR, failed OPEN whenever
+      //     both copies happened to be skipped by ffprobe first.
+      // A check that fails closed by design must not sit behind one that can skip.
 
       const sha256 = await sha256File(file);
 
@@ -269,10 +304,11 @@ export async function buildManifest(opts: BuildOptions): Promise<BuildResult> {
       // no amount of curation reaches it. Content-addressed names make that
       // impossible by construction: different bytes, different URL.
       //
-      // So a file whose name is not its hash is not published. Skipped, not fatal:
-      // the manifest keeps regenerating (the 5-min timer must not wedge because
-      // someone dropped a file in by hand) and the file is simply never served,
-      // which is the safe side of the line.
+      // So a file whose name is not its hash is not published — skipped, not fatal,
+      // and it never reaches ffprobe. This is a FILE-class skip: we reached a verdict
+      // about the file (its name is wrong) with no tool involved. It NEVER throws, not
+      // even as the only file in the pool — that is a truthful empty manifest, and one
+      // hand-dropped file must never wedge the 5-minute timer (Phase 5a.1).
       const expected = contentName(sha256, ext);
       if (entry.name !== expected) {
         warn(
@@ -283,20 +319,6 @@ export async function buildManifest(opts: BuildOptions): Promise<BuildResult> {
         continue;
       }
 
-      // Key order here IS the key order in the JSON. Keep it stable.
-      const item: ManifestItem = {
-        sha256,
-        tier,
-        rel_path: rel.split(path.sep).join('/'),
-        ...(labelBySha.has(sha256) ? { label: labelBySha.get(sha256) as string } : {}),
-        kind,
-        bytes: st.size,
-        width: probed.width,
-        height: probed.height,
-        ...(kind === 'photo' || probed.durationMs === null ? {} : { duration_ms: probed.durationMs }),
-        added_at: addedAtBySha.get(sha256) ?? Math.floor(st.mtimeMs),
-      };
-
       // The same bytes in two tiers is ONE item (identity is the content — it is the
       // file_id cache key, invariant 3) with TWO tiers, and no rule can pick between
       // them that is not a guess. Picking quietly would put a meme in a tier its
@@ -304,21 +326,93 @@ export async function buildManifest(opts: BuildOptions): Promise<BuildResult> {
       //
       // tier.ts refuses to create this in the first place, so reaching here means the
       // pool was edited by hand. The manifest on disk is left exactly as it was.
-      const prior = bySha.get(sha256);
+      const prior = seenBySha.get(sha256);
       if (prior) {
         throw new PoolError(
           `the same content is in two tiers:\n` +
             `    ${prior.rel_path}   (${prior.tier})\n` +
-            `    ${rel.split(path.sep).join('/')}   (${tier})\n` +
+            `    ${relPosix}   (${tier})\n` +
             `  One meme, one tier. Archive the one you do not want:\n` +
             `    tier archive ${entry.name}`,
         );
       }
-      bySha.set(sha256, item);
+      seenBySha.set(sha256, { rel_path: relPosix, tier, name: entry.name });
+
+      // ---- EXPENSIVE CHECK. Only content-addressed, non-duplicate files get here. ----
+      let probed: Probed;
+      try {
+        probed = await ffprobe(file);
+      } catch (err) {
+        const detail = (err as Error).message.split('\n')[0];
+        if (isEnvironmentFailure(err)) {
+          // The tool never returned a verdict. We did NOT learn this file is bad, so
+          // dropping it is not a fact — it is a hole. Record it; the run will refuse
+          // to write below rather than publish a manifest missing a file that may be
+          // perfectly good.
+          warn(`skip ${rel}: ffprobe FAILED TO RUN (${detail}) — environment fault, not a bad file`);
+          environmentFailures.push(`${rel}: ${detail}`);
+        } else {
+          // ffprobe ran and rejected it (or produced no usable stream). A verdict.
+          warn(`skip ${rel}: ffprobe could not parse it (${detail})`);
+        }
+        continue;
+      }
+
+      const kind = kindFor(ext, probed.hasAudio);
+      if (kind === null) {
+        warn(`skip ${rel}: unsupported extension ${ext}`);
+        continue;
+      }
+
+      // Key order here IS the key order in the JSON. Keep it stable.
+      collected.push({
+        sha256,
+        tier,
+        rel_path: relPosix,
+        ...(labelBySha.has(sha256) ? { label: labelBySha.get(sha256) as string } : {}),
+        kind,
+        bytes: st.size,
+        width: probed.width,
+        height: probed.height,
+        ...(kind === 'photo' || probed.durationMs === null ? {} : { duration_ms: probed.durationMs }),
+        added_at: addedAtBySha.get(sha256) ?? Math.floor(st.mtimeMs),
+      });
     }
   }
 
-  const items = [...bySha.values()].sort((a, b) => (a.sha256 < b.sha256 ? -1 : a.sha256 > b.sha256 ? 1 : 0));
+  /**
+   * CORRUPT AND EMPTY MUST NOT PRODUCE THE SAME OBJECT (the Phase 6 rule), enforced on
+   * the WRITER — where it does the damage — and decided by the REASON a file was
+   * skipped, never by the count.
+   *
+   * The rule: if the TOOL failed to run on even one file, refuse to write. An ffprobe
+   * that is missing, unrunnable, killed or timed out taught us nothing about that file,
+   * so any manifest built without it is missing rows it has no basis to omit — a lie
+   * about a pool that may be full. That holds whether it failed on all files or on one
+   * of fifty; a partial environment failure still corrupts the output silently.
+   *
+   * Left intact: the previous manifest. A stale manifest serves the right memes; an
+   * empty one serves none. On the VPS the alternative is the 5-minute timer quietly
+   * blanking every rotation bag and dropping both websites to hardcoded art.
+   *
+   * What does NOT throw: FILE-class skips (wrong name, over the ceiling, bytes that do
+   * not match the name, ffprobe running and rejecting the file). Those are verdicts. A
+   * pool that reduces to zero items purely through FILE skips writes a TRUTHFUL empty
+   * manifest — including the one-hand-dropped-file case the count-based guard used to
+   * throw on, in violation of Phase 5a.1. A genuinely empty pool writes empty, as ever.
+   */
+  if (environmentFailures.length > 0) {
+    throw new PoolError(
+      `ffprobe FAILED TO RUN on ${environmentFailures.length} file(s) — a BROKEN ENVIRONMENT, not bad files.\n` +
+        `  No manifest was written and the previous one is left intact, because a skip here is\n` +
+        `  a hole, not a verdict: these files may be perfectly good and we could not tell.\n` +
+        `  The usual cause is a missing or broken ffprobe:  apt install ffmpeg\n` +
+        `  Failures:\n` +
+        environmentFailures.map((f) => `    - ${f}`).join('\n'),
+    );
+  }
+
+  const items = collected.sort((a, b) => (a.sha256 < b.sha256 ? -1 : a.sha256 > b.sha256 ? 1 : 0));
 
   const tiers = Object.fromEntries(
     TIER_DIRS.map((t) => [t, items.filter((i) => i.tier === t).length]),

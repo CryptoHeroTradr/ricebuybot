@@ -219,13 +219,18 @@ describe('skips (warn, never fail the run)', () => {
   });
 
   it('skips a file ffprobe cannot parse', async () => {
-    await put('regular', 'corrupt.png', Buffer.from('this is not a png'));
+    // Content-addressed but unparseable, so it gets PAST the filename check and is
+    // genuinely rejected by ffprobe. (It used to be called `corrupt.png`, which now
+    // fails the cheaper content-addressing check first and never reaches ffprobe —
+    // correct, but it would have made this test assert the wrong rejection.)
+    const GARBAGE = Buffer.from('this is not a png');
+    await put('regular', addressed(GARBAGE, '.png'), GARBAGE);
     await put('regular', addressed(GIF_1X1, '.gif'), GIF_1X1);
 
     const { manifest, warnings } = await buildManifest({ root, mint: MINT });
 
     expect(manifest.count).toBe(1);
-    expect(warnings.join('\n')).toMatch(/corrupt\.png.*ffprobe/);
+    expect(warnings.join('\n')).toMatch(new RegExp(`${sha(GARBAGE)}\\.png.*ffprobe`));
   });
 
   it('skips an unsupported extension', async () => {
@@ -239,23 +244,253 @@ describe('skips (warn, never fail the run)', () => {
   it('skips a file that is not named after its own hash', async () => {
     // The immutable one-year cache is safe ONLY because a URL cannot come to mean
     // different bytes. A file called foo.gif can. So it is never published.
+    //
+    // A good meme sits alongside it so the pool is not left with NOTHING publishable —
+    // that is the all-skipped state, which is now a hard error (a broken environment,
+    // not an empty pool). One hand-dropped file in a real pool must still only warn.
     await put('regular', 'foo.gif', GIF_1X1);
+    await put('whale', addressed(PNG_1X1, '.png'), PNG_1X1);
 
     const { manifest, warnings } = await buildManifest({ root, mint: MINT });
 
-    expect(manifest.count).toBe(0);
-    expect(warnings.join('\n')).toMatch(/not content-addressed/);
+    expect(manifest.count).toBe(1);
+    expect(manifest.items[0]!.sha256).toBe(sha(PNG_1X1)); // foo.gif is not in it
+    expect(warnings.join('\n')).toMatch(/foo\.gif.*not content-addressed/s);
   });
 
   it('skips a content-addressed file whose bytes no longer match its name', async () => {
     // Someone replaced the bytes under a hash filename. That is the exact attack
     // the immutable cache cannot survive, so it must never reach the manifest.
     await put('massive', `${sha(GIF_1X1)}.gif`, PNG_1X1);
+    await put('whale', addressed(GIF_1X1, '.gif'), GIF_1X1);
 
     const { manifest, warnings } = await buildManifest({ root, mint: MINT });
 
-    expect(manifest.count).toBe(0);
+    expect(manifest.count).toBe(1);
+    expect(manifest.items[0]!.tier).toBe('whale'); // the tampered massive/ copy is out
     expect(warnings.join('\n')).toMatch(/not content-addressed/);
+  });
+}, { timeout: SUBPROCESS_TIMEOUT_MS });
+
+/**
+ * THE WRITER SIDE OF THE PHASE 6 RULE — "a malformed manifest is an error, not an
+ * empty pool; corrupt and empty must not produce the same object" — decided by the
+ * REASON a file was skipped, never by a count.
+ *
+ * The line is environment vs file. An ENVIRONMENT skip (ffprobe missing, unrunnable,
+ * killed, timed out) taught us nothing about the file; an empty manifest built around
+ * it is a LIE about a pool that may be full, and on the VPS the 5-minute timer would
+ * silently replace a good manifest with it, blanking every rotation bag. A FILE skip
+ * (wrong name, over the ceiling, ffprobe ran and rejected it) is a verdict; an empty
+ * manifest built from those is the TRUTH. So: ANY environment skip throws, no matter
+ * how many files got through; FILE skips never throw, no matter how many there are.
+ *
+ * These tests break ffprobe for real by shadowing PATH — the actual failure mode, not
+ * a mock of it — and distinguish the two classes rather than counting skips.
+ */
+describe('a broken environment is not an empty pool', () => {
+  const REAL_FFPROBE = execSync('command -v ffprobe', { encoding: 'utf8' }).trim();
+
+  /** A 1x1 GIF made unique by an embedded comment block — distinct bytes, distinct sha,
+   *  still parses cleanly. Lets a test seed MANY good, distinct, content-addressed files. */
+  function distinctGif(i: number): Buffer {
+    const body = GIF_1X1.subarray(0, GIF_1X1.length - 1); // drop the trailing 0x3B trailer
+    const comment = Buffer.from([0x21, 0xfe, 0x02, i & 0xff, (i >> 8) & 0xff, 0x00]);
+    return Buffer.concat([body, comment, Buffer.from([0x3b])]);
+  }
+
+  async function seedGoodGifs(tier: string, n: number): Promise<void> {
+    for (let i = 0; i < n; i++) {
+      const bytes = distinctGif(i);
+      await put(tier, addressed(bytes, '.gif'), bytes);
+    }
+  }
+
+  /** Run `fn` with PATH pointing at `binDir` only. Restored even if fn throws. */
+  async function withPath<T>(binDir: string, fn: () => Promise<T>): Promise<T> {
+    const saved = process.env.PATH;
+    process.env.PATH = binDir;
+    try {
+      return await fn();
+    } finally {
+      process.env.PATH = saved;
+    }
+  }
+
+  /** A PATH containing no ffprobe at all — `spawn ffprobe ENOENT`, exactly like CI hit. */
+  async function emptyBin(): Promise<string> {
+    const bin = await mkdtemp(path.join(tmpdir(), 'ricebin-'));
+    return bin;
+  }
+
+  /** A PATH whose ffprobe logs every invocation, then delegates to the real one. */
+  async function countingBin(): Promise<{ bin: string; calls: () => Promise<number> }> {
+    const bin = await mkdtemp(path.join(tmpdir(), 'ricebin-'));
+    const logFile = path.join(bin, 'calls.log');
+    await writeFile(path.join(bin, 'ffprobe'), `#!/bin/sh\necho call >> ${logFile}\nexec ${REAL_FFPROBE} "$@"\n`, {
+      mode: 0o755,
+    });
+    return {
+      bin,
+      calls: async () =>
+        (await readFile(logFile, 'utf8').catch(() => '')).split('\n').filter((l) => l.trim() !== '').length,
+    };
+  }
+
+  /**
+   * A PATH whose ffprobe DIES BY SIGNAL for any file whose path contains `marker`, and
+   * runs the real ffprobe for every other file. A signal death is an environment failure
+   * (the process gave no verdict) — the classifier keys on `signal`/`killed`, not on the
+   * particular errno — so this stages a PARTIAL failure: some files collect, one does not.
+   */
+  async function killOnBin(marker: string): Promise<string> {
+    const bin = await mkdtemp(path.join(tmpdir(), 'ricebin-'));
+    await writeFile(
+      path.join(bin, 'ffprobe'),
+      `#!/bin/sh\ncase "$*" in\n  *${marker}*) kill -TERM $$ ;;\n  *) exec ${REAL_FFPROBE} "$@" ;;\nesac\n`,
+      { mode: 0o755 },
+    );
+    return bin;
+  }
+
+  it('THROWS naming ENVIRONMENT and ffprobe, leaving the previous manifest intact', async () => {
+    await put('massive', addressed(GIF_1X1, '.gif'), GIF_1X1);
+    await put('regular', addressed(PNG_1X1, '.png'), PNG_1X1);
+
+    // A good run first — this is the manifest that must survive.
+    const good = await generate({ root, mint: MINT });
+    expect(good.manifest.count).toBe(2);
+    const onDisk = path.join(root, MINT, 'manifest.json');
+    const before = await readFile(onDisk, 'utf8');
+
+    // Now ffmpeg "breaks". Every spawn is `ffprobe ENOENT` — an ENVIRONMENT failure.
+    await withPath(await emptyBin(), async () => {
+      await expect(generate({ root, mint: MINT })).rejects.toThrow(PoolError);
+      await expect(generate({ root, mint: MINT })).rejects.toThrow(/FAILED TO RUN/);
+      await expect(generate({ root, mint: MINT })).rejects.toThrow(/BROKEN ENVIRONMENT/);
+      // It names the fix, because the operator seeing this is looking at a dead pool.
+      await expect(generate({ root, mint: MINT })).rejects.toThrow(/apt install ffmpeg/);
+    });
+
+    // THE POINT: a stale manifest serves the right memes; an empty one serves none.
+    expect(await readFile(onDisk, 'utf8')).toBe(before);
+    expect(JSON.parse(before).count).toBe(2);
+  });
+
+  it('THROWS on an environment failure even with 50 good files present', async () => {
+    // The count-based guard would also throw here (0 collected), but for the wrong
+    // reason. Assert the class: it is ffprobe failing to RUN, not the pool being empty.
+    await seedGoodGifs('regular', 50);
+    await withPath(await emptyBin(), async () => {
+      await expect(generate({ root, mint: MINT })).rejects.toThrow(/FAILED TO RUN on 50 file/);
+      await expect(generate({ root, mint: MINT })).rejects.toThrow(/apt install ffmpeg/);
+    });
+  });
+
+  it('THROWS on a PARTIAL failure — one spawn dies while the rest succeed', async () => {
+    // THE case the count-based guard cannot see: collected.length > 0 and STILL a hole.
+    // One file's ffprobe is killed by a signal (environment); the other two probe fine.
+    const doomed = distinctGif(999);
+    const doomedName = addressed(doomed, '.gif');
+    await put('regular', doomedName, doomed);
+    await put('big', addressed(distinctGif(1), '.gif'), distinctGif(1));
+    await put('whale', addressed(distinctGif(2), '.gif'), distinctGif(2));
+
+    // Sanity: with a healthy ffprobe all three collect. The failure below is the env, not the files.
+    expect((await buildManifest({ root, mint: MINT })).manifest.count).toBe(3);
+
+    await withPath(await killOnBin(doomedName), async () => {
+      // Two files probed fine, so collected.length === 2 — yet the run still refuses,
+      // because one file's verdict was never reached.
+      await expect(generate({ root, mint: MINT })).rejects.toThrow(PoolError);
+      await expect(generate({ root, mint: MINT })).rejects.toThrow(/FAILED TO RUN on 1 file/);
+    });
+
+    // And it wrote nothing: no manifest was ever generated for this pool.
+    await expect(stat(path.join(root, MINT, 'manifest.json'))).rejects.toThrow();
+  });
+
+  it('leaves NO temp file behind when it refuses to write', async () => {
+    await put('massive', addressed(GIF_1X1, '.gif'), GIF_1X1);
+    await withPath(await emptyBin(), async () => {
+      await expect(generate({ root, mint: MINT })).rejects.toThrow(PoolError);
+    });
+    const entries = await readdir(path.join(root, MINT));
+    expect(entries.filter((e) => e.includes('tmp'))).toEqual([]);
+  });
+
+  it('a GENUINELY empty pool still writes an empty manifest — that IS a valid state', async () => {
+    // Zero files on disk, so zero skips of any class. Nothing is broken; the pool is
+    // simply not stocked yet. No environment failure -> a truthful empty manifest.
+    await withPath(await emptyBin(), async () => {
+      const { manifest } = await generate({ root, mint: MINT });
+      expect(manifest.count).toBe(0);
+      expect(manifest.items).toEqual([]);
+    });
+    const written = JSON.parse(await readFile(path.join(root, MINT, 'manifest.json'), 'utf8'));
+    expect(written.count).toBe(0);
+  });
+
+  it('a FILE skip NEVER throws — the ONLY file being misnamed writes a truthful empty manifest', async () => {
+    // THE invariant the count-based guard violated (Phase 5a.1): one hand-dropped,
+    // non-content-addressed file must never wedge the timer. It is a FILE-class skip —
+    // a verdict, reached with no tool — so an empty result is the TRUTH, not an error.
+    await put('regular', 'foo.gif', GIF_1X1);
+
+    const { manifest, warnings } = await generate({ root, mint: MINT });
+    expect(manifest.count).toBe(0);
+    expect(warnings.join('\n')).toMatch(/foo\.gif.*not content-addressed/s);
+
+    const written = JSON.parse(await readFile(path.join(root, MINT, 'manifest.json'), 'utf8'));
+    expect(written.count).toBe(0); // it WROTE — did not throw
+  });
+
+  it('50 good files plus one misnamed writes 50, warns once, does not throw', async () => {
+    await seedGoodGifs('regular', 50);
+    await put('whale', 'foo.gif', PNG_1X1); // FILE-class skip alongside the 50
+
+    const { manifest, warnings } = await generate({ root, mint: MINT });
+    expect(manifest.count).toBe(50);
+    expect(warnings.filter((w) => /not content-addressed/.test(w))).toHaveLength(1);
+  });
+
+  it('a stray non-media file is a FILE skip, so it cannot wedge the timer', async () => {
+    // Unsupported extension is a verdict reached before any tool runs — never environment.
+    await put('regular', 'notes.txt', Buffer.from('hello'));
+    await withPath(await emptyBin(), async () => {
+      const { manifest } = await generate({ root, mint: MINT });
+      expect(manifest.count).toBe(0);
+    });
+  });
+
+  it('checks content-addressing BEFORE spawning ffprobe — and never spawns it for a bad name', async () => {
+    await put('regular', 'foo.gif', GIF_1X1); // not content-addressed
+    await put('whale', addressed(PNG_1X1, '.png'), PNG_1X1); // good
+
+    const { bin, calls } = await countingBin();
+    const warnings = await withPath(bin, async () => (await buildManifest({ root, mint: MINT })).warnings);
+
+    // It names the ACTUAL defect, not "ffprobe could not parse it".
+    expect(warnings.join('\n')).toMatch(/foo\.gif.*not content-addressed/s);
+    expect(warnings.join('\n')).not.toMatch(/foo\.gif.*ffprobe/s);
+
+    // The assertion with teeth: exactly ONE spawn, for the one good file. The filename
+    // check is a hash comparison and needs no subprocess, so a bad name costs nothing.
+    expect(await calls()).toBe(1);
+  });
+
+  it('detects a duplicate across two tiers even when ffprobe is unavailable', async () => {
+    // A check specified to FAIL CLOSED must not sit behind one that can skip. It used
+    // to: both copies were skipped by ffprobe first, and build() RESOLVED.
+    await put('regular', `${sha(GIF_1X1)}.gif`, GIF_1X1);
+    await put('massive', `${sha(GIF_1X1)}.gif`, GIF_1X1);
+
+    await withPath(await emptyBin(), async () => {
+      await expect(build()).rejects.toThrow(PoolError);
+      await expect(build()).rejects.toThrow(/same content is in two tiers/);
+      await expect(build()).rejects.toThrow(/regular/);
+      await expect(build()).rejects.toThrow(/massive/);
+    });
   });
 }, { timeout: SUBPROCESS_TIMEOUT_MS });
 
