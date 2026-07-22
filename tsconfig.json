@@ -1,0 +1,42 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    // WIDENED from "src" so that scripts/ is type-checked and can import the pool
+    // primitives in src/media/pool.ts. Emitted output therefore lands at
+    // dist/src/... and dist/scripts/... — package.json, pm2.config.cjs and
+    // copy-migrations.mjs all point at dist/src/index.js accordingly.
+    "rootDir": ".",
+    "outDir": "dist",
+
+    // The pool scripts are executed by Node DIRECTLY, unbuilt (`node
+    // scripts/build-manifest.ts`), because the systemd manifest timer must run
+    // whether or not the bot has been built. Node's type stripping does NOT resolve a
+    // `.js` specifier to a `.ts` file — it throws — so those imports must be spelled
+    // `.ts`. These two flags let tsc accept that spelling and rewrite it back to `.js`
+    // on emit, so the compiled bot is unaffected. One spelling, both runtimes.
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "forceConsistentCasingInFileNames": true,
+
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "declaration": true,
+    "sourceMap": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*", "scripts/**/*.ts"],
+  "exclude": ["node_modules", "dist", "test"]
+}

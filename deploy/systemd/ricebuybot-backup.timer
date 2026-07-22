@@ -1,0 +1,14 @@
+# /etc/systemd/system/ricebuybot-backup.timer
+[Unit]
+Description=Nightly RiceBuybot SQLite backup
+
+[Timer]
+OnCalendar=daily
+# The VPS is not always up at 00:00. Persistent=true runs a missed backup on the next boot
+# rather than silently skipping the night the box was down — which is exactly the night you
+# would want a backup from.
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

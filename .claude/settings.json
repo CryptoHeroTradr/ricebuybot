@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -oE \"'[^']{12,70}'\")",
+      "Bash(rsync -a --relative ./scripts/setup-bot.sh ./scripts/verify-deploy.sh ./scripts/backup-db.sh ./deploy/systemd/ ./README.md ./OPERATIONS.md rice-vps:/home/deploy/ricebuybot-phase5a/)",
+      "Bash(timeout 20 ssh -o BatchMode=yes rice-vps 'ls /home/deploy/ricebuybot-phase5a/deploy/systemd/ && echo \"--- 3012 still free? ---\" && \\(ss -ltn | grep -q \":3012 \" && echo BUSY || echo \"3012 free\"\\)')",
+      "Bash(timeout 300 pnpm -s test test/plans.test.ts)",
+      "Bash(timeout 40 ssh -o BatchMode=yes rice-vps ' *)",
+      "Bash(timeout 30 ssh -o BatchMode=yes rice-vps ' *)",
+      "Bash(timeout 20 ssh -o BatchMode=yes rice-vps 'ls -la ~/env.new 2>&1; echo \"home: $HOME\"; ls -la /home/deploy/ | grep -i env || echo \"  no env* in /home/deploy\"')",
+      "Bash(timeout 20 ssh -o BatchMode=yes rice-vps 'ls -la \"/home/deploy/~\" 2>/dev/null && echo \"^^ there it is: a literal ~ directory\" || echo \"no literal ~ dir either\"')",
+      "Bash(chain)",
+      "Bash(echo \"=== what index.ts passes as `chain` ===\")",
+      "Bash(node -e ' *)",
+      "Bash(timeout 300 pnpm -s test test/config.test.ts)",
+      "Bash(bash -n scripts/setup-bot.sh)",
+      "Bash(rsync -a --delete --exclude node_modules --exclude .env --exclude data --exclude dist ~/RiceBuybot/ rice-vps:~/ricebuybot-src/)",
+      "Bash(curl -sS -m 10 https://1grainofrice.com/media/manifest.json)",
+      "Bash(python3 -c ' *)",
+      "Bash(timeout 300 pnpm -s test test/media-pool.test.ts)",
+      "Bash(timeout 300 pnpm -s test test/normalize.test.ts)",
+      "Bash(node --input-type=module -e ' *)",
+      "Bash(timeout 200 pnpm -s test test/wallet-value.test.ts)",
+      "Bash(timeout 200 pnpm -s test test/render.test.ts test/config.test.ts)",
+      "Bash(sed -i \"s/it\\('spells out that whale is the buyer's SOL+USDC wallet value, not the token bag'/it\\('spells out that whale is the SOL+USDC wallet value, not the token bag'/\" test/config.test.ts)",
+      "Bash(timeout 200 pnpm -s test test/config.test.ts)",
+      "Bash(timeout 300 pnpm -s test test/positions.test.ts)",
+      "Bash(timeout 300 pnpm -s test test/webhook.test.ts test/pricing.test.ts)",
+      "Bash(timeout 200 pnpm -s test test/normalize.test.ts -t \"wrong-whale guard\")"
+    ],
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  }
+}

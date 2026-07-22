@@ -1,0 +1,81 @@
+# /etc/systemd/system/ricebuybot.service
+#
+# The bot. systemd, NOT a second pm2 daemon.
+#
+# Everything else on this box runs under `deploy`'s pm2. Adding RiceBuybot to it would mean
+# a second pm2 daemon, a second `pm2 startup` unit, a second `pm2 save` to forget about —
+# and, far worse, it would put the Telegram bot token and the Helius key inside the blast
+# radius of two public-facing Next apps. See INVARIANT 4. pm2.config.cjs stays for LOCAL DEV
+# only; it is not how this is deployed.
+#
+#   systemctl start ricebuybot
+#   systemctl status ricebuybot
+#   journalctl -u ricebuybot -f
+
+[Unit]
+Description=RiceBuybot — Telegram buy bot for Solana SPL tokens
+Documentation=file:///opt/ricebuybot/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ricebuybot
+Group=ricebuybot
+WorkingDirectory=/opt/ricebuybot
+
+# 0600 ricebuybot:ricebuybot. The whole reason this user exists: `deploy` runs two
+# public-facing Next apps and must not be able to read a bot token that can post to every
+# group we ever onboard, nor a paid RPC key.
+EnvironmentFile=/etc/ricebuybot/env
+
+ExecStart=/usr/bin/node /opt/ricebuybot/dist/src/index.js
+
+Restart=always
+RestartSec=5
+# The watchdog exits(1) when the websocket has been down for 120s (Phase 9). That is a
+# DELIBERATE crash: a silently-dead bot — process up, /health answering, no buys — is the
+# worst failure this thing has, because nobody notices it. Restart=always turns it into a
+# noisy crash loop, which someone fixes.
+
+# --- logs -------------------------------------------------------------------------------
+# journald. pino writes structured JSON to stdout; `journalctl -u ricebuybot -o cat | jq`
+# gives you the buy lines directly.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ricebuybot
+
+# --- hardening --------------------------------------------------------------------------
+#
+# THE BOT IS STRUCTURALLY UNABLE TO WRITE ANYWHERE EXCEPT THE POOL AND ITS OWN DB.
+#
+# ProtectSystem=strict makes the ENTIRE filesystem read-only, including /opt/ricebuybot —
+# so the bot cannot rewrite its own code, cannot drop a script in /usr/local/bin, and cannot
+# touch the two websites' trees even though they sit on the same disk. The two ReadWritePaths
+# below are the complete list of what it may change, and they are the two things it must:
+#
+#   /srv/media          the meme pool. The bot IS the curator (INVARIANT 4) — Phase 8.5's DM
+#                       flow writes memes here, moves them between tiers, and archives them.
+#                       A read-only pool would make ➕ Add and 🗑 Remove fail at runtime.
+#   /var/lib/ricebuybot the SQLite DB (+ its -wal and -shm files, which is why the DIRECTORY
+#                       must be writable, not just the file).
+ProtectSystem=strict
+ReadWritePaths=/srv/media /var/lib/ricebuybot
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+
+# The bot binds 127.0.0.1 only and talks out over TCP. It has no business with anything else.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

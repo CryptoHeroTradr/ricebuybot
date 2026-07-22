@@ -1,0 +1,22 @@
+# /etc/systemd/system/ricebuybot-backup.service
+#
+# Nightly SQLite backup. Driven by ricebuybot-backup.timer.
+#   systemctl start ricebuybot-backup    # run one now
+#   journalctl -u ricebuybot-backup -n 20
+[Unit]
+Description=RiceBuybot nightly SQLite backup
+Documentation=file:///opt/ricebuybot/scripts/backup-db.sh
+
+[Service]
+Type=oneshot
+User=ricebuybot
+Group=ricebuybot
+ExecStart=/opt/ricebuybot/scripts/backup-db.sh
+
+# It writes ONLY into its own state directory. Note /srv/media is absent: a backup job has no
+# business anywhere near the media pool.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ricebuybot
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes

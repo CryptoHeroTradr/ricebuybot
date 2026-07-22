@@ -1,0 +1,47 @@
+# /etc/systemd/system/ricebuybot-manifest.service
+#
+# Regenerate the media pool manifest. Oneshot; driven by ricebuybot-manifest.timer
+# every 5 minutes, and runnable on demand:
+#
+#   systemctl start ricebuybot-manifest.service
+#   journalctl -u ricebuybot-manifest -n 50
+#
+# It runs as `ricebuybot`, the only user with write access to the pool. It does
+# NOT depend on the bot being installed, built or running: the generator is
+# standalone by design, so the pool stands on its own.
+#
+# An unchanged pool produces a byte-identical manifest, so this timer is a no-op
+# in the common case — it does not churn mtimes or bust caches for nothing.
+
+[Unit]
+Description=RiceBuybot media pool manifest
+Documentation=file:///opt/ricebuybot-media/scripts/build-manifest.ts
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=ricebuybot
+Group=ricebuybot
+
+# The pool's mint. setup-media-pool.sh rewrites this line when it installs the
+# unit, so `--mint <other>` provisions a second pool without editing the repo.
+Environment=MINT=2wQq3MrFFHPQnapMt1wnZ2vGkVZDv5ENDCrdLCqFpump
+ExecStart=/usr/bin/node /opt/ricebuybot-media/scripts/build-manifest.ts --root /srv/media --mint ${MINT} --quiet
+
+# The pool is the ONLY thing this unit may write to. Everything else on the box
+# is read-only to it — including /opt/ricebuybot-media, so the job cannot rewrite
+# its own code.
+ProtectSystem=strict
+ReadWritePaths=/srv/media
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+
+# Never lets a wedged ffprobe hold the timer.
+TimeoutStartSec=300

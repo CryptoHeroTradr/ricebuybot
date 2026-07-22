@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+!.env.example
+keystores/
+*.keystore.json
+*.log
+.DS_Store

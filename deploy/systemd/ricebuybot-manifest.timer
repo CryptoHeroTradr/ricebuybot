@@ -1,0 +1,26 @@
+# /etc/systemd/system/ricebuybot-manifest.timer
+#
+# The "5-minute cron" for the manifest, as a timer rather than a crontab: same
+# user and same hardening as the service it drives, visible in `systemctl
+# list-timers`, and its output lands in the journal instead of in root's mail.
+#
+#   systemctl enable --now ricebuybot-manifest.timer
+#   systemctl list-timers ricebuybot-manifest.timer
+#
+# This is a SAFETY NET, not the main path. `tier` regenerates the manifest itself
+# on every move, and Phase 8.5's DM curation will too — so the pool is already
+# consistent the moment it changes. The timer exists to catch a file dropped into
+# a tier folder by hand, out of band.
+
+[Unit]
+Description=Regenerate the RiceBuybot media pool manifest every 5 minutes
+Requires=ricebuybot-manifest.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=ricebuybot-manifest.service
+
+[Install]
+WantedBy=timers.target
