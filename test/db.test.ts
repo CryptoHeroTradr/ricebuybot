@@ -1,5 +1,5 @@
 import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { availableParallelism, cpus, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -538,7 +538,27 @@ describe('orphaned claim sweep (INVARIANT 9)', () => {
 
 // --- concurrency: PROVE exactly one winner ------------------------------------
 
-describe('concurrent claimSend', () => {
+const CORES = availableParallelism?.() ?? cpus().length;
+
+/**
+ * SKIPPED ON SINGLE-CORE MACHINES, because the harness cannot produce a
+ * concurrent interleaving there.
+ *
+ * With one core the 8 barrier-released threads are scheduled ~500-1000us apart,
+ * while the claim's critical section completes in ~150us. Each thread finishes
+ * read-then-write inside its own timeslice, so the gap never straddles a context
+ * switch and BOTH a correct and a broken CLAIM_SQL yield exactly one winner.
+ *
+ * Skipping is deliberate. An unconditional run, or a control relaxed until it
+ * goes green, re-introduces a silent hole: the positive test would keep passing
+ * whether or not the claim is atomic. Phase 13's executions table inherits this
+ * exact claim pattern with real money behind it. A skipped test shows as SKIPPED
+ * in the tally; a vacuously passing one shows as green.
+ *
+ * Do NOT widen the naive read->write gap to make the negative control pass. That
+ * restores the CONTROL without restoring the COVERAGE.
+ */
+describe.skipIf(CORES < 2)('claim concurrency (requires >=2 cores)', () => {
   /**
    * better-sqlite3 is synchronous, so two Promises in one event loop would
    * serialise trivially and prove nothing. This runs the REAL claim statement

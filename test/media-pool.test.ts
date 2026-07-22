@@ -70,6 +70,19 @@ afterEach(async () => {
 });
 
 /**
+ * These are INTEGRATION tests and they have a legitimately different time budget
+ * from a unit test: `runScript` spawns a real `node` process per call, and
+ * `buildManifest` spawns an `ffprobe` per media file — some tests do both, twice.
+ * Measured on a loaded single-core box, one test ranged from 332ms to 3702ms, and
+ * 4 of 6 runs blew the 5s default.
+ *
+ * Scoped to the describes below ON PURPOSE, rather than raised in vitest.config.ts.
+ * A global 30s would make a genuinely hung UNIT test take 30s to fail everywhere,
+ * and fast failure is worth keeping where nothing is being spawned.
+ */
+const SUBPROCESS_TIMEOUT_MS = 30_000;
+
+/**
  * ffprobe is a hard dependency of the generator, and its absence is INVISIBLE:
  * with no ffprobe, every file is skipped with a warning and the manifest comes
  * out empty — at which point "an unchanged pool is byte-identical" and "items
@@ -81,7 +94,7 @@ describe('preconditions', () => {
   it('ffprobe is installed — without it every assertion below goes vacuous', async () => {
     await expect(execFileAsync('ffprobe', ['-version'])).resolves.toBeTruthy();
   });
-});
+}, { timeout: SUBPROCESS_TIMEOUT_MS });
 
 describe('the four tiers', () => {
   it('ERRORS on an unexpected folder rather than silently ignoring it', async () => {
@@ -105,7 +118,7 @@ describe('the four tiers', () => {
     await mkdir(path.join(root, MINT, 'massive', 'best'), { recursive: true });
     await expect(build()).rejects.toThrow(/Tier folders are FLAT/);
   });
-});
+}, { timeout: SUBPROCESS_TIMEOUT_MS });
 
 describe('manifest', () => {
   it('records sha256, tier, kind and dimensions for a new file', async () => {
@@ -192,7 +205,7 @@ describe('manifest', () => {
     expect(after.tier).toBe('massive');
     expect(after.added_at).toBe(before.added_at);
   });
-});
+}, { timeout: SUBPROCESS_TIMEOUT_MS });
 
 describe('skips (warn, never fail the run)', () => {
   it('skips a photo over Telegram’s 10MB ceiling', async () => {
@@ -244,7 +257,7 @@ describe('skips (warn, never fail the run)', () => {
     expect(manifest.count).toBe(0);
     expect(warnings.join('\n')).toMatch(/not content-addressed/);
   });
-});
+}, { timeout: SUBPROCESS_TIMEOUT_MS });
 
 describe('the same meme in two tiers', () => {
   it('is a HARD ERROR naming both paths — no rule can pick a tier that is not a guess', async () => {
@@ -357,7 +370,7 @@ describe('the same meme in two tiers', () => {
     // The pool is still generatable — the refusal happened BEFORE the move.
     await expect(build()).resolves.toBeTruthy();
   });
-});
+}, { timeout: SUBPROCESS_TIMEOUT_MS });
 
 describe('tier CLI', () => {
   it('moves, CONTENT-ADDRESSES, and regenerates the manifest, in one command', async () => {
@@ -499,4 +512,4 @@ describe('tier CLI', () => {
     expect(code).not.toBe(0);
     expect(stderr).toMatch(/unknown destination: epic/);
   });
-});
+}, { timeout: SUBPROCESS_TIMEOUT_MS });

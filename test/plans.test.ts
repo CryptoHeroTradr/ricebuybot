@@ -259,7 +259,40 @@ describe('a downgraded chat', () => {
 
 describe('the free plan posts 5 seconds late', () => {
   const card = { text: 'x', entities: [], keyboard: [], ladderCount: 1, ladderTruncated: false };
-  const job = (n: number, delayMs: number, enqueuedAt = Date.now()) => ({
+
+  /**
+   * A CONTROLLABLE clock, injected into DeliveryQueue via its existing `now` dep.
+   *
+   * The hold is `delayMs - (now() - enqueuedAt)` (queue.ts), i.e. a delta between
+   * two clock reads: one taken here when the job is built, one taken later inside
+   * the async drain. On the real clock those land in different milliseconds under
+   * load, so the hold came out as 4997 and an exact assertion failed.
+   *
+   * Freezing the clock makes the hold EXACTLY delayMs, so `toContain(5_000)` is
+   * correct rather than lucky. Loosening the assertion to a range would have hidden
+   * a real non-determinism instead of removing it. `advance()` additionally lets a
+   * partial-delay case be set up on purpose rather than raced into.
+   */
+  const fakeClock = (start = 1_700_000_000_000) => {
+    let t = start;
+    return { now: () => t, advance: (ms: number) => void (t += ms) };
+  };
+
+  /**
+   * Poll for the observable outcome instead of sleeping a fixed 30ms and hoping the
+   * drain got there. A fixed sleep used as synchronisation is a race; on a loaded
+   * box it is the flake. The ceiling uses the REAL clock deliberately — it is the
+   * harness's own watchdog, not part of any assertion.
+   */
+  const waitFor = async (cond: () => boolean, timeoutMs = 5_000): Promise<void> => {
+    const deadline = Date.now() + timeoutMs;
+    while (!cond()) {
+      if (Date.now() > deadline) throw new Error('timed out waiting for the queue to drain');
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  };
+
+  const job = (n: number, delayMs: number, enqueuedAt: number) => ({
     signature: `sig${n}`.padEnd(88, 'x') as Signature,
     chatId: CHAT,
     enqueuedAt,
@@ -276,24 +309,26 @@ describe('the free plan posts 5 seconds late', () => {
         return sent.length;
       },
     };
+    const clock = fakeClock();
     const q = new DeliveryQueue({
       repo,
       sender,
       log,
       perChatMs: 0,
+      now: clock.now,
       sleep: async (ms) => {
         slept.push(ms);
       },
     });
 
-    q.enqueue(job(1, 5_000));
-    await new Promise((r) => setTimeout(r, 30));
+    q.enqueue(job(1, 5_000, clock.now()));
+    await waitFor(() => sent.length === 1);
     expect(slept).toContain(5_000);
     expect(sent).toHaveLength(1); // delayed, NOT dropped
 
     slept.length = 0;
-    q.enqueue(job(2, 0));
-    await new Promise((r) => setTimeout(r, 30));
+    q.enqueue(job(2, 0, clock.now()));
+    await waitFor(() => sent.length === 2);
     expect(slept.filter((ms) => ms > 0)).toEqual([]); // paid: no hold at all
   });
 
@@ -305,10 +340,11 @@ describe('the free plan posts 5 seconds late', () => {
         return 1;
       },
     };
-    const q = new DeliveryQueue({ repo, sender, log, perChatMs: 0, sleep: async () => {} });
+    const clock = fakeClock();
+    const q = new DeliveryQueue({ repo, sender, log, perChatMs: 0, now: clock.now, sleep: async () => {} });
 
-    q.enqueue(job(3, 5_000));
-    await new Promise((r) => setTimeout(r, 30));
+    q.enqueue(job(3, 5_000, clock.now()));
+    await waitFor(() => sent.length === 1);
 
     // A plan that silently ate buys would look broken, not slow — a cruel way to sell an
     // upgrade and a worse way to keep a free user.
@@ -317,24 +353,36 @@ describe('the free plan posts 5 seconds late', () => {
 
   it('does not add the delay on top of a wait the chat has already served', async () => {
     const slept: number[] = [];
-    const sender: Sender = { send: async () => 1 };
+    const sent: string[] = [];
+    const sender: Sender = {
+      send: async () => {
+        sent.push('x');
+        return sent.length;
+      },
+    };
+    const clock = fakeClock();
     const q = new DeliveryQueue({
       repo,
       sender,
       log,
       perChatMs: 0,
+      now: clock.now,
       sleep: async (ms) => {
         slept.push(ms);
       },
     });
 
     // Enqueued 4s ago (it was stuck behind a 429). Only 1s of the 5s hold is left.
-    q.enqueue(job(4, 5_000, Date.now() - 4_000));
-    await new Promise((r) => setTimeout(r, 30));
+    // Advancing a frozen clock states that 4s explicitly, so the remaining hold is
+    // exactly 1000 rather than "1000 minus however long the box took to get here".
+    const stuck = job(4, 5_000, clock.now());
+    clock.advance(4_000);
+    q.enqueue(stuck);
+    await waitFor(() => sent.length === 1);
 
     const held = slept.filter((ms) => ms > 0);
-    expect(held[0]).toBeLessThanOrEqual(1_100);
-    expect(held[0]).toBeGreaterThan(0);
+    expect(held).toHaveLength(1); // assert length BEFORE indexing — [0] on an empty array is undefined
+    expect(held[0]).toBe(1_000);
   });
 });
 
