@@ -9,6 +9,7 @@ import { DeliveryQueue, DryRunSender, TelegramSender, fanOut, registerCommands, 
 import { Keystore } from './trade/keystore.js';
 import { registerTradeCommands } from './telegram/trade-commands.js';
 import { bootNotices, envUnlock } from './trade/unlock.js';
+import { Scheduler, dryRunExecutor, type TradeValuer } from './trade/scheduler.js';
 import { registerCuration } from './telegram/curate/index.js';
 import { setPlanWhitelist } from './telegram/plan-gate.js';
 import { BurstDetector, DailyCap, digestText } from './telegram/digest.js';
@@ -455,6 +456,42 @@ async function main(): Promise<void> {
       });
 
       log.info({ keystores: cfg.KEYSTORE_DIR, envUnlocked: envUnlocked.length }, 'autotrader: key custody ready (no trading in phase 12)');
+
+      /**
+       * PHASE 13: the DCA scheduler. Decides WHAT and WHEN, and logs it — it executes NOTHING.
+       * Every claimed slot ends as failed/dry-run via `dryRunExecutor`, so a full day of intended
+       * trades can be read off the logs before Phase 14 gives the executor teeth. This runs
+       * whether or not DRY_RUN is set: the phase itself is the safety boundary, not the flag.
+       */
+      const valuer: TradeValuer = {
+        // Buy side is priced EXACTLY: lamports of SOL × SOL/USD. A null feed -> unpriceable ->
+        // the slot is skipped, never fired against a price we do not have.
+        // Sell-side USD valuation (token leg) lands with the quote/execution path in Phase 14;
+        // until then a sell schedule logs `unpriceable-skipped` rather than guessing a price.
+        usdValueOf: async (schedule) => {
+          if (schedule.side !== 'buy' || schedule.amountKind !== 'absolute') return null;
+          const solUsd = feed.solUsd();
+          if (solUsd === null) return null;
+          return (Number(schedule.amountRaw) / 1e9) * solUsd;
+        },
+        solBalanceLamports: async (userId) => {
+          const pubkey = keystore.pubkeyOf(userId);
+          return pubkey ? rpc.getBalance(pubkey) : null;
+        },
+      };
+
+      const scheduler = new Scheduler({
+        repo,
+        valuer,
+        execute: dryRunExecutor(log),
+        log,
+      });
+      await scheduler.logActiveOnBoot(); // schedules survive restart; prove it in the boot log
+      scheduler.start();
+      shutdown.register('scheduler', () => {
+        scheduler.stop();
+        return Promise.resolve();
+      });
     }
 
     /**

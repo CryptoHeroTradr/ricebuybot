@@ -34,6 +34,15 @@ import {
 import { reconcile } from '../positions/reconcile.js';
 import type { Logger } from '../ops/logger.js';
 import type { AutotraderMember } from '../trade/access.js';
+import type {
+  AmountKind,
+  Caps,
+  ExecutionOutcome,
+  Schedule,
+  ScheduleState,
+  SchedulerRepo,
+  Side,
+} from '../trade/scheduler.js';
 import { migrate } from './migrate.js';
 import type { ChatTokenPatch, MediaItemInput, Repo } from './index.js';
 
@@ -168,6 +177,60 @@ function hydrateAutotrader(r: AutotraderRow): AutotraderMember {
     addedAt: r.added_at,
     locked: r.locked === 1,
     lockedAt: r.locked_at,
+  };
+}
+
+// --- Phase 13: DCA scheduler rows (INVARIANT 14, 17: everything scoped by user_id) ---
+
+interface ScheduleRow {
+  id: number;
+  user_id: number;
+  mint: string;
+  side: string;
+  amount_raw: string;
+  amount_kind: string;
+  interval_minutes: number;
+  slippage_bps: number;
+  state: string;
+  halt_reason: string | null;
+  next_run_at: number;
+  last_run_at: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+function hydrateSchedule(r: ScheduleRow): Schedule {
+  return {
+    id: r.id,
+    userId: r.user_id,
+    mint: r.mint as Mint,
+    side: r.side as Side,
+    amountRaw: BigInt(r.amount_raw),
+    amountKind: r.amount_kind as AmountKind,
+    intervalMinutes: r.interval_minutes,
+    slippageBps: r.slippage_bps,
+    state: r.state as ScheduleState,
+    haltReason: r.halt_reason,
+    nextRunAt: r.next_run_at,
+    lastRunAt: r.last_run_at,
+  };
+}
+
+interface CapsRow {
+  user_id: number;
+  mint: string;
+  max_per_exec_usd: number;
+  max_per_day_usd: number;
+  min_sol_reserve_lamports: string;
+}
+
+function hydrateCaps(r: CapsRow): Caps {
+  return {
+    userId: r.user_id,
+    mint: r.mint as Mint,
+    maxPerExecUsd: r.max_per_exec_usd,
+    maxPerDayUsd: r.max_per_day_usd,
+    minSolReserveLamports: BigInt(r.min_sol_reserve_lamports),
   };
 }
 
@@ -1452,6 +1515,177 @@ export class SqliteRepo implements Repo {
     this.#db
       .prepare('INSERT INTO autotrader_access_log (user_id, action, actor, at, note) VALUES (?, ?, ?, ?, ?)')
       .run(userId, action, actor, Date.now(), note ?? null);
+  }
+
+  // --- Phase 13: DCA scheduler (SchedulerRepo). EVERY cap query is filtered by user_id. ---
+  //
+  // The idempotency of the whole surface rests on `claimExecution`: it is the same atomic
+  // INSERT ... ON CONFLICT DO NOTHING as claimSend (INVARIANT 2), and it is what makes an
+  // overlapping tick or a restart replay resolve to exactly one winner.
+
+  async dueSchedules(now: number): Promise<readonly Schedule[]> {
+    return this.#db
+      .prepare<[number], ScheduleRow>(
+        `SELECT * FROM schedules WHERE state = 'active' AND next_run_at <= ? ORDER BY next_run_at`,
+      )
+      .all(now)
+      .map(hydrateSchedule);
+  }
+
+  async activeSchedules(): Promise<readonly Schedule[]> {
+    return this.#db
+      .prepare<[], ScheduleRow>(`SELECT * FROM schedules WHERE state = 'active' ORDER BY next_run_at`)
+      .all()
+      .map(hydrateSchedule);
+  }
+
+  async getSchedule(id: number): Promise<Schedule | null> {
+    const row = this.#db.prepare<[number], ScheduleRow>('SELECT * FROM schedules WHERE id = ?').get(id);
+    return row ? hydrateSchedule(row) : null;
+  }
+
+  /** Every schedule for one user, halted and paused included. Scoped by user_id. */
+  async listSchedules(userId: number): Promise<readonly Schedule[]> {
+    return this.#db
+      .prepare<[number], ScheduleRow>('SELECT * FROM schedules WHERE user_id = ? ORDER BY id')
+      .all(userId)
+      .map(hydrateSchedule);
+  }
+
+  /** Create a schedule. `firstRunAt` is the first slot; the tick advances from there (rule 3). */
+  async createSchedule(input: {
+    userId: number;
+    mint: Mint;
+    side: Side;
+    amountRaw: bigint;
+    amountKind: AmountKind;
+    intervalMinutes: number;
+    slippageBps?: number;
+    firstRunAt: number;
+    state?: ScheduleState;
+  }): Promise<number> {
+    const now = Date.now();
+    const res = this.#db
+      .prepare(
+        `INSERT INTO schedules
+           (user_id, mint, side, amount_raw, amount_kind, interval_minutes, slippage_bps,
+            state, next_run_at, last_run_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+      )
+      .run(
+        input.userId,
+        input.mint,
+        input.side,
+        input.amountRaw.toString(),
+        input.amountKind,
+        input.intervalMinutes,
+        input.slippageBps ?? 100,
+        input.state ?? 'active',
+        input.firstRunAt,
+        now,
+        now,
+      );
+    return Number(res.lastInsertRowid);
+  }
+
+  /** Set (or replace) a user's per-mint caps. */
+  async setCaps(input: {
+    userId: number;
+    mint: Mint;
+    maxPerExecUsd: number;
+    maxPerDayUsd: number;
+    minSolReserveLamports?: bigint;
+  }): Promise<void> {
+    this.#db
+      .prepare(
+        `INSERT INTO caps (user_id, mint, max_per_exec_usd, max_per_day_usd, min_sol_reserve_lamports)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (user_id, mint) DO UPDATE SET
+           max_per_exec_usd = excluded.max_per_exec_usd,
+           max_per_day_usd = excluded.max_per_day_usd,
+           min_sol_reserve_lamports = excluded.min_sol_reserve_lamports`,
+      )
+      .run(
+        input.userId,
+        input.mint,
+        input.maxPerExecUsd,
+        input.maxPerDayUsd,
+        (input.minSolReserveLamports ?? 20_000_000n).toString(),
+      );
+  }
+
+  async getCaps(userId: number, mint: Mint): Promise<Caps | null> {
+    const row = this.#db
+      .prepare<[number, string], CapsRow>('SELECT * FROM caps WHERE user_id = ? AND mint = ?')
+      .get(userId, mint);
+    return row ? hydrateCaps(row) : null;
+  }
+
+  /**
+   * Rolling-24h spend for ONE user on ONE mint. CONFIRMED and UNKNOWN both count — an UNKNOWN
+   * execution may have spent (INVARIANT 16), so it must occupy cap headroom or a lost-outcome
+   * tx becomes free budget. Filtered by user_id: one person's spend never touches another's cap.
+   */
+  async usdSpent24h(userId: number, mint: Mint, sinceMs: number): Promise<number> {
+    const row = this.#db
+      .prepare<[number, string, number], { total: number | null }>(
+        `SELECT COALESCE(SUM(e.usd_value), 0) AS total
+           FROM executions e
+           JOIN schedules  s ON s.id = e.schedule_id
+          WHERE e.user_id = ?
+            AND s.mint = ?
+            AND e.planned_at >= ?
+            AND e.state IN ('confirmed', 'UNKNOWN')`,
+      )
+      .get(userId, mint, sinceMs);
+    return row?.total ?? 0;
+  }
+
+  async advanceSchedule(id: number, nextRunAt: number, lastRunAt: number | null): Promise<void> {
+    this.#db
+      .prepare('UPDATE schedules SET next_run_at = ?, last_run_at = ?, updated_at = ? WHERE id = ?')
+      .run(nextRunAt, lastRunAt, Date.now(), id);
+  }
+
+  async haltSchedule(id: number, reason: string, at: number): Promise<void> {
+    this.#db
+      .prepare(`UPDATE schedules SET state = 'halted', halt_reason = ?, updated_at = ? WHERE id = ?`)
+      .run(reason, at, id);
+  }
+
+  /**
+   * THE claim. Atomic INSERT — the UNIQUE(schedule_id, planned_at) makes a double-fire
+   * impossible. `changes === 1` means we own the slot; 0 means another tick already does, and
+   * we return null so the caller does nothing. Identical discipline to claimSend.
+   */
+  async claimExecution(scheduleId: number, userId: number, plannedAt: number): Promise<number | null> {
+    const res = this.#db
+      .prepare(
+        `INSERT INTO executions (schedule_id, user_id, planned_at, state)
+         VALUES (?, ?, ?, 'claimed')
+         ON CONFLICT (schedule_id, planned_at) DO NOTHING`,
+      )
+      .run(scheduleId, userId, plannedAt);
+    return res.changes === 1 ? Number(res.lastInsertRowid) : null;
+  }
+
+  async settleExecution(id: number, outcome: ExecutionOutcome): Promise<void> {
+    this.#db
+      .prepare(
+        `UPDATE executions
+            SET state = ?, signature = ?, in_raw = ?, out_raw = ?, price_usd = ?, usd_value = ?, error = ?
+          WHERE id = ?`,
+      )
+      .run(
+        outcome.state,
+        outcome.signature ?? null,
+        outcome.inRaw != null ? outcome.inRaw.toString() : null,
+        outcome.outRaw != null ? outcome.outRaw.toString() : null,
+        outcome.priceUsd ?? null,
+        outcome.usdValue ?? null,
+        outcome.error ?? null,
+        id,
+      );
   }
 
   // --- Cursors ---
