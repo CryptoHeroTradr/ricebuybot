@@ -24,6 +24,49 @@ REPO="$(dirname "$HERE")"
 
 say() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
 
+# THIS SCRIPT SHIPS THE TREE IT LIVES IN.
+#
+# `REPO` is the parent of the dir this script is in, and the rsync in the "application" section
+# copies `$REPO/` -> `$APP_DIR/`. Run the COPY that already lives in `$APP_DIR` and `$REPO`
+# equals `$APP_DIR`: that rsync becomes /opt -> /opt — a silent `rsync -a` no-op that "succeeds"
+# while shipping NOTHING, then rebuilds the old code from itself. schema_migrations does not move
+# and nobody notices until the wrong code is live. That has already cost one deploy.
+#
+# Refuse it — and refuse HERE, before preflight stops the running service. A refusal that first
+# takes the bot down is worse than the bug it is guarding against. Run from the source checkout:
+#   sudo bash /home/deploy/ricebuybot-src/scripts/setup-bot.sh
+if [[ "$(realpath -m "$REPO")" == "$(realpath -m "$APP_DIR")" ]]; then
+  echo "REFUSING TO DEPLOY: this script is running from $APP_DIR, so it would rsync that tree onto" >&2
+  echo "itself and deploy NO new code. Run the copy in your SOURCE CHECKOUT instead, e.g.:" >&2
+  echo "    sudo bash /home/deploy/ricebuybot-src/scripts/setup-bot.sh" >&2
+  exit 1
+fi
+
+# DEPLOY PROVENANCE — which source COMMIT these bytes came from.
+#
+# The rsync ships BYTES ON DISK; the marker we write at rsync time records a COMMIT. If the working
+# tree is dirty those two disagree — the marker would name a commit the shipped code is NOT — and a
+# provenance marker that can lie is worse than no marker at all. So compute it HERE, and refuse a
+# dirty tree before preflight stops the service. ALLOW_DIRTY=1 overrides for emergencies, and then
+# the marker is tagged `-dirty` so the discrepancy is at least labelled rather than hidden.
+if git -C "$REPO" rev-parse HEAD >/dev/null 2>&1; then
+  DEPLOY_SHA="$(git -C "$REPO" rev-parse HEAD)"
+  DIRTY="$(git -C "$REPO" status --short)"
+  if [[ -n "$DIRTY" ]]; then
+    if [[ "${ALLOW_DIRTY:-0}" != "1" ]]; then
+      echo "REFUSING TO DEPLOY: $REPO has uncommitted changes, so the shipped bytes would not match" >&2
+      echo "the commit recorded in DEPLOYED_COMMIT. Commit them, or pass ALLOW_DIRTY=1 to override:" >&2
+      echo "$DIRTY" | sed 's/^/    /' >&2
+      exit 1
+    fi
+    DEPLOY_SHA="${DEPLOY_SHA}-dirty"
+    echo "WARNING: deploying a DIRTY tree (ALLOW_DIRTY=1) — marker tagged $DEPLOY_SHA" >&2
+  fi
+else
+  # Not a git checkout — record "unknown" rather than failing (a tarball deploy is still a deploy).
+  DEPLOY_SHA="unknown"
+fi
+
 # ---------------------------------------------------------------------------
 say "preflight"
 
@@ -118,6 +161,14 @@ say "application"
 rsync -a --delete \
   --exclude .git --exclude node_modules --exclude data --exclude .env \
   "$REPO/" "$APP_DIR/"
+
+# Provenance marker: the source commit these bytes came from, and when. Written AFTER the rsync so
+# `--delete` cannot remove it. verify-deploy reads it back; EXPECT_COMMIT=<sha> turns a stale deploy
+# into a hard failure EVEN when it changed no migration (the case the version checks cannot catch).
+{
+  echo "$DEPLOY_SHA"
+  echo "deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$APP_DIR/DEPLOYED_COMMIT"
 
 chown -R root:root "$APP_DIR"
 chmod +x "$APP_DIR/scripts/backup-db.sh"
