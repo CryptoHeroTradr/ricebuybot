@@ -350,8 +350,8 @@ export class Executor {
 
   /** Parse the REAL transaction through normalizeSwap — the chain is the truth; quoted amounts are
    *  estimates. Records in_raw/out_raw/price_usd from what actually happened. */
-  async #recordConfirmed(schedule: Schedule, signature: string, tradeUsd: number, pubkey: string): Promise<ExecutionOutcome> {
-    const tx = await this.#d.chain.getTransaction(signature).catch(() => null);
+  async #recordConfirmed(schedule: Schedule, signature: string, tradeUsd: number, pubkey: string, prefetched?: ConfirmedTx | null): Promise<ExecutionOutcome> {
+    const tx = prefetched ?? (await this.#d.chain.getTransaction(signature).catch(() => null));
     const solUsd = this.#d.solUsd();
     let inRaw: bigint | null = null;
     let outRaw: bigint | null = null;
@@ -426,10 +426,23 @@ export class Executor {
         await this.#dmResolved(schedule, executionId, 'failed on-chain — schedule resumed');
         return;
       }
-      // Not found AND past blockhash expiry: an expired blockhash can never be included, so this is
-      // a definitive drop, not lag.
+      // Not found in the status result, past blockhash expiry. This LOOKS dropped — but a null from
+      // getSignatureStatuses can be a CACHE MISS (the signature aged out of the status cache), not
+      // proof it never landed. Marking a landed swap 'failed' is the double-buy INVARIANT 13 exists
+      // to prevent, arriving through the back door. So ABSENCE MUST BE PROVEN: confirm with
+      // getTransaction before declaring dropped. If the transaction is there, it CONFIRMED.
       if (status === null && this.#now() - start >= this.#cfg.droppedAfterMs) {
-        await this.#d.repo.settleExecution(executionId, { state: 'failed', signature, usdValue: tradeUsd, error: 'dropped (blockhash expired, never landed)' });
+        const tx = await this.#d.chain.getTransaction(signature).catch(() => null);
+        if (tx) {
+          const outcome = await this.#recordConfirmed(schedule, signature, tradeUsd, pubkey, tx);
+          await this.#d.repo.settleExecution(executionId, outcome);
+          await this.#d.repo.unhaltSchedule(schedule.id);
+          await this.#dmResolved(schedule, executionId, 'confirmed late (found on-chain, not in the status cache) — schedule resumed');
+          return;
+        }
+        // Absent from BOTH the status result and getTransaction, past blockhash expiry -> a genuine
+        // drop: an expired blockhash can never be included, so it can never land now.
+        await this.#d.repo.settleExecution(executionId, { state: 'failed', signature, usdValue: tradeUsd, error: 'dropped (blockhash expired; absent from status AND getTransaction)' });
         await this.#d.repo.unhaltSchedule(schedule.id);
         await this.#dmResolved(schedule, executionId, 'dropped (never landed) — schedule resumed');
         return;

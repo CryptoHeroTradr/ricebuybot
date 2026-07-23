@@ -756,10 +756,17 @@ timer, and only the timer, which is the failure nobody is watching.
 | `api.binance.us` | SOL/USD primary (bookTicker) | always |
 | `*.coinbase.com` | SOL/USD secondary | always |
 | the media host | `manifest.json` + media bytes | **only** when `MEDIA_SOURCE=http` |
+| `lite-api.jup.ag` (`JUPITER_API_URL`) | Jupiter swap quote + build (Phase 14) | **only** when `TRADE_LIVE=true` |
 
 Nothing else. No analytics, no crash reporter, no phone-home, in our code **or in any
 transitive dependency**. `pnpm audit:network` greps the entire *production* dependency tree
 (`pnpm ls --prod`, 63 packages) for outbound hosts and fails on any known telemetry SDK.
+
+The Jupiter host is the one runtime-configured member of this list (`JUPITER_API_URL`), so
+`audit:network` cannot see it — it comes from config, not a dependency. It is contacted ONLY
+when `TRADE_LIVE=true`, and the VPS firewall (the actual enforcement — the audit is a smoke
+alarm, not a firewall) must permit it. The old `quote-api.jup.ag/v6` host was RETIRED; the
+current endpoint is `lite-api.jup.ag/swap/v1` (free) / `api.jup.ag/swap/v1` (keyed).
 
 Two things it deliberately does NOT flag:
 
@@ -767,7 +774,8 @@ Two things it deliberately does NOT flag:
   are ever loaded by the running bot. Scanning them buries the one finding that would matter
   under a hundred that cannot.
 - **Link URLs in `core/links.ts`** (dextools, dexscreener, jup.ag). Those are rendered as
-  inline-keyboard buttons for a *user* to tap. The bot never fetches them.
+  inline-keyboard buttons for a *user* to tap. The bot never fetches them — distinct from the
+  Jupiter API host above, which it does fetch, deliberately, only while trading.
 
 ### Audit output (Phase 10, final)
 

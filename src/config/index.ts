@@ -152,10 +152,14 @@ const EnvSchema = z
     // --- Phase 14: autotrader EXECUTION (Jupiter) --------------------------------------------
     //
     // NOTE (Phase 9 allowlist): turning execution on adds ONE new outbound host — the Jupiter
-    // quote/swap API. It is not on the zero-telemetry allowlist because until Phase 14 the bot
-    // never traded. The VPS firewall must permit it; `pnpm audit:network` will not see it (the
-    // host comes from this config value at runtime, not a dependency).
-    JUPITER_API_URL: z.string().url('must be a URL').default('https://quote-api.jup.ag/v6'),
+    // swap API (`lite-api.jup.ag`). It is not on the zero-telemetry allowlist because until
+    // Phase 14 the bot never traded. The VPS firewall must permit it; `pnpm audit:network` will
+    // not see it (the host comes from this config value at runtime, not a dependency).
+    //
+    // The base is the `/swap/v1` root; JupiterHttp appends `/quote` and `/swap`. The old
+    // `quote-api.jup.ag/v6` host was RETIRED (it no longer resolves) — Jupiter moved to
+    // `lite-api.jup.ag/swap/v1` (free tier) / `api.jup.ag/swap/v1` (keyed). Verified live.
+    JUPITER_API_URL: z.string().url('must be a URL').default('https://lite-api.jup.ag/swap/v1'),
 
     /** Reject a quote whose price impact exceeds this FRACTION. A slippage setting is not a
      *  price-impact guard: on a ~$105K-cap token a modest order moves the price itself. */
@@ -168,6 +172,30 @@ const EnvSchema = z
     CONFIRM_TIMEOUT_MS: z.coerce.number().int().positive().default(90_000),
   })
   .superRefine((env, ctx) => {
+    // REFUSE HEADLESS LIVE TRADING. On an UNKNOWN swap the executor halts the schedule and needs a
+    // human to /resolve it (INVARIANT 13). A human who cannot be reached cannot resolve it — the
+    // halt then sits unnoticed while the owner assumes the schedule is running. So TRADE_LIVE=true
+    // requires a reachable alert channel (a Telegram bot, which DRY_RUN disables) AND something to
+    // execute (AUTOTRADER). Fail at boot, naming the exact conflicting vars — never a warning.
+    if (env.TRADE_LIVE) {
+      if (env.DRY_RUN) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['TRADE_LIVE'],
+          message:
+            'TRADE_LIVE=true is refused with DRY_RUN=true: DRY_RUN disables the Telegram bot, so an ' +
+            'UNKNOWN swap (INVARIANT 13) would halt a schedule with no way to reach you. ' +
+            'Set DRY_RUN=false, or TRADE_LIVE=false.',
+        });
+      }
+      if (!env.AUTOTRADER) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['TRADE_LIVE'],
+          message: 'TRADE_LIVE=true requires AUTOTRADER=true — there is no executor to run otherwise.',
+        });
+      }
+    }
     if (env.INGEST_MODE === 'webhook' && !env.WEBHOOK_SECRET) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,

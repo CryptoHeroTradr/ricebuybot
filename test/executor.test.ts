@@ -96,6 +96,7 @@ interface Overrides {
   signatureStatus?: () => Promise<SignatureStatus | null>;
   quote?: (p: { inputMint: string; outputMint: string; amount: bigint }) => Promise<JupiterQuote>;
   mintBalance?: (owner: string, mint: string) => Promise<bigint>;
+  getTransaction?: () => Promise<unknown>;
   parseSwap?: unknown;
   solUsd?: number | null;
   ownerUserId?: number;
@@ -129,7 +130,7 @@ function mkExecutor(over: Overrides = {}): { executor: Executor; rec: Recorder; 
         return over.send ? over.send() : SIG;
       },
       signatureStatus: over.signatureStatus ?? (async () => null),
-      getTransaction: async () => ({}) as never,
+      getTransaction: (over.getTransaction ?? (async () => ({}))) as never,
     },
     balances: {
       mintBalance: async (owner, mint) => {
@@ -223,8 +224,9 @@ describe('the UNKNOWN path', () => {
     expect((await executor.resolve(plan.executionId, 'failed')).ok).toBe(false);
   });
 
-  it('a dropped signature (null past blockhash expiry) resolves to failed and unhalts', async () => {
-    const { executor } = mkExecutor({ signatureStatus: async () => null });
+  it('a dropped signature (absent from status AND getTransaction) resolves to failed and unhalts', async () => {
+    // Absence PROVEN: null status AND getTransaction returns null -> genuinely never landed.
+    const { executor } = mkExecutor({ signatureStatus: async () => null, getTransaction: async () => null });
     const schedule = await seedSchedule();
     const plan = await claimedPlan(schedule);
     await repo.settleExecution(plan.executionId, await executor.execute(plan));
@@ -232,6 +234,23 @@ describe('the UNKNOWN path', () => {
 
     expect(stateOf(plan.executionId)).toBe('failed');
     expect(await schedState(schedule.id)).toBe('active');
+  });
+
+  it('CACHE MISS is not a drop: absent from the status cache but present via getTransaction -> CONFIRMED', async () => {
+    // The status result is null forever (aged out of the bounded cache), but the transaction IS on
+    // chain. Absence must be proven; getTransaction proves presence, so this must NEVER be dropped.
+    const { executor } = mkExecutor({
+      signatureStatus: async () => null,
+      getTransaction: async () => ({}), // present on-chain
+      parseSwap: () => ({ event: { kind: 'buy', quoteRaw: 10n, tokensRaw: 20n } }),
+    });
+    const schedule = await seedSchedule();
+    const plan = await claimedPlan(schedule);
+    await repo.settleExecution(plan.executionId, await executor.execute(plan));
+    await executor.lastPassiveResolution;
+
+    expect(stateOf(plan.executionId)).toBe('confirmed'); // NOT 'failed'
+    expect(await schedState(schedule.id)).toBe('active'); // unhalted
   });
 });
 
@@ -265,6 +284,32 @@ describe('guards that fire before anything is sent', () => {
     expect(outcome.error).toMatch(/simulation failed/);
     expect(rec.send).toBe(0);
     expect(stateOf(plan.executionId)).toBe('claimed'); // never marked submitted
+  });
+
+  it('NO branch reaches send() without a successful sign(): a throwing signer -> zero sends, always', async () => {
+    // The structural property that makes the mint guard unbypassable: send is downstream of sign on
+    // every path. A signer that throws must yield zero sends and no 'submitted' write, whatever the
+    // trade shape — buy, absolute sell, percent sell.
+    const shapes: { label: string; side: Side; amountKind: AmountKind; amountRaw: bigint; balance?: bigint }[] = [
+      { label: 'buy/absolute', side: 'buy', amountKind: 'absolute', amountRaw: SOL / 10n },
+      { label: 'sell/absolute', side: 'sell', amountKind: 'absolute', amountRaw: 1000n },
+      { label: 'sell/percent', side: 'sell', amountKind: 'percent_of_balance', amountRaw: 1000n, balance: 500n },
+    ];
+    for (const s of shapes) {
+      const { executor, rec } = mkExecutor({
+        sign: async () => {
+          throw new Error(`guard rejected (${s.label})`);
+        },
+        mintBalance: async () => s.balance ?? 0n,
+      });
+      const schedule = await seedSchedule({ side: s.side, amountKind: s.amountKind, amountRaw: s.amountRaw });
+      const plan = await claimedPlan(schedule);
+
+      const outcome = await executor.execute(plan);
+      expect(outcome.state, s.label).toBe('failed');
+      expect(rec.send, `${s.label}: send must be zero`).toBe(0);
+      expect(stateOf(plan.executionId), `${s.label}: no submitted write`).toBe('claimed');
+    }
   });
 
   it('every transaction goes through the signer mint guard; a rejected mint stops BEFORE submit', async () => {

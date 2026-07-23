@@ -83,22 +83,25 @@ describe('config', () => {
     expect(() => loadConfig({ ...VALID_ENV, DRY_RUN: 'false', MEDIA_VAULT_CHAT_ID: '-1001' })).not.toThrow();
   });
 
-  it('TRADE_LIVE defaults to false and is independent of DRY_RUN', () => {
-    // Money is the explicit opt-in: absent means false.
+  it('TRADE_LIVE defaults to false and does not read DRY_RUN', () => {
+    // Money is the explicit opt-in: absent means false, and DRY_RUN never sets it.
     expect(loadConfig(VALID_ENV).TRADE_LIVE).toBe(false);
+    expect(loadConfig({ ...VALID_ENV, DRY_RUN: 'true' }).TRADE_LIVE).toBe(false);
+    // The safe combos parse and neither flag moves the other.
+    const live = loadConfig({ ...VALID_ENV, DRY_RUN: 'false', MEDIA_VAULT_CHAT_ID: '-1001', AUTOTRADER: 'true', TRADE_LIVE: 'true' });
+    expect(live.TRADE_LIVE).toBe(true);
+    expect(live.DRY_RUN).toBe(false);
+    expect(loadConfig({ ...VALID_ENV, DRY_RUN: 'true', TRADE_LIVE: 'false', AUTOTRADER: 'true' }).TRADE_LIVE).toBe(false);
+  });
 
-    // All four DRY_RUN × TRADE_LIVE combinations parse, and neither flag moves the other.
-    const combos = [
-      { DRY_RUN: 'true', TRADE_LIVE: 'false' },
-      { DRY_RUN: 'true', TRADE_LIVE: 'true' },
-      { DRY_RUN: 'false', TRADE_LIVE: 'false', MEDIA_VAULT_CHAT_ID: '-1001' },
-      { DRY_RUN: 'false', TRADE_LIVE: 'true', MEDIA_VAULT_CHAT_ID: '-1001' },
-    ] as const;
-    for (const c of combos) {
-      const cfg = loadConfig({ ...VALID_ENV, ...c });
-      expect(cfg.DRY_RUN).toBe(c.DRY_RUN === 'true');
-      expect(cfg.TRADE_LIVE).toBe(c.TRADE_LIVE === 'true'); // DRY_RUN never changes TRADE_LIVE
-    }
+  it('REFUSES headless live trading — TRADE_LIVE=true with no reachable alert channel', () => {
+    // DRY_RUN disables the bot, so an UNKNOWN swap could halt a schedule with no way to reach a human.
+    const base = { ...VALID_ENV, AUTOTRADER: 'true', TRADE_LIVE: 'true' };
+    expect(() => loadConfig({ ...base, DRY_RUN: 'true' })).toThrow(/TRADE_LIVE.*DRY_RUN|DRY_RUN.*TRADE_LIVE/s);
+    // And TRADE_LIVE with nothing to execute is refused too, naming AUTOTRADER.
+    expect(() => loadConfig({ ...VALID_ENV, DRY_RUN: 'false', MEDIA_VAULT_CHAT_ID: '-1001', TRADE_LIVE: 'true', AUTOTRADER: 'false' })).toThrow(/AUTOTRADER/);
+    // The safe live config is accepted.
+    expect(() => loadConfig({ ...base, DRY_RUN: 'false', MEDIA_VAULT_CHAT_ID: '-1001' })).not.toThrow();
   });
 });
 
