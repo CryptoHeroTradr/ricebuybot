@@ -120,20 +120,31 @@ step "deployed version"
 # (setup-bot.sh run from the wrong copy, so its self-rsync was a no-op) is invisible here unless we
 # look at the CODE VERSION. So look at it.
 DIST_MIG_DIR="$APP_DIR/dist/src/db/migrations"
-DIST_MAX="$(ls "$DIST_MIG_DIR" 2>/dev/null | grep -oP '^[0-9]+' | sort -n | tail -1 || true)"
+DIST_RAW="$(ls "$DIST_MIG_DIR" 2>/dev/null | grep -oP '^[0-9]+' | sort -n | tail -1 || true)"
 DB_PATH="$(grep -oP '^DB_PATH=\K.*' /etc/ricebuybot/env 2>/dev/null || echo "$STATE_DIR/ricebuybot.db")"
-DB_MAX="$(as_bot sqlite3 "$DB_PATH" 'SELECT MAX(version) FROM schema_migrations;' 2>/dev/null || true)"
+DB_RAW="$(as_bot sqlite3 "$DB_PATH" 'SELECT MAX(version) FROM schema_migrations;' 2>/dev/null || true)"
 
-if [[ -z "$DIST_MAX" ]]; then
+if [[ -z "$DIST_RAW" ]]; then
   bad "no migrations found in $DIST_MIG_DIR — is dist even built?"
-elif [[ -z "$DB_MAX" ]]; then
+elif [[ -z "$DB_RAW" ]]; then
   bad "could not read schema_migrations from $DB_PATH"
 else
+  # NORMALIZE TO BASE-10 INTEGERS BEFORE ANY COMPARISON.
+  #
+  # Migration FILES are zero-padded (`013_dca_schedules.sql`), so the parsed value is "013", while
+  # schema_migrations stores the integer 13. Two ways that bit a GOOD deploy and reported red:
+  #   - "013" == "13" is FALSE as a string (the self-check).
+  #   - "013" in a `[[ -ge ]]` arithmetic context is read as OCTAL = 11, so 13 looked older than 13
+  #     (the EXPECT_MIGRATION check).
+  # A check that cries wolf on a fine deploy is worse than no check — it trains you to skim past red.
+  # `10#N` forces base-10 regardless of leading zeros; after this both sides are plain integers.
+  DIST_MAX=$((10#$DIST_RAW))
+  DB_MAX=$((10#$DB_RAW))
   echo "  highest migration shipped in dist: $DIST_MAX;  highest applied in the live DB: $DB_MAX"
 
   # migrate() runs at boot, so every migration that SHIPPED must be APPLIED. A gap means the code
   # shipped but the DB did not migrate to it — a half-deploy that runs new code on an old schema.
-  [[ "$DB_MAX" == "$DIST_MAX" ]] &&
+  [[ "$DB_MAX" -eq "$DIST_MAX" ]] &&
     ok "the live DB is migrated to the shipped version ($DB_MAX)" ||
     bad "shipped migration is $DIST_MAX but the DB is at $DB_MAX — the DB did not migrate to the deployed code"
 
@@ -143,9 +154,10 @@ else
   # a stale deploy has dist and DB agreeing at the OLD version, so it passes. Only YOU know the
   # target. Pass EXPECT_MIGRATION=<n> and a stale deploy becomes a hard failure here.
   if [[ -n "${EXPECT_MIGRATION:-}" ]]; then
-    { [[ "$DIST_MAX" -ge "$EXPECT_MIGRATION" ]] && [[ "$DB_MAX" -ge "$EXPECT_MIGRATION" ]]; } &&
-      ok "deploy meets EXPECT_MIGRATION=$EXPECT_MIGRATION (shipped $DIST_MAX, applied $DB_MAX)" ||
-      bad "EXPECT_MIGRATION=$EXPECT_MIGRATION but shipped=$DIST_MAX applied=$DB_MAX — STALE deploy, old code is live"
+    EXPECT_MIGRATION_N=$((10#$EXPECT_MIGRATION))  # normalize too — "013" and "13" must mean the same
+    { [[ "$DIST_MAX" -ge "$EXPECT_MIGRATION_N" ]] && [[ "$DB_MAX" -ge "$EXPECT_MIGRATION_N" ]]; } &&
+      ok "deploy meets EXPECT_MIGRATION=$EXPECT_MIGRATION_N (shipped $DIST_MAX, applied $DB_MAX)" ||
+      bad "EXPECT_MIGRATION=$EXPECT_MIGRATION_N but shipped=$DIST_MAX applied=$DB_MAX — STALE deploy, old code is live"
   else
     echo "  (set EXPECT_MIGRATION=<n> to FAIL this step on a stale deploy — e.g. EXPECT_MIGRATION=13)"
   fi
