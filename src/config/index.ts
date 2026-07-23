@@ -117,6 +117,19 @@ const EnvSchema = z
     AUTOTRADER: boolVar(false),
 
     /**
+     * PHASE 14 — the money opt-in. Governs whether the REAL executor runs at all; nothing else does.
+     *
+     * Deliberately INDEPENDENT of DRY_RUN. DRY_RUN governs Telegram sends (INVARIANT 7) and has no
+     * bearing on trading in either direction — so the dry-run day runs with DRY_RUN=false (cards post
+     * normally), AUTOTRADER=true, TRADE_LIVE=false (the scheduler ticks and the executor LOGS, but the
+     * wallet is never touched). Real execution requires TRADE_LIVE=true AND AUTOTRADER=true.
+     *
+     * Default false: spending real money is the explicit opt-in, never a default and never a side
+     * effect of a flag that means something else. Boot logs LOUDLY when it is true.
+     */
+    TRADE_LIVE: boolVar(false),
+
+    /**
      * Where per-user keystores live. One encrypted file per user, 0600, owned by the bot's
      * own system user — which is the whole reason the bot does not run as `deploy` (see
      * INVARIANT 4's note): `deploy` runs two public-facing Next apps.

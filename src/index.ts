@@ -372,6 +372,110 @@ async function main(): Promise<void> {
   const mints = new Set([...(await repo.activeMints()), cfg.DEFAULT_MINT]);
   for (const mint of mints) await ingestor.subscribe(mint);
 
+  // --- autotrader ENGINE (Phase 12 custody + 13 scheduler + 14 executor) -------
+  //
+  // Runs whenever AUTOTRADER=true, INDEPENDENT of DRY_RUN and of whether a Telegram bot exists.
+  // DRY_RUN governs card sends only (INVARIANT 7); TRADE_LIVE — and only TRADE_LIVE — governs
+  // whether real swaps execute. So all four DRY_RUN×TRADE_LIVE combinations are reachable, and the
+  // dry-run day is DRY_RUN=false (cards post) + TRADE_LIVE=false (executor logs, wallet untouched).
+  //
+  // The Telegram COMMAND surface (custody, /resolve) is registered later, only when a bot exists —
+  // but the engine here does not need one. Without a bot, safety alerts fall back to the log.
+  let atKeystore: Keystore | undefined;
+  let atUnlockConfig: { ownerUserId: number | undefined; ownerPassphrase: string | undefined } | undefined;
+  let atExecutor: Executor | undefined;
+  let atEnvUnlocked: readonly number[] = [];
+
+  if (cfg.AUTOTRADER) {
+    const keystore = new Keystore({ dir: cfg.KEYSTORE_DIR });
+    const unlockConfig = { ownerUserId: cfg.OWNER_USER_ID, ownerPassphrase: cfg.OWNER_KEYSTORE_PASSPHRASE };
+    // INVARIANT 15: zero every key on the way out. Registered FIRST so it runs even if boot throws.
+    shutdown.register('keystore', () => {
+      keystore.lockAll();
+      return Promise.resolve();
+    });
+
+    const tradeChain = new TradeChain(rpc, log);
+    const signer = new Signer({ keystore, access: repo, rpc: tradeChain, log });
+    const jupiter = new JupiterHttp(cfg.JUPITER_API_URL, log);
+
+    // Alert channel: the bot if present, otherwise the log. A silent UNKNOWN is the worst outcome,
+    // so a headless run logs it LOUDLY rather than swallowing it.
+    const dm = telegram
+      ? { send: async (userId: number, text: string) => void (await telegram.bot.api.sendMessage(userId, text).catch(() => undefined)) }
+      : { send: async (userId: number, text: string) => void log.warn({ userId, alert: text }, 'autotrader ALERT (no Telegram bot — logged, not DMed)') };
+
+    const executor = new Executor({
+      repo,
+      jupiter,
+      signer,
+      chain: tradeChain,
+      balances: { mintBalance: async (owner, mint) => (await rpc.getTokenBalances(owner, [mint])).get(mint) ?? 0n },
+      wallets: { pubkeyOf: (userId) => keystore.pubkeyOf(userId) },
+      dm,
+      log,
+      solUsd: () => feed.solUsd(),
+      decimalsOf: async (mint) => (await tokenMeta.get(mint as Mint))?.decimals ?? null,
+      ownerUserId: cfg.OWNER_USER_ID,
+      config: {
+        maxPriceImpactPct: cfg.MAX_PRICE_IMPACT_PCT,
+        priorityFeeLamports: cfg.PRIORITY_FEE_LAMPORTS,
+        confirmTimeoutMs: cfg.CONFIRM_TIMEOUT_MS,
+      },
+    });
+
+    const valuer: TradeValuer = {
+      // Buy/absolute is priced EXACTLY: lamports of SOL × SOL/USD; a null feed -> the scheduler
+      // skips rather than fire against a price we do not have. Sells (and percent-of-balance) are
+      // valued at EXECUTION time by the executor, which reads the live balance and re-checks caps;
+      // a provisional 0 keeps the scheduler from skipping them.
+      usdValueOf: async (schedule) => {
+        if (schedule.side === 'buy' && schedule.amountKind === 'absolute') {
+          const solUsd = feed.solUsd();
+          if (solUsd === null) return null;
+          return (Number(schedule.amountRaw) / 1e9) * solUsd;
+        }
+        return 0;
+      },
+      solBalanceLamports: async (userId) => {
+        const pubkey = keystore.pubkeyOf(userId);
+        return pubkey ? rpc.getBalance(pubkey) : null;
+      },
+    };
+
+    const scheduler = new Scheduler({
+      repo,
+      valuer,
+      execute: cfg.TRADE_LIVE ? executor.execute : dryRunExecutor(log),
+      log,
+    });
+    await scheduler.logActiveOnBoot(); // schedules survive restart; prove it in the boot log
+    scheduler.start();
+    shutdown.register('scheduler', () => {
+      scheduler.stop();
+      return Promise.resolve();
+    });
+
+    atEnvUnlocked = envUnlock(keystore, unlockConfig, log);
+
+    if (cfg.TRADE_LIVE) {
+      log.warn(
+        { jupiter: cfg.JUPITER_API_URL, maxImpactPct: cfg.MAX_PRICE_IMPACT_PCT, priorityFeeLamports: cfg.PRIORITY_FEE_LAMPORTS, telegram: telegram !== null },
+        '🟢 autotrader: TRADE_LIVE=true — REAL swaps will execute via Jupiter. Money is at stake.',
+      );
+      if (!telegram) {
+        log.warn('autotrader: TRADE_LIVE=true with NO Telegram bot (DRY_RUN) — UNKNOWN and kill-switch alerts will be LOGGED, not DMed');
+      }
+    } else {
+      log.info({ dryRun: cfg.DRY_RUN }, 'autotrader: scheduler running, TRADE_LIVE=false — executor LOGS intended trades, wallet untouched');
+    }
+    log.info({ keystores: cfg.KEYSTORE_DIR, envUnlocked: atEnvUnlocked.length }, 'autotrader: key custody ready');
+
+    atKeystore = keystore;
+    atUnlockConfig = unlockConfig;
+    atExecutor = executor;
+  }
+
   // --- group configuration (Phase 8) -------------------------------------------
   //
   // Commands need a Bot, so they exist only when we actually have one. Under DRY_RUN there
@@ -406,29 +510,17 @@ async function main(): Promise<void> {
     });
 
     /**
-     * Phase 12: the autotrader's key custody (INVARIANTS 14-18).
+     * Phase 12-14: the autotrader's Telegram COMMAND surface — custody (wallet/trader), key unlock,
+     * and /resolve. The engine (keystore, scheduler, executor) was already built above, independent
+     * of the bot; here we only attach the commands, which genuinely need one. Registered before
+     * bot.start() below, and in the same middleware order as the card commands above it.
      *
-     * OFF unless AUTOTRADER=true. Note what is registered here and what is not: wallets,
-     * keys and the allowlist — and NO trading. A phase that both introduces key custody and
-     * executes trades is a phase where you cannot tell which half broke.
-     *
-     * Every wallet starts LOCKED. That is not a state to be recovered from at boot; it is
-     * the correct state after a restart, and the mitigation is telling people (`bootNotices`),
-     * not weakening it.
+     * Every wallet starts LOCKED — the correct state after a restart. The mitigation is telling
+     * people (`bootNotices`), not weakening it.
      */
-    if (cfg.AUTOTRADER) {
-      const keystore = new Keystore({ dir: cfg.KEYSTORE_DIR });
-      const unlockConfig = {
-        ownerUserId: cfg.OWNER_USER_ID,
-        ownerPassphrase: cfg.OWNER_KEYSTORE_PASSPHRASE,
-      };
-
-      // INVARIANT 15: zero every key on the way out. Registered FIRST so it runs even if
-      // something below throws during boot.
-      shutdown.register('keystore', () => {
-        keystore.lockAll();
-        return Promise.resolve();
-      });
+    if (cfg.AUTOTRADER && atKeystore && atExecutor && atUnlockConfig) {
+      const keystore = atKeystore;
+      const executor = atExecutor;
 
       registerTradeCommands(telegram.bot, {
         repo,
@@ -438,80 +530,12 @@ async function main(): Promise<void> {
           getOwnedTokenAccountsParsed: (owner) => rpc.getOwnedTokenAccountsParsed(owner),
         },
         log,
-        unlockConfig,
+        unlockConfig: atUnlockConfig,
         primaryMint: cfg.DEFAULT_MINT,
         primarySymbol: (await tokenMeta.get(cfg.DEFAULT_MINT as Mint))?.symbol ?? 'tokens',
-        // Locking or revoking a wallet pauses that user's schedules — now that trading is real
-        // (Phase 14), a locked wallet must not keep firing DCA slots.
+        // Locking or revoking a wallet pauses that user's schedules — a locked wallet must not keep
+        // firing DCA slots.
         pauseSchedules: async (userId: number) => void (await repo.pauseUserSchedules(userId)),
-      });
-
-      const envUnlocked = envUnlock(keystore, unlockConfig, log);
-
-      // Tell everyone whose wallet a restart just locked. Best-effort and non-fatal: a user
-      // who has blocked the bot must not stop the bot from booting.
-      void bootNotices(repo, keystore, envUnlocked).then(async (notices) => {
-        for (const n of notices) {
-          try {
-            await telegram.bot.api.sendMessage(n.userId, n.text);
-          } catch {
-            log.warn({ userId: n.userId }, 'autotrader: could not deliver restart notice');
-          }
-        }
-      });
-
-      log.info({ keystores: cfg.KEYSTORE_DIR, envUnlocked: envUnlocked.length }, 'autotrader: key custody ready (no trading in phase 12)');
-
-      /**
-       * PHASE 13 + 14: the DCA scheduler decides WHAT and WHEN; the executor DOES it via Jupiter.
-       *
-       * DRY_RUN is the safety boundary here too (INVARIANT 7 — a trade IS a send): under DRY_RUN the
-       * scheduler runs with the dry-run executor (logs intended trades, spends nothing), so a full
-       * day can be read off the logs on the real code before money moves. With DRY_RUN=false the real
-       * executor quotes, guards, signs, simulates, submits and confirms.
-       */
-      const valuer: TradeValuer = {
-        // Buy/absolute is priced EXACTLY: lamports of SOL × SOL/USD. A null feed -> unpriceable ->
-        // the scheduler skips the slot rather than fire against a price we do not have.
-        // Sells (and percent-of-balance) are valued at EXECUTION time by the executor, which reads
-        // the live balance, recomputes, and re-checks caps. A provisional 0 keeps the scheduler from
-        // skipping them; the executor is authoritative for their caps.
-        usdValueOf: async (schedule) => {
-          if (schedule.side === 'buy' && schedule.amountKind === 'absolute') {
-            const solUsd = feed.solUsd();
-            if (solUsd === null) return null;
-            return (Number(schedule.amountRaw) / 1e9) * solUsd;
-          }
-          return 0;
-        },
-        solBalanceLamports: async (userId) => {
-          const pubkey = keystore.pubkeyOf(userId);
-          return pubkey ? rpc.getBalance(pubkey) : null;
-        },
-      };
-
-      // The chain adapter backs BOTH the signer's guard and the executor.
-      const tradeChain = new TradeChain(rpc, log);
-      const signer = new Signer({ keystore, access: repo, rpc: tradeChain, log });
-      const jupiter = new JupiterHttp(cfg.JUPITER_API_URL, log);
-
-      const executor = new Executor({
-        repo,
-        jupiter,
-        signer,
-        chain: tradeChain,
-        balances: { mintBalance: async (owner, mint) => (await rpc.getTokenBalances(owner, [mint])).get(mint) ?? 0n },
-        wallets: { pubkeyOf: (userId) => keystore.pubkeyOf(userId) },
-        dm: { send: async (userId, text) => void (await telegram.bot.api.sendMessage(userId, text).catch(() => undefined)) },
-        log,
-        solUsd: () => feed.solUsd(),
-        decimalsOf: async (mint) => (await tokenMeta.get(mint as Mint))?.decimals ?? null,
-        ownerUserId: cfg.OWNER_USER_ID,
-        config: {
-          maxPriceImpactPct: cfg.MAX_PRICE_IMPACT_PCT,
-          priorityFeeLamports: cfg.PRIORITY_FEE_LAMPORTS,
-          confirmTimeoutMs: cfg.CONFIRM_TIMEOUT_MS,
-        },
       });
 
       // /resolve <executionId> confirmed|failed — the human exit from an UNKNOWN outcome.
@@ -523,22 +547,18 @@ async function main(): Promise<void> {
         log,
       });
 
-      const scheduler = new Scheduler({
-        repo,
-        valuer,
-        execute: cfg.DRY_RUN ? dryRunExecutor(log) : executor.execute,
-        log,
+      // Tell everyone whose wallet a restart just locked. Best-effort and non-fatal.
+      void bootNotices(repo, keystore, atEnvUnlocked).then(async (notices) => {
+        for (const n of notices) {
+          try {
+            await telegram.bot.api.sendMessage(n.userId, n.text);
+          } catch {
+            log.warn({ userId: n.userId }, 'autotrader: could not deliver restart notice');
+          }
+        }
       });
-      await scheduler.logActiveOnBoot(); // schedules survive restart; prove it in the boot log
-      scheduler.start();
-      shutdown.register('scheduler', () => {
-        scheduler.stop();
-        return Promise.resolve();
-      });
-      log.info(
-        { dryRun: cfg.DRY_RUN, jupiter: cfg.JUPITER_API_URL, maxImpactPct: cfg.MAX_PRICE_IMPACT_PCT },
-        cfg.DRY_RUN ? 'autotrader: scheduler in DRY_RUN — no trades will execute' : 'autotrader: EXECUTION LIVE via Jupiter',
-      );
+
+      log.info('autotrader: Telegram commands registered');
     }
 
     /**
