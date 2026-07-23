@@ -257,6 +257,15 @@ export class HeliusRpc implements SolanaRpc {
     ]);
   }
 
+  /**
+   * Raw JSON-RPC passthrough for callers that need a method not wrapped above — the Phase 14
+   * trade chain adapter (simulate / send / getSignatureStatuses / getTokenAccountsByOwner-base64).
+   * Kept narrow and off the hot path; the wrapped methods above stay the preferred surface.
+   */
+  rpc<T>(method: string, params: unknown): Promise<T> {
+    return this.#call<T>(method, params);
+  }
+
   async getTokenSupply(mint: Mint): Promise<{ amount: bigint; decimals: number } | null> {
     const r = await this.#call<{ value?: { amount: string; decimals: number } }>('getTokenSupply', [mint]);
     if (!r?.value) return null;

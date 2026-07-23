@@ -10,6 +10,11 @@ import { Keystore } from './trade/keystore.js';
 import { registerTradeCommands } from './telegram/trade-commands.js';
 import { bootNotices, envUnlock } from './trade/unlock.js';
 import { Scheduler, dryRunExecutor, type TradeValuer } from './trade/scheduler.js';
+import { Signer } from './trade/signer.js';
+import { TradeChain } from './trade/chain.js';
+import { JupiterHttp } from './trade/jupiter.js';
+import { Executor } from './trade/executor.js';
+import { registerResolveCommand } from './telegram/resolve-command.js';
 import { registerCuration } from './telegram/curate/index.js';
 import { setPlanWhitelist } from './telegram/plan-gate.js';
 import { BurstDetector, DailyCap, digestText } from './telegram/digest.js';
@@ -436,9 +441,9 @@ async function main(): Promise<void> {
         unlockConfig,
         primaryMint: cfg.DEFAULT_MINT,
         primarySymbol: (await tokenMeta.get(cfg.DEFAULT_MINT as Mint))?.symbol ?? 'tokens',
-        // Phase 13 owns schedules. Until then there is nothing to pause, and the hook is
-        // here so that lock/remove/purge already call it when there is.
-        pauseSchedules: async () => undefined,
+        // Locking or revoking a wallet pauses that user's schedules — now that trading is real
+        // (Phase 14), a locked wallet must not keep firing DCA slots.
+        pauseSchedules: async (userId: number) => void (await repo.pauseUserSchedules(userId)),
       });
 
       const envUnlocked = envUnlock(keystore, unlockConfig, log);
@@ -458,21 +463,26 @@ async function main(): Promise<void> {
       log.info({ keystores: cfg.KEYSTORE_DIR, envUnlocked: envUnlocked.length }, 'autotrader: key custody ready (no trading in phase 12)');
 
       /**
-       * PHASE 13: the DCA scheduler. Decides WHAT and WHEN, and logs it — it executes NOTHING.
-       * Every claimed slot ends as failed/dry-run via `dryRunExecutor`, so a full day of intended
-       * trades can be read off the logs before Phase 14 gives the executor teeth. This runs
-       * whether or not DRY_RUN is set: the phase itself is the safety boundary, not the flag.
+       * PHASE 13 + 14: the DCA scheduler decides WHAT and WHEN; the executor DOES it via Jupiter.
+       *
+       * DRY_RUN is the safety boundary here too (INVARIANT 7 — a trade IS a send): under DRY_RUN the
+       * scheduler runs with the dry-run executor (logs intended trades, spends nothing), so a full
+       * day can be read off the logs on the real code before money moves. With DRY_RUN=false the real
+       * executor quotes, guards, signs, simulates, submits and confirms.
        */
       const valuer: TradeValuer = {
-        // Buy side is priced EXACTLY: lamports of SOL × SOL/USD. A null feed -> unpriceable ->
-        // the slot is skipped, never fired against a price we do not have.
-        // Sell-side USD valuation (token leg) lands with the quote/execution path in Phase 14;
-        // until then a sell schedule logs `unpriceable-skipped` rather than guessing a price.
+        // Buy/absolute is priced EXACTLY: lamports of SOL × SOL/USD. A null feed -> unpriceable ->
+        // the scheduler skips the slot rather than fire against a price we do not have.
+        // Sells (and percent-of-balance) are valued at EXECUTION time by the executor, which reads
+        // the live balance, recomputes, and re-checks caps. A provisional 0 keeps the scheduler from
+        // skipping them; the executor is authoritative for their caps.
         usdValueOf: async (schedule) => {
-          if (schedule.side !== 'buy' || schedule.amountKind !== 'absolute') return null;
-          const solUsd = feed.solUsd();
-          if (solUsd === null) return null;
-          return (Number(schedule.amountRaw) / 1e9) * solUsd;
+          if (schedule.side === 'buy' && schedule.amountKind === 'absolute') {
+            const solUsd = feed.solUsd();
+            if (solUsd === null) return null;
+            return (Number(schedule.amountRaw) / 1e9) * solUsd;
+          }
+          return 0;
         },
         solBalanceLamports: async (userId) => {
           const pubkey = keystore.pubkeyOf(userId);
@@ -480,10 +490,43 @@ async function main(): Promise<void> {
         },
       };
 
+      // The chain adapter backs BOTH the signer's guard and the executor.
+      const tradeChain = new TradeChain(rpc, log);
+      const signer = new Signer({ keystore, access: repo, rpc: tradeChain, log });
+      const jupiter = new JupiterHttp(cfg.JUPITER_API_URL, log);
+
+      const executor = new Executor({
+        repo,
+        jupiter,
+        signer,
+        chain: tradeChain,
+        balances: { mintBalance: async (owner, mint) => (await rpc.getTokenBalances(owner, [mint])).get(mint) ?? 0n },
+        wallets: { pubkeyOf: (userId) => keystore.pubkeyOf(userId) },
+        dm: { send: async (userId, text) => void (await telegram.bot.api.sendMessage(userId, text).catch(() => undefined)) },
+        log,
+        solUsd: () => feed.solUsd(),
+        decimalsOf: async (mint) => (await tokenMeta.get(mint as Mint))?.decimals ?? null,
+        ownerUserId: cfg.OWNER_USER_ID,
+        config: {
+          maxPriceImpactPct: cfg.MAX_PRICE_IMPACT_PCT,
+          priorityFeeLamports: cfg.PRIORITY_FEE_LAMPORTS,
+          confirmTimeoutMs: cfg.CONFIRM_TIMEOUT_MS,
+        },
+      });
+
+      // /resolve <executionId> confirmed|failed — the human exit from an UNKNOWN outcome.
+      registerResolveCommand(telegram.bot, {
+        repo,
+        getExecution: (id) => repo.getExecution(id),
+        resolve: (id, verdict) => executor.resolve(id, verdict),
+        ownerUserId: cfg.OWNER_USER_ID,
+        log,
+      });
+
       const scheduler = new Scheduler({
         repo,
         valuer,
-        execute: dryRunExecutor(log),
+        execute: cfg.DRY_RUN ? dryRunExecutor(log) : executor.execute,
         log,
       });
       await scheduler.logActiveOnBoot(); // schedules survive restart; prove it in the boot log
@@ -492,6 +535,10 @@ async function main(): Promise<void> {
         scheduler.stop();
         return Promise.resolve();
       });
+      log.info(
+        { dryRun: cfg.DRY_RUN, jupiter: cfg.JUPITER_API_URL, maxImpactPct: cfg.MAX_PRICE_IMPACT_PCT },
+        cfg.DRY_RUN ? 'autotrader: scheduler in DRY_RUN — no trades will execute' : 'autotrader: EXECUTION LIVE via Jupiter',
+      );
     }
 
     /**

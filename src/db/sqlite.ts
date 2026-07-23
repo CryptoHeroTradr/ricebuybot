@@ -38,6 +38,7 @@ import type {
   AmountKind,
   Caps,
   ExecutionOutcome,
+  ExecutionRecord,
   Schedule,
   ScheduleState,
   SchedulerRepo,
@@ -1686,6 +1687,57 @@ export class SqliteRepo implements Repo {
         outcome.error ?? null,
         id,
       );
+  }
+
+  async getExecution(id: number): Promise<ExecutionRecord | null> {
+    const r = this.#db
+      .prepare<[number], {
+        id: number; schedule_id: number; user_id: number; planned_at: number; state: string;
+        signature: string | null; in_raw: string | null; out_raw: string | null;
+        price_usd: number | null; usd_value: number | null; error: string | null;
+      }>('SELECT * FROM executions WHERE id = ?')
+      .get(id);
+    if (!r) return null;
+    return {
+      id: r.id,
+      scheduleId: r.schedule_id,
+      userId: r.user_id,
+      plannedAt: r.planned_at,
+      state: r.state as ExecutionOutcome['state'],
+      signature: r.signature,
+      inRaw: r.in_raw != null ? BigInt(r.in_raw) : null,
+      outRaw: r.out_raw != null ? BigInt(r.out_raw) : null,
+      priceUsd: r.price_usd,
+      usdValue: r.usd_value,
+      error: r.error,
+    };
+  }
+
+  /** Resolution unhalt: a paused-by-UNKNOWN schedule resumes. next_run_at is left as it was —
+   *  the scheduler's gap logic skips any slots that expired while it was halted (no backfill). */
+  async unhaltSchedule(id: number): Promise<void> {
+    this.#db
+      .prepare(`UPDATE schedules SET state = 'active', halt_reason = NULL, updated_at = ? WHERE id = ?`)
+      .run(Date.now(), id);
+  }
+
+  /**
+   * KILL SWITCH — halt every active schedule at once. Three consecutive failed executions is a
+   * broken assumption, not bad luck (INVARIANT 16-17 territory), so we stop ALL trading and page a
+   * human rather than keep firing into whatever is wrong. Returns how many were halted.
+   */
+  async haltAllActiveSchedules(reason: string, at: number): Promise<number> {
+    return this.#db
+      .prepare(`UPDATE schedules SET state = 'halted', halt_reason = ?, updated_at = ? WHERE state = 'active'`)
+      .run(reason, at).changes;
+  }
+
+  /** Pause one user's active schedules — called when their wallet is locked or revoked. Scoped by
+   *  user_id: a lock stops that person's trading and nobody else's (INVARIANT 14). */
+  async pauseUserSchedules(userId: number): Promise<number> {
+    return this.#db
+      .prepare(`UPDATE schedules SET state = 'paused', updated_at = ? WHERE user_id = ? AND state = 'active'`)
+      .run(Date.now(), userId).changes;
   }
 
   // --- Cursors ---

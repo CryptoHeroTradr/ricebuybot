@@ -135,6 +135,24 @@ const EnvSchema = z
      * requires a DM unlock after a restart.
      */
     OWNER_KEYSTORE_PASSPHRASE: z.string().min(8, 'must be at least 8 chars').optional(),
+
+    // --- Phase 14: autotrader EXECUTION (Jupiter) --------------------------------------------
+    //
+    // NOTE (Phase 9 allowlist): turning execution on adds ONE new outbound host — the Jupiter
+    // quote/swap API. It is not on the zero-telemetry allowlist because until Phase 14 the bot
+    // never traded. The VPS firewall must permit it; `pnpm audit:network` will not see it (the
+    // host comes from this config value at runtime, not a dependency).
+    JUPITER_API_URL: z.string().url('must be a URL').default('https://quote-api.jup.ag/v6'),
+
+    /** Reject a quote whose price impact exceeds this FRACTION. A slippage setting is not a
+     *  price-impact guard: on a ~$105K-cap token a modest order moves the price itself. */
+    MAX_PRICE_IMPACT_PCT: z.coerce.number().positive().max(1).default(0.03),
+
+    /** Priority fee (lamports). A transaction that never lands is worse than one that costs more. */
+    PRIORITY_FEE_LAMPORTS: z.coerce.number().int().nonnegative().default(100_000),
+
+    /** Bounded confirmation wait (ms) before an outcome is declared UNKNOWN. */
+    CONFIRM_TIMEOUT_MS: z.coerce.number().int().positive().default(90_000),
   })
   .superRefine((env, ctx) => {
     if (env.INGEST_MODE === 'webhook' && !env.WEBHOOK_SECRET) {

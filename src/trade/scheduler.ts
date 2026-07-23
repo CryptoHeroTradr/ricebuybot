@@ -54,6 +54,21 @@ export interface Caps {
   readonly minSolReserveLamports: bigint;
 }
 
+/** A row of the executions ledger, hydrated. Phase 14's executor and /resolve read these. */
+export interface ExecutionRecord {
+  readonly id: number;
+  readonly scheduleId: number;
+  readonly userId: number;
+  readonly plannedAt: number;
+  readonly state: ExecutionState;
+  readonly signature: string | null;
+  readonly inRaw: bigint | null;
+  readonly outRaw: bigint | null;
+  readonly priceUsd: number | null;
+  readonly usdValue: number | null;
+  readonly error: string | null;
+}
+
 /**
  * A trade the scheduler has decided to make. The unit the executor (Phase 14) will act on,
  * and — in this phase — the unit that is logged and marked `dry-run`.
@@ -63,6 +78,12 @@ export interface PlannedTrade {
   readonly plannedAt: number;
   /** The trade's USD value at decision time, from the pricer. Used for the cap checks. */
   readonly usdValue: number;
+  /**
+   * The claimed execution row's id. Phase 14's executor writes `submitted` (with the signature)
+   * to this row BEFORE it sends — so a process that dies mid-send leaves the signature on disk
+   * and the outcome discoverable. The dry-run executor ignores it.
+   */
+  readonly executionId: number;
 }
 
 export interface ExecutionOutcome {
@@ -376,7 +397,7 @@ export class Scheduler {
     }
 
     // --- EXECUTE. Phase 13: the dry-run executor logs and marks failed/dry-run. ---------------
-    const plan: PlannedTrade = { schedule, plannedAt, usdValue };
+    const plan: PlannedTrade = { schedule, plannedAt, usdValue, executionId: execId };
     const outcome = await this.#execute(plan);
     await this.#repo.settleExecution(execId, outcome);
     return { kind: 'fired', plannedAt, outcome };
