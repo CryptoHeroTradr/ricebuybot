@@ -5,7 +5,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { InputArbiter } from '../src/telegram/input-arbiter.ts';
+import { InputArbiter, registerCancelCommand } from '../src/telegram/input-arbiter.ts';
 import { encodeBase58 } from '../src/trade/base58.ts';
 import { isSecretKeyBase58, scrub, createLogger } from '../src/ops/logger.ts';
 import { SqliteRepo } from '../src/db/sqlite.ts';
@@ -215,5 +215,217 @@ describe('routing does not depend on handler registration order', () => {
     expect(wallet).toMatch(/arbiter\.acquire\(uid, 'wallet', \{ protected: true/);
     expect(wallet).toMatch(/arbiter\.release\(uid, 'wallet'\)/);
     expect(wallet).not.toMatch(/pending\.set\(userId/); // all sets go through setPending
+  });
+});
+
+// ===========================================================================================
+// 4. /cancel — THE EXIT. One implementation, owned by the arbiter, above every handler.
+// ===========================================================================================
+
+type Handler = (ctx: any, next?: () => Promise<void>) => Promise<void>;
+
+class FakeBot {
+  commands = new Map<string, Handler>();
+  textHandler: Handler | null = null;
+  command(name: string, h: Handler): void {
+    this.commands.set(name, h);
+  }
+  on(event: string, h: Handler): void {
+    if (event === 'message:text') this.textHandler = h;
+  }
+}
+
+class FakeCtx {
+  replies: string[] = [];
+  nextCalled = false;
+  constructor(
+    public userId: number,
+    public text = '',
+    public match = '',
+    private chatType = 'private',
+  ) {}
+  get from() { return { id: this.userId }; }
+  get chat() { return { id: this.userId, type: this.chatType }; }
+  get message() { return { text: this.text, message_id: 55 }; }
+  reply = async (t: string) => { this.replies.push(t); return { message_id: 999 }; };
+  api = {
+    deleteMessage: async () => undefined,
+    sendMessage: async () => undefined,
+    editMessageText: async () => undefined,
+  };
+  next = async () => { this.nextCalled = true; };
+}
+
+describe('/cancel is the exit, and it is reachable from inside a protected slot', () => {
+  it('releases a WALLET slot, and the panel works IMMEDIATELY afterward — not after the TTL', () => {
+    const clock = { t: 1_000 };
+    const a = new InputArbiter(() => clock.t);
+    const bot = new FakeBot();
+    registerCancelCommand(bot as never, a);
+
+    a.acquire(USER, 'wallet', { protected: true, ttlMs: TTL });
+    expect(a.acquire(USER, 'panel', { ttlMs: TTL }).ok).toBe(false); // locked out, as designed
+
+    return (async () => {
+      const ctx = new FakeCtx(USER);
+      await bot.commands.get('cancel')!(ctx);
+      expect(ctx.replies[0]).toBe('Cancelled the pending wallet setup.');
+      expect(a.peek(USER)).toBeNull();
+
+      // IMMEDIATELY — the clock has not moved, so this proves it is not the TTL expiring.
+      expect(clock.t).toBe(1_000);
+      expect(a.acquire(USER, 'panel', { ttlMs: TTL }).ok).toBe(true);
+    })();
+  });
+
+  it('releases a CURATION slot and a PANEL slot, naming each', async () => {
+    const a = new InputArbiter(() => 1_000);
+    const bot = new FakeBot();
+    registerCancelCommand(bot as never, a);
+
+    for (const [owner, label] of [['curation', 'meme upload'], ['panel', 'settings prompt']] as const) {
+      a.acquire(USER, owner, { ttlMs: TTL });
+      const ctx = new FakeCtx(USER);
+      await bot.commands.get('cancel')!(ctx);
+      expect(ctx.replies[0]).toBe(`Cancelled the pending ${label}.`);
+      expect(a.peek(USER)).toBeNull();
+    }
+  });
+
+  it('with nothing open replies "Nothing to cancel." and changes nothing', async () => {
+    const a = new InputArbiter(() => 1_000);
+    const bot = new FakeBot();
+    registerCancelCommand(bot as never, a);
+
+    const ctx = new FakeCtx(USER);
+    await bot.commands.get('cancel')!(ctx);
+    expect(ctx.replies[0]).toBe('Nothing to cancel.');
+    expect(a.peek(USER)).toBeNull();
+    expect(a.open).toBe(0);
+  });
+
+  it('runs the owner cleanup, not just the slot release', async () => {
+    const a = new InputArbiter(() => 1_000);
+    const bot = new FakeBot();
+    registerCancelCommand(bot as never, a);
+    const cleared: number[] = [];
+    a.onCancel('panel', (uid) => void cleared.push(uid));
+    a.acquire(USER, 'panel', { ttlMs: TTL });
+
+    await bot.commands.get('cancel')!(new FakeCtx(USER));
+    expect(cleared).toEqual([USER]); // the payload cleanup ran
+  });
+
+  it('subsumes non-slot flows via a fallback (the group /setup wizard)', async () => {
+    const a = new InputArbiter(() => 1_000);
+    const bot = new FakeBot();
+    registerCancelCommand(bot as never, a);
+    let wizardOpen = true;
+    a.onFallbackCancel('group setup', () => {
+      if (!wizardOpen) return false;
+      wizardOpen = false;
+      return true;
+    });
+
+    const ctx = new FakeCtx(USER);
+    await bot.commands.get('cancel')!(ctx);
+    expect(ctx.replies[0]).toBe('Cancelled the pending group setup.');
+    // Second time there is nothing left.
+    const ctx2 = new FakeCtx(USER);
+    await bot.commands.get('cancel')!(ctx2);
+    expect(ctx2.replies[0]).toBe('Nothing to cancel.');
+  });
+
+  it('a /cancel typed in a GROUP does not reach into the user\'s DM wallet slot', async () => {
+    const a = new InputArbiter(() => 1_000);
+    const bot = new FakeBot();
+    registerCancelCommand(bot as never, a);
+    a.acquire(USER, 'wallet', { protected: true, ttlMs: TTL });
+
+    await bot.commands.get('cancel')!(new FakeCtx(USER, '', '', 'supergroup'));
+    expect(a.owns(USER, 'wallet')).toBe(true); // untouched from a group
+  });
+});
+
+describe('/cancel during a real wallet import leaves NO fragment behind', () => {
+  it('clears the pending state, not just the slot — and the panel is usable at once', async () => {
+    const { Keystore } = await import('../src/trade/keystore.ts');
+    const { registerTradeCommands } = await import('../src/telegram/trade-commands.ts');
+
+    const dir = mkdtempSync(join(tmpdir(), 'ricebuybot-cancel-'));
+    const repo2 = new SqliteRepo(':memory:', log);
+    await repo2.init();
+    await repo2.addAutotraderUser(USER, 'tester', 1);
+    const arbiter = new InputArbiter();
+    const bot = new FakeBot();
+
+    // /cancel FIRST — exactly as boot does it, above the wallet's text handler.
+    registerCancelCommand(bot as never, arbiter);
+    registerTradeCommands(bot as never, {
+      repo: repo2,
+      keystore: new Keystore({ dir }),
+      rpc: { getBalance: async () => 1n, getOwnedTokenAccountsParsed: async () => [] },
+      log,
+      unlockConfig: { ownerUserId: 1, ownerPassphrase: undefined },
+      primaryMint: MINT,
+      primarySymbol: 'RICE',
+      pauseSchedules: async () => undefined,
+      arbiter,
+    });
+
+    // Start a real import: pending = import-ack, slot protected.
+    await bot.commands.get('wallet')!(new FakeCtx(USER, '', 'import'));
+    expect(arbiter.owns(USER, 'wallet')).toBe(true);
+    expect(arbiter.acquire(USER, 'panel', { ttlMs: TTL }).ok).toBe(false);
+
+    // /cancel — reachable even though the wallet slot is PROTECTED.
+    const cancelCtx = new FakeCtx(USER);
+    await bot.commands.get('cancel')!(cancelCtx);
+    expect(cancelCtx.replies[0]).toBe('Cancelled the pending wallet setup.');
+    expect(arbiter.peek(USER)).toBeNull();
+
+    // NO FRAGMENT of the pending state survives: the wallet's text handler now passes the message
+    // straight through instead of reading it as the import's next step.
+    const after = new FakeCtx(USER, 'I UNDERSTAND');
+    await bot.textHandler!(after, after.next);
+    expect(after.nextCalled).toBe(true);
+    expect(after.replies).toEqual([]);
+
+    // …and the panel can take the slot at once.
+    expect(arbiter.acquire(USER, 'panel', { ttlMs: TTL }).ok).toBe(true);
+
+    await repo2.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('every refusal names its own exit', () => {
+  it('the precedence refusals contain "/cancel" (so they cannot regress into dead ends)', () => {
+    const read = (f: string): string => readFileSync(join(import.meta.dirname, '..', f), 'utf8');
+    for (const f of ['src/telegram/trade-panel/index.ts', 'src/telegram/curate/index.ts']) {
+      const src = read(f);
+      const refusal = /Finish your \$\{claim\.heldLabel\}[^`]*/.exec(src)?.[0] ?? '';
+      expect(refusal, `${f} refusal must name its exit`).toContain('/cancel');
+    }
+  });
+
+  it('there is exactly ONE /cancel implementation, and it is the arbiter\'s', () => {
+    const read = (f: string): string => readFileSync(join(import.meta.dirname, '..', f), 'utf8');
+    expect(read('src/telegram/input-arbiter.ts')).toMatch(/bot\.command\('cancel'/);
+    // The group-config surface no longer registers its own; it hooks in as a fallback.
+    const cmds = read('src/telegram/commands.ts');
+    expect(cmds).not.toMatch(/bot\.command\('cancel'/);
+    expect(cmds).toMatch(/onFallbackCancel\('group setup'/);
+  });
+
+  it('boot registers /cancel BEFORE every handler that could swallow the message', () => {
+    const boot = readFileSync(join(import.meta.dirname, '..', 'src/index.ts'), 'utf8');
+    const at = (needle: string): number => boot.indexOf(needle);
+    const cancelAt = at('registerCancelCommand(telegram.bot');
+    expect(cancelAt).toBeGreaterThan(-1);
+    // The wallet's text handler is the one that would read "/cancel" as a passphrase.
+    for (const later of ['registerCommands(telegram.bot', 'registerCuration(telegram.bot', 'registerTradeCommands(telegram.bot', 'registerTradePanel(telegram.bot']) {
+      expect(cancelAt, `/cancel must be registered before ${later}`).toBeLessThan(at(later));
+    }
   });
 });

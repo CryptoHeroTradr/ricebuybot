@@ -80,6 +80,14 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
     deps.arbiter.release(uid, 'wallet');
   };
 
+  // /cancel is owned by the arbiter; this is only HOW to drop our payload when it fires. A secret
+  // buffer is zeroed on the way out — a cancelled import must not leave key bytes in memory.
+  deps.arbiter.onCancel('wallet', (uid: number) => {
+    const st = pending.get(uid) as { secret?: Buffer } | undefined;
+    if (st?.secret) st.secret.fill(0);
+    pending.delete(uid);
+  });
+
   const userIdOf = (ctx: Context): number => ctx.from?.id ?? 0;
   const isDm = (ctx: Context): boolean => ctx.chat?.type === 'private';
 

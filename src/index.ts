@@ -16,7 +16,7 @@ import { JupiterHttp } from './trade/jupiter.js';
 import { Executor } from './trade/executor.js';
 import { registerResolveCommand } from './telegram/resolve-command.js';
 import { registerTradePanel } from './telegram/trade-panel/index.js';
-import { InputArbiter } from './telegram/input-arbiter.js';
+import { InputArbiter, registerCancelCommand } from './telegram/input-arbiter.js';
 import { registerCuration } from './telegram/curate/index.js';
 import { setPlanWhitelist } from './telegram/plan-gate.js';
 import { BurstDetector, DailyCap, digestText } from './telegram/digest.js';
@@ -487,6 +487,10 @@ async function main(): Promise<void> {
     // ONE DM input arbiter shared by curation, wallet custody, and the trade panel: at most one
     // awaiting-input state per user, with /wallet import taking precedence structurally.
     const inputArbiter = new InputArbiter();
+    // /cancel FIRST — above every handler. The wallet's slot is protected so no other handler sees
+    // the message; registered after the wallet's text handler, "/cancel" would be read as a
+    // passphrase and the user would be locked in for the full TTL.
+    registerCancelCommand(telegram.bot, inputArbiter);
     registerCommands(telegram.bot, {
       repo,
       media: mediaPool,
@@ -502,6 +506,7 @@ async function main(): Promise<void> {
       subscribe: (mint) => ingestor.subscribe(mint),
       unsubscribe: (mint) => ingestor.unsubscribe(mint),
       currentMints: () => ingestor.mints,
+      arbiter: inputArbiter,
     });
     // Phase 8.5: DM meme curation. Registered BEFORE bot.start(), and only when there is a
     // real bot — DRY_RUN has nothing to curate into and nothing to send.

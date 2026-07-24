@@ -73,6 +73,8 @@ function extOf(name: string | undefined, fallback: string): string {
 export function registerCuration(bot: Bot, deps: CurateUiDeps): void {
   const sessions = deps.sessions ?? new CurationSessions();
   const arbiter = deps.arbiter;
+  // How to drop our payload when the arbiter's /cancel releases the slot.
+  arbiter.onCancel('curation', (uid: number) => void sessions.stopAwaiting(uid));
   const auth: AuthDeps = { repo: deps.repo, api: bot.api, ownerUserId: deps.ownerUserId };
   const curate: CurateDeps = { repo: deps.repo, pool: deps.pool, root: deps.mediaRoot, log: deps.log };
 
@@ -269,7 +271,7 @@ export function registerCuration(bot: Bot, deps: CurateUiDeps): void {
     if (verb === 'add') {
       const claim = arbiter.acquire(userId, 'curation', { ttlMs: AWAITING_TTL_MS });
       if (!claim.ok) {
-        return void ctx.reply(`Finish or cancel your ${claim.heldLabel} first (e.g. /wallet), then tap ➕ Add again.`);
+        return void ctx.reply(`Finish your ${claim.heldLabel} first, or send /cancel to drop it — then tap ➕ Add again.`);
       }
       sessions.startAwaiting(userId, board.mint, board.tier as TierFolder);
       if (claim.cancelled) await ctx.reply(`(cancelled the pending ${claim.cancelled})`);

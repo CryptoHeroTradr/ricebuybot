@@ -18,6 +18,8 @@
  *      handler can take the slot, so no other handler will ever process the key message.
  */
 
+import type { Bot, Context } from 'grammy';
+
 export type InputOwner = 'wallet' | 'curation' | 'panel';
 
 const DEFAULT_LABEL: Record<InputOwner, string> = {
@@ -40,10 +42,50 @@ export type AcquireResult =
 
 export class InputArbiter {
   readonly #slots = new Map<number, Slot>();
+  /** How to clear each owner's PAYLOAD when its slot is cancelled. The arbiter owns the slot; the
+   *  handler owns its own state, so it registers once how to drop it. Without this, /cancel would
+   *  free the slot and leave a half-finished import's pending state behind. */
+  readonly #cleanups = new Map<InputOwner, (userId: number) => void>();
+  /** Cancellable flows that are NOT arbiter slots (the group /setup wizard). Tried in order when no
+   *  slot is open, so one /cancel means one thing everywhere. Returns a label if it cancelled. */
+  readonly #fallbacks: Array<{ label: string; fn: (userId: number, chatId: number) => boolean }> = [];
   readonly #now: () => number;
 
   constructor(now: () => number = Date.now) {
     this.#now = now;
+  }
+
+  /** Register how to clear `owner`'s payload when its slot is released by /cancel. */
+  onCancel(owner: InputOwner, cleanup: (userId: number) => void): void {
+    this.#cleanups.set(owner, cleanup);
+  }
+
+  /** Register a non-slot flow that /cancel should also be able to drop (the /setup wizard). */
+  onFallbackCancel(label: string, fn: (userId: number, chatId: number) => boolean): void {
+    this.#fallbacks.push({ label, fn });
+  }
+
+  /**
+   * THE ONE /cancel. Drops whatever is open for this user — the slot AND its owner's payload — and
+   * returns what was cancelled so the reply can name it. Falls back to the non-slot flows, and
+   * returns null when there was nothing to cancel.
+   *
+   * `slotScoped` is false for group chats: a /cancel typed in a group must not reach into someone's
+   * DM wallet flow; only the chat-scoped fallbacks apply there.
+   */
+  cancel(userId: number, chatId: number, slotScoped = true): string | null {
+    if (slotScoped) {
+      const cur = this.#live(userId);
+      if (cur) {
+        this.#slots.delete(userId);
+        this.#cleanups.get(cur.owner)?.(userId); // drop the payload too, not just the slot
+        return cur.label;
+      }
+    }
+    for (const f of this.#fallbacks) {
+      if (f.fn(userId, chatId)) return f.label;
+    }
+    return null;
   }
 
   #live(userId: number): Slot | null {
@@ -100,4 +142,28 @@ export class InputArbiter {
   get open(): number {
     return this.#slots.size;
   }
+}
+
+/**
+ * /cancel — THE exit, owned by the arbiter and registered ABOVE all three handlers.
+ *
+ * It must be registered FIRST, before the wallet's `message:text` handler. The wallet's slot is
+ * protected precisely so no other handler sees the message — which includes this one. Registered
+ * after, "/cancel" would be swallowed by the import flow and read as a passphrase, and the user
+ * would be locked in for the full TTL with the bot telling them a door exists that they cannot open.
+ *
+ * There is exactly ONE implementation of this word. Other flows hook in via `onFallbackCancel`
+ * rather than registering a second `/cancel`.
+ */
+export function registerCancelCommand(bot: Bot, arbiter: InputArbiter): void {
+  bot.command('cancel', async (ctx: Context) => {
+    const userId = ctx.from?.id ?? 0;
+    const chatId = ctx.chat?.id ?? 0;
+    // In a group only the chat-scoped flows are cancellable — a group message must never reach
+    // into this user's DM wallet flow.
+    const slotScoped = ctx.chat?.type === 'private';
+    const cancelled = arbiter.cancel(userId, chatId, slotScoped);
+    // Never a bare "ok": say what state they just left, or that there was none.
+    await ctx.reply(cancelled ? `Cancelled the pending ${cancelled}.` : 'Nothing to cancel.');
+  });
 }

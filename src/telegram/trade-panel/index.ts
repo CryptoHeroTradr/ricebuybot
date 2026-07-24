@@ -68,6 +68,8 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
   const access = new AutotraderAccess(deps.access, log);
   const sessions = deps.sessions ?? new PanelSessions(deps.now);
   const now = deps.now ?? Date.now;
+  // How to drop our payload when the arbiter's /cancel releases the slot.
+  arbiter.onCancel('panel', (uid: number) => sessions.clearAwaiting(uid));
 
   const isDm = (ctx: Context): boolean => ctx.chat?.type === 'private';
 
@@ -210,7 +212,7 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
     // is mid-flow (a key is awaited), so a settings prompt can never intercept a secret key.
     const claim = arbiter.acquire(userId, 'panel', { ttlMs: AWAIT_TTL_MS });
     if (!claim.ok) {
-      return void ctx.reply(`Finish or cancel your ${claim.heldLabel} first (e.g. /wallet), then tap again.`);
+      return void ctx.reply(`Finish your ${claim.heldLabel} first, or send /cancel to drop it — then tap again.`);
     }
     sessions.startAwaiting(userId, verb, panel.token);
     const prefix = claim.cancelled ? `(cancelled the pending ${claim.cancelled})\n` : '';

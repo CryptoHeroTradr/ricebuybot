@@ -38,6 +38,9 @@ export interface CommandDeps {
   /** What the ingestor is subscribed to RIGHT NOW. Diffed against the DB, never assumed. */
   readonly currentMints: () => readonly Mint[];
   readonly wizards?: Wizards;
+  /** The shared DM input arbiter. /cancel lives THERE (one implementation of the word); this
+   *  surface registers the wizard/media capture as a fallback it can also drop. */
+  readonly arbiter?: import('./input-arbiter.js').InputArbiter;
 }
 
 /** The keyboard labels a group may set, and what they are called on the card. */
@@ -283,10 +286,13 @@ export function registerCommands(bot: Bot, deps: CommandDeps): void {
     );
   });
 
-  bot.command('cancel', async (ctx) => {
-    const had = wizards.cancel(chatIdOf(ctx), userIdOf(ctx));
-    awaitingMedia.delete(`${chatIdOf(ctx)}:${userIdOf(ctx)}`);
-    await ctx.reply(had ? 'Cancelled. Nothing was changed.' : 'Nothing to cancel.');
+  // /cancel is NOT registered here. There is exactly one implementation of that word and it lives
+  // in the input arbiter, above every handler — so it is reachable even from inside a protected
+  // wallet slot. This surface just tells the arbiter how to drop ITS in-progress state.
+  deps.arbiter?.onFallbackCancel('group setup', (userId, chatId) => {
+    const had = wizards.cancel(chatId, userId);
+    const hadMedia = awaitingMedia.delete(`${chatId}:${userId}`);
+    return had || hadMedia;
   });
 
   /**
