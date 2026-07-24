@@ -147,6 +147,13 @@ export interface ExecutorDeps {
   readonly solUsd: () => number | null;
   /** Decimals for a mint (from token metadata), for price_usd. */
   readonly decimalsOf: (mint: string) => Promise<number | null>;
+  /**
+   * DEAD-MAN (Phase 16). Whether it is safe to trade AT ALL right now. If the SOL price is stale,
+   * Helius is unreachable, or Telegram is failing, this returns not-ok and the execution is PAUSED
+   * — not halted, not retried-blind. A buy priced against a stale SOL number can breach its own USD
+   * cap without knowing; a swap we cannot alert on is a swap we should not make. Defaults to always-ok.
+   */
+  readonly tradingHealth?: () => { readonly ok: true } | { readonly ok: false; readonly reason: string };
   /** Bot admin, DMed on the kill switch. */
   readonly ownerUserId?: number | undefined;
   readonly config?: Partial<ExecutorConfig>;
@@ -207,6 +214,15 @@ export class Executor {
   };
 
   async #execute(plan: PlannedTrade): Promise<ExecutionOutcome> {
+    // DEAD-MAN, before anything money-moving. A pause is TRANSIENT — the schedule stays active and
+    // retries next slot — so it deliberately does NOT go through #accountForOutcome and cannot trip
+    // the kill switch: an outage is a broken ENVIRONMENT, not a broken assumption about the trade.
+    const health = this.#d.tradingHealth?.() ?? { ok: true as const };
+    if (!health.ok) {
+      this.#d.log.warn({ scheduleId: plan.schedule.id, reason: health.reason }, 'autotrader executor: DEAD-MAN — execution paused, not trading blind');
+      return { state: 'failed', usdValue: plan.usdValue, error: `paused (dead-man): ${health.reason}` };
+    }
+
     const outcome = await this.#run(plan).catch((err): ExecutionOutcome => {
       this.#d.log.error({ scheduleId: plan.schedule.id, err: msg(err) }, 'autotrader executor: unexpected error');
       return { state: 'failed', usdValue: plan.usdValue, error: `executor error: ${msg(err)}` };

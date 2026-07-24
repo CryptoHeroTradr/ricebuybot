@@ -421,6 +421,14 @@ async function main(): Promise<void> {
       log,
       solUsd: () => feed.solUsd(),
       decimalsOf: async (mint) => (await tokenMeta.get(mint as Mint))?.decimals ?? null,
+      // DEAD-MAN (Phase 16). Do not trade blind: pause execution when the SOL price is stale,
+      // Helius is unreachable, or Telegram polling is down (we could not alert on an UNKNOWN).
+      tradingHealth: () => {
+        if (feed.solUsd() === null) return { ok: false, reason: 'SOL price feed is stale' };
+        if (!ingestor.connected) return { ok: false, reason: 'Helius is unreachable' };
+        if (!telegramPolling) return { ok: false, reason: 'Telegram is not reachable' };
+        return { ok: true };
+      },
       ownerUserId: cfg.OWNER_USER_ID,
       config: {
         maxPriceImpactPct: cfg.MAX_PRICE_IMPACT_PCT,

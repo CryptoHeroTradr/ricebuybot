@@ -102,6 +102,7 @@ interface Overrides {
   parseSwap?: unknown;
   solUsd?: number | null;
   ownerUserId?: number;
+  tradingHealth?: () => { ok: true } | { ok: false; reason: string };
 }
 
 function mkExecutor(over: Overrides = {}): { executor: Executor; rec: Recorder; clock: { t: number } } {
@@ -145,6 +146,7 @@ function mkExecutor(over: Overrides = {}): { executor: Executor; rec: Recorder; 
     dm: { send: async (userId, text) => void rec.dms.push({ userId, text }) },
     log,
     solUsd: () => (over.solUsd === undefined ? 150 : over.solUsd),
+    tradingHealth: over.tradingHealth,
     decimalsOf: async () => 6,
     ownerUserId: over.ownerUserId,
     config: CFG,
@@ -527,3 +529,59 @@ function mkExecutorWithCeiling(ceiling: number): { executor: Executor; rec: Reco
   void base;
   return { executor, rec };
 }
+
+// ===========================================================================================
+// PHASE 16 — DEAD-MAN: do not trade blind
+// ===========================================================================================
+
+describe('the dead-man pauses execution rather than trading blind', () => {
+  for (const reason of ['SOL price feed is stale', 'Helius is unreachable', 'Telegram is not reachable']) {
+    it(`pauses when ${reason} — no quote, no sign, no send, schedule stays active`, async () => {
+      const schedule = await seedSchedule();
+      const plan = await claimedPlan(schedule);
+      const { executor, rec } = mkExecutor({ tradingHealth: () => ({ ok: false, reason }) });
+      const outcome = await executor.execute(plan);
+      expect(outcome.state).toBe('failed');
+      expect(outcome.error).toMatch(/dead-man/);
+      expect(rec.quotes).toHaveLength(0); // never even priced it
+      expect(rec.signAllowed).toHaveLength(0);
+      expect(rec.send).toBe(0);
+      expect(await schedState(schedule.id)).toBe('active'); // paused, NOT halted — it retries next slot
+    });
+  }
+
+  it('a dead-man pause does NOT count toward the 3-failure kill switch (it is an outage, not a bug)', async () => {
+    const a = await seedSchedule();
+    const bId = await repo.createSchedule({ userId: USER, mint: MINT, side: 'buy', amountRaw: SOL / 10n, amountKind: 'absolute', intervalMinutes: 60, firstRunAt: 2_000_000 });
+    const OWNER = 777;
+    const { executor, rec } = mkExecutor({ tradingHealth: () => ({ ok: false, reason: 'Helius is unreachable' }), ownerUserId: OWNER });
+
+    for (let i = 0; i < 5; i++) {
+      const plannedAt = a.nextRunAt + i;
+      const execId = (await repo.claimExecution(a.id, USER, plannedAt))!;
+      await executor.execute({ schedule: a, plannedAt, usdValue: 15, executionId: execId });
+    }
+    // Five dead-man pauses in a row and NOTHING is halted, no owner page.
+    expect(await schedState(a.id)).toBe('active');
+    expect(await schedState(bId)).toBe('active');
+    expect(rec.dms.some((d) => d.userId === OWNER)).toBe(false);
+  });
+
+  it('resumes trading the instant health returns', async () => {
+    const schedule = await seedSchedule();
+    let healthy = false;
+    const { executor, rec } = mkExecutor({
+      tradingHealth: () => (healthy ? { ok: true } : { ok: false, reason: 'SOL price feed is stale' }),
+      signatureStatus: async () => ({ confirmationStatus: 'confirmed', err: null, slot: 1 }),
+      parseSwap: () => ({ event: { kind: 'buy', quoteRaw: 1n, tokensRaw: 1n } }),
+    });
+    // While unhealthy: paused.
+    expect((await executor.execute(await claimedPlan(schedule, 15))).state).toBe('failed');
+    expect(rec.send).toBe(0);
+    // Health returns; the very next slot trades.
+    healthy = true;
+    const plan2 = { schedule, plannedAt: schedule.nextRunAt + 1, usdValue: 15, executionId: (await repo.claimExecution(schedule.id, USER, schedule.nextRunAt + 1))! };
+    expect((await executor.execute(plan2)).state).toBe('confirmed');
+    expect(rec.send).toBe(1);
+  });
+});
