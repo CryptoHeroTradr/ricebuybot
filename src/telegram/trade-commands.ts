@@ -6,6 +6,7 @@ import { Keystore, KeystoreError } from '../trade/keystore.js';
 import { decodeBase58, looksLikeSecretKey } from '../trade/base58.js';
 import { fetchInventory, exposureWarning, importValueWarning, renderWallet, shortPubkey, type WalletRpc } from '../trade/wallet.js';
 import { unlockModeFor, type UnlockConfig } from '../trade/unlock.js';
+import { InputArbiter } from './input-arbiter.js';
 
 /**
  * THE AUTOTRADER'S TELEGRAM SURFACE.
@@ -50,6 +51,8 @@ export interface TradeCommandDeps {
    * never silently continue against a new one. Returns how many were halted (for the message).
    */
   readonly onWalletChanged?: (userId: number) => Promise<number>;
+  /** The shared DM input arbiter — one awaiting state per user across all handlers. */
+  readonly arbiter: InputArbiter;
 }
 
 const ACK_PHRASE = 'I UNDERSTAND';
@@ -61,6 +64,21 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
 
   /** userId -> what we are waiting for. In memory: a conversation, not a setting. */
   const pending = new Map<number, Pending>();
+
+  // THE SINGLE INPUT SLOT. Every wallet awaiting-state is PROTECTED — while one is open (a key,
+  // a passphrase, a typed confirmation is expected), no other DM handler may take the slot, so the
+  // secret can never be claimed and echoed by the amount/curation handlers. setPending returns the
+  // label of any curation/panel prompt it displaced, so the caller can say what was cancelled.
+  const PENDING_TTL_MS = 10 * 60_000;
+  const setPending = (uid: number, state: Pending): string | null => {
+    pending.set(uid, state);
+    const r = deps.arbiter.acquire(uid, 'wallet', { protected: true, ttlMs: PENDING_TTL_MS });
+    return r.ok ? r.cancelled : null;
+  };
+  const clearPending = (uid: number): void => {
+    pending.delete(uid);
+    deps.arbiter.release(uid, 'wallet');
+  };
 
   const userIdOf = (ctx: Context): number => ctx.from?.id ?? 0;
   const isDm = (ctx: Context): boolean => ctx.chat?.type === 'private';
@@ -171,7 +189,10 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
           await ctx.reply('Usage: /trader purge <user_id>');
           return;
         }
-        pending.set(userId, { kind: 'purge-confirm', target });
+        {
+        const cancelled = setPending(userId, { kind: 'purge-confirm', target });
+        if (cancelled) await ctx.reply(`(cancelled the pending ${cancelled})`);
+      }
         await ctx.reply(
           [
             `⚠️ This DESTROYS ${target}'s encrypted key. It cannot be recovered.`,
@@ -224,7 +245,10 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
         // The warning comes BEFORE the key, and an acknowledgement is required. A person who
         // has already pasted their secret has already taken the risk; asking afterwards is
         // theatre.
-        pending.set(userId, { kind: 'import-ack' });
+        {
+        const cancelled = setPending(userId, { kind: 'import-ack' });
+        if (cancelled) await ctx.reply(`(cancelled the pending ${cancelled})`);
+      }
         await ctx.reply(
           [
             'Before you send a key, read this:',
@@ -242,7 +266,10 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
           await ctx.reply('You already have a wallet. /wallet export it first if you want to keep it.');
           return;
         }
-        pending.set(userId, { kind: 'generate-passphrase' });
+        {
+        const cancelled = setPending(userId, { kind: 'generate-passphrase' });
+        if (cancelled) await ctx.reply(`(cancelled the pending ${cancelled})`);
+      }
         await ctx.reply('Send a passphrase for your new wallet. It encrypts your key and I never store it.');
         return;
       }
@@ -252,7 +279,10 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
           await ctx.reply('No wallet to export.');
           return;
         }
-        pending.set(userId, { kind: 'export-confirm' });
+        {
+        const cancelled = setPending(userId, { kind: 'export-confirm' });
+        if (cancelled) await ctx.reply(`(cancelled the pending ${cancelled})`);
+      }
         await ctx.reply(
           ['⚠️ This reveals your secret key in this chat.', '', `Type exactly:  ${ACK_PHRASE}`].join('\n'),
         );
@@ -271,7 +301,10 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
           await ctx.reply('No wallet yet.');
           return;
         }
-        pending.set(userId, { kind: 'unlock' });
+        {
+          const cancelled = setPending(userId, { kind: 'unlock' });
+          if (cancelled) await ctx.reply(`(cancelled the pending ${cancelled})`);
+        }
         await ctx.reply('Send your passphrase. I will delete the message immediately.');
         return;
       }
@@ -285,7 +318,10 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
     const userId = await guard(ctx);
     if (userId === null) return;
     if (!keystore.has(userId)) return;
-    pending.set(userId, { kind: 'unlock' });
+    {
+      const cancelled = setPending(userId, { kind: 'unlock' });
+      if (cancelled) await ctx.reply(`(cancelled the pending ${cancelled})`);
+    }
     await ctx.reply('Send your passphrase. I will delete the message immediately.');
   });
 
@@ -300,7 +336,7 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
     // Owner purge confirmation is the one flow not gated on membership — the owner is
     // administering, and the target may already have been removed.
     if (state.kind === 'purge-confirm') {
-      pending.delete(userId);
+      clearPending(userId);
       if (!isOwner(unlockConfig.ownerUserId, userId)) return;
       if (ctx.message.text.trim() !== PURGE_PHRASE) {
         await ctx.reply('Not purged.');
@@ -327,11 +363,11 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
     switch (state.kind) {
       case 'import-ack': {
         if (ctx.message.text.trim() !== ACK_PHRASE) {
-          pending.delete(userId);
+          clearPending(userId);
           await ctx.reply('Not acknowledged — nothing imported.');
           return;
         }
-        pending.set(userId, { kind: 'import-secret' });
+        setPending(userId, { kind: 'import-secret' });
         await ctx.reply('Send your base58 secret key. I will delete the message the moment I read it.');
         return;
       }
@@ -341,12 +377,12 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
         const deleted = await deleteSecretMessage(ctx, 'SECRET KEY');
 
         if (!looksLikeSecretKey(text)) {
-          pending.delete(userId);
+          clearPending(userId);
           // Never quote the input back — it may be a real key with a typo.
           await ctx.reply("That doesn't look like a base58 secret key. Nothing imported.");
           return;
         }
-        pending.set(userId, { kind: 'import-passphrase', secret: Buffer.from(decodeBase58(text)) });
+        setPending(userId, { kind: 'import-passphrase', secret: Buffer.from(decodeBase58(text)) });
         await ctx.reply(
           [
             deleted ? '✅ Key received and your message deleted.' : '⚠️ Key received.',
@@ -361,7 +397,7 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
       case 'import-passphrase': {
         const passphrase = ctx.message.text;
         await deleteSecretMessage(ctx, 'PASSPHRASE');
-        pending.delete(userId);
+        clearPending(userId);
 
         try {
           const pubkey = keystore.import(userId, state.secret, passphrase, { overwrite: true });
@@ -392,7 +428,7 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
       case 'generate-passphrase': {
         const passphrase = ctx.message.text;
         await deleteSecretMessage(ctx, 'PASSPHRASE');
-        pending.delete(userId);
+        clearPending(userId);
 
         const { pubkey, secretBase58 } = keystore.generate(userId, passphrase, { overwrite: false });
         keystore.unlock(userId, passphrase);
@@ -419,11 +455,11 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
 
       case 'export-confirm': {
         if (ctx.message.text.trim() !== ACK_PHRASE) {
-          pending.delete(userId);
+          clearPending(userId);
           await ctx.reply('Not exported.');
           return;
         }
-        pending.set(userId, { kind: 'export-passphrase' });
+        setPending(userId, { kind: 'export-passphrase' });
         await ctx.reply('Send your passphrase.');
         return;
       }
@@ -431,7 +467,7 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
       case 'export-passphrase': {
         const passphrase = ctx.message.text;
         await deleteSecretMessage(ctx, 'PASSPHRASE');
-        pending.delete(userId);
+        clearPending(userId);
 
         try {
           const secret = keystore.exportSecret(userId, passphrase);
@@ -454,7 +490,7 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
       case 'unlock': {
         const passphrase = ctx.message.text;
         await deleteSecretMessage(ctx, 'PASSPHRASE');
-        pending.delete(userId);
+        clearPending(userId);
 
         try {
           keystore.unlock(userId, passphrase);

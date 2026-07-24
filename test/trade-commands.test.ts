@@ -6,6 +6,7 @@ import pino from 'pino';
 
 import { SqliteRepo } from '../src/db/sqlite.js';
 import { Keystore } from '../src/trade/keystore.js';
+import { InputArbiter } from '../src/telegram/input-arbiter.js';
 import { registerTradeCommands, type TradeCommandDeps } from '../src/telegram/trade-commands.js';
 import { renderWallet, exposureWarning, fetchInventory, type WalletRpc } from '../src/trade/wallet.js';
 import { bootNotices, envUnlock, unlockModeFor } from '../src/trade/unlock.js';
@@ -106,6 +107,7 @@ function setup(): TradeCommandDeps {
     pauseSchedules: async (userId) => {
       paused.push(userId);
     },
+    arbiter: new InputArbiter(),
   };
   registerTradeCommands(bot as any, deps);
   return deps;

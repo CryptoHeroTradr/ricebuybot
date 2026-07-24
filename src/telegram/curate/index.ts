@@ -9,7 +9,8 @@ import type { Repo } from '../../db/index.js';
 import type { MediaPool } from '../../media/index.js';
 import { addMedia, moveMedia, removeMedia, DOWNLOAD_LIMIT_BYTES, type CurateDeps } from '../../media/curate.js';
 import { NOT_A_CURATOR, resolveCurator, type AuthDeps } from './auth.js';
-import { CurationSessions, cb, parseCb, type Board } from './session.js';
+import { CurationSessions, AWAITING_TTL_MS, cb, parseCb, type Board } from './session.js';
+import { InputArbiter } from '../input-arbiter.js';
 import * as view from './view.js';
 
 export { CurationSessions } from './session.js';
@@ -23,6 +24,8 @@ export interface CurateUiDeps {
   readonly mediaRoot: string;
   readonly botToken: string;
   readonly ownerUserId?: number | undefined;
+  /** The shared DM input arbiter — one awaiting state per user across all handlers. */
+  readonly arbiter: InputArbiter;
   readonly sessions?: CurationSessions;
 }
 
@@ -69,6 +72,7 @@ function extOf(name: string | undefined, fallback: string): string {
 
 export function registerCuration(bot: Bot, deps: CurateUiDeps): void {
   const sessions = deps.sessions ?? new CurationSessions();
+  const arbiter = deps.arbiter;
   const auth: AuthDeps = { repo: deps.repo, api: bot.api, ownerUserId: deps.ownerUserId };
   const curate: CurateDeps = { repo: deps.repo, pool: deps.pool, root: deps.mediaRoot, log: deps.log };
 
@@ -116,7 +120,9 @@ export function registerCuration(bot: Bot, deps: CurateUiDeps): void {
   });
 
   bot.command('done', async (ctx) => {
-    const stopped = sessions.stopAwaiting(ctx.from?.id ?? 0);
+    const uid = ctx.from?.id ?? 0;
+    const stopped = sessions.stopAwaiting(uid);
+    arbiter.release(uid, 'curation');
     await ctx.reply(stopped ? 'Done. Send /media to see the board.' : 'Nothing in progress.');
   });
 
@@ -261,7 +267,12 @@ export function registerCuration(bot: Bot, deps: CurateUiDeps): void {
     }
 
     if (verb === 'add') {
+      const claim = arbiter.acquire(userId, 'curation', { ttlMs: AWAITING_TTL_MS });
+      if (!claim.ok) {
+        return void ctx.reply(`Finish or cancel your ${claim.heldLabel} first (e.g. /wallet), then tap ➕ Add again.`);
+      }
       sessions.startAwaiting(userId, board.mint, board.tier as TierFolder);
+      if (claim.cancelled) await ctx.reply(`(cancelled the pending ${claim.cancelled})`);
       const name = board.tier;
       await ctx.reply(
         `Send or forward media for **${name}**. I'll add each one as it arrives.\n\n/done when finished.`,
@@ -324,6 +335,9 @@ export function registerCuration(bot: Bot, deps: CurateUiDeps): void {
     if (!isDm(ctx)) return next();
 
     const userId = ctx.from?.id ?? 0;
+    // Process only if WE hold the single input slot — never by handler order. While a /wallet key
+    // is awaited the slot is the wallet's, so a forwarded file here does not steal that turn.
+    if (!arbiter.owns(userId, 'curation')) return next();
     const awaiting = sessions.awaiting(userId);
     if (!awaiting) return next();
 
@@ -338,6 +352,7 @@ export function registerCuration(bot: Bot, deps: CurateUiDeps): void {
       still.kind === 'one' ? still.mint === awaiting.mint : still.kind === 'many' && still.mints.includes(awaiting.mint);
     if (!allowed) {
       sessions.stopAwaiting(userId);
+      arbiter.release(userId, 'curation');
       return void ctx.reply(NOT_A_CURATOR);
     }
 

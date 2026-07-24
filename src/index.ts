@@ -16,6 +16,7 @@ import { JupiterHttp } from './trade/jupiter.js';
 import { Executor } from './trade/executor.js';
 import { registerResolveCommand } from './telegram/resolve-command.js';
 import { registerTradePanel } from './telegram/trade-panel/index.js';
+import { InputArbiter } from './telegram/input-arbiter.js';
 import { registerCuration } from './telegram/curate/index.js';
 import { setPlanWhitelist } from './telegram/plan-gate.js';
 import { BurstDetector, DailyCap, digestText } from './telegram/digest.js';
@@ -483,6 +484,9 @@ async function main(): Promise<void> {
   // is no bot and nothing to configure — which is correct: DRY_RUN is for watching cards,
   // not for onboarding groups.
   if (telegram) {
+    // ONE DM input arbiter shared by curation, wallet custody, and the trade panel: at most one
+    // awaiting-input state per user, with /wallet import taking precedence structurally.
+    const inputArbiter = new InputArbiter();
     registerCommands(telegram.bot, {
       repo,
       media: mediaPool,
@@ -508,6 +512,7 @@ async function main(): Promise<void> {
       mediaRoot: cfg.MEDIA_ROOT,
       botToken: cfg.TELEGRAM_BOT_TOKEN,
       ownerUserId: cfg.OWNER_USER_ID,
+      arbiter: inputArbiter,
     });
 
     /**
@@ -540,6 +545,7 @@ async function main(): Promise<void> {
         // CHANGING the wallet (new key imported/generated) HALTS the schedules (Phase 15) — explicit
         // resume required, because the money would otherwise move from a different wallet silently.
         onWalletChanged: (userId: number) => repo.haltUserSchedules(userId, 'wallet changed'),
+        arbiter: inputArbiter,
       });
 
       // /resolve <executionId> confirmed|failed — the human exit from an UNKNOWN outcome.
@@ -564,6 +570,7 @@ async function main(): Promise<void> {
         tradeLive: cfg.TRADE_LIVE,
         defaultMint: cfg.DEFAULT_MINT,
         log,
+        arbiter: inputArbiter,
       });
 
       // Tell everyone whose wallet a restart just locked. Best-effort and non-fatal.

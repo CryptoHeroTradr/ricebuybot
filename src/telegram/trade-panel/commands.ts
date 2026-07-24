@@ -48,9 +48,11 @@ const err = (message: string): ApplyResult => ({ ok: false, message });
 /** VALIDATE-BEFORE-WRITE: resolve a schedule that both exists AND belongs to the caller, else a
  *  specific error. Every id-taking action goes through this first. */
 async function ownedSchedule(repo: PanelRepo, userId: number, id: number): Promise<Schedule | ApplyResult> {
-  if (!Number.isInteger(id) || id <= 0) return err(`"${id}" is not a schedule id.`);
+  // Never echo the raw token back (it may be a mistyped secret). `id` here is already Number()'d;
+  // if it is not a clean positive integer, say what was expected instead of quoting anything.
+  if (!Number.isInteger(id) || id <= 0) return err('That is not a schedule id. Your ids are shown on /trade.');
   const s = await repo.getSchedule(id);
-  if (!s || s.userId !== userId) return err(`No schedule #${id} of yours. Check /trade for your ids.`);
+  if (!s || s.userId !== userId) return err(`No schedule #${id} of yours. Your ids are shown on /trade.`);
   return s;
 }
 function isErr(x: Schedule | ApplyResult): x is ApplyResult {

@@ -1,7 +1,7 @@
 import type { Bot, Context } from 'grammy';
 
 import type { Mint } from '../../core/types.js';
-import type { Logger } from '../../ops/logger.js';
+import { scrub, type Logger } from '../../ops/logger.js';
 import { AutotraderAccess, type AutotraderAccessRepo } from '../../trade/access.js';
 import type { Caps, ExecutionRecord, Schedule } from '../../trade/scheduler.js';
 import {
@@ -21,6 +21,7 @@ import {
 } from './commands.js';
 import { renderPanel, parseCb, type PanelData, type PanelVerb, type ScheduleView } from './render.js';
 import { PanelSessions } from './session.js';
+import { InputArbiter } from '../input-arbiter.js';
 
 /**
  * PHASE 15 — the control surface. DM-only, member-gated at action time, and every view and action
@@ -50,16 +51,20 @@ export interface TradePanelDeps {
   readonly tradeLive: boolean;
   readonly defaultMint: string;
   readonly log: Logger;
+  /** THE shared DM input arbiter — one awaiting state per user across all handlers. */
+  readonly arbiter: InputArbiter;
   readonly sessions?: PanelSessions;
   readonly now?: () => number;
 }
+
+const AWAIT_TTL_MS = 10 * 60_000;
 
 /** STOP ALL is the ONE button that acts on a single tap — a confirmation on an emergency stop is a
  *  design error. Every other button leads to a prompt. */
 const IMMEDIATE = new Set<PanelVerb>(['stop']);
 
 export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
-  const { repo, keystore, rpc, log } = deps;
+  const { repo, keystore, rpc, log, arbiter } = deps;
   const access = new AutotraderAccess(deps.access, log);
   const sessions = deps.sessions ?? new PanelSessions(deps.now);
   const now = deps.now ?? Date.now;
@@ -114,7 +119,9 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
   async function sendPanel(ctx: Context, userId: number, note?: string): Promise<void> {
     const panel = sessions.open(userId);
     const { text, keyboard } = await gather(userId, panel.token);
-    const body = note ? `${note}\n\n${text}` : text;
+    // scrub() is a BACKSTOP: apply* never echoes raw input, but a note is a place where anything
+    // could one day end up, so a secret-shaped token would be redacted before it is ever sent.
+    const body = note ? `${scrub(note)}\n\n${text}` : text;
     const sent = await ctx.reply(body, { reply_markup: { inline_keyboard: keyboard } });
     sessions.setMessageId(panel.token, sent.message_id);
   }
@@ -122,7 +129,7 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
   /** Re-render an existing panel IN PLACE (editMessageText). The one-message rule. */
   async function editPanel(ctx: Context, token: string, userId: number, chatId: number, messageId: number, note?: string): Promise<void> {
     const { text, keyboard } = await gather(userId, token);
-    const body = note ? `${note}\n\n${text}` : text;
+    const body = note ? `${scrub(note)}\n\n${text}` : text; // scrub() backstop — never echo a stray secret
     await ctx.api.editMessageText(chatId, messageId, body, { reply_markup: { inline_keyboard: keyboard } }).catch((e: unknown) => {
       // "message is not modified" and the like are non-fatal — the panel already shows current state.
       log.debug({ err: e instanceof Error ? e.message : String(e) }, 'panel edit skipped');
@@ -199,9 +206,15 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
       return void ctx.reply('Manage your wallet with /wallet (import, generate, lock, unlock). Changing it halts your schedules.');
     }
 
-    // Everything else prompts for input; the reply handler completes it and re-renders the panel.
+    // Everything else prompts for input. Take the ONE input slot first — refused if /wallet import
+    // is mid-flow (a key is awaited), so a settings prompt can never intercept a secret key.
+    const claim = arbiter.acquire(userId, 'panel', { ttlMs: AWAIT_TTL_MS });
+    if (!claim.ok) {
+      return void ctx.reply(`Finish or cancel your ${claim.heldLabel} first (e.g. /wallet), then tap again.`);
+    }
     sessions.startAwaiting(userId, verb, panel.token);
-    await ctx.reply(PROMPTS[verb] ?? 'Send the value:');
+    const prefix = claim.cancelled ? `(cancelled the pending ${claim.cancelled})\n` : '';
+    await ctx.reply(prefix + (PROMPTS[verb] ?? 'Send the value:'));
   });
 
   // ---------------------------------------------------------------------------
@@ -209,8 +222,12 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
   // ---------------------------------------------------------------------------
   bot.on('message:text', async (ctx, next) => {
     const userId = ctx.from?.id ?? 0;
+    // ROUTING BY THE ARBITER, not by handler order: process only if WE hold the input slot. While a
+    // /wallet key is awaited the slot is the wallet's, so this handler never sees the key message.
+    if (!arbiter.owns(userId, 'panel')) return next();
     const awaiting = sessions.takeAwaiting(userId);
-    if (!awaiting) return next(); // not a panel prompt — let curation/trade-commands handle it
+    arbiter.release(userId, 'panel');
+    if (!awaiting) return next();
     if (!isDm(ctx) || !(await access.check(userId)).allowed) return; // silence
     const panel = sessions.panel(awaiting.token, userId);
     if (!panel || panel === 'expired' || panel.messageId === null) return void ctx.reply(EXPIRED);
