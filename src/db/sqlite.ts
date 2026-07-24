@@ -1774,6 +1774,31 @@ export class SqliteRepo implements Repo {
       .run(reason, Date.now(), userId).changes;
   }
 
+  /**
+   * STARTUP SAFETY (Phase 16). Restarting the process must NEVER clear an unresolved trade.
+   *
+   * An execution left in 'submitted' means the process died mid-confirm — the swap may have landed
+   * and we lost the in-memory confirm loop, so its outcome is now genuinely UNKNOWN. Promote it, so
+   * /resolve (which acts only on UNKNOWN) can settle it. Then HALT every schedule that owns any
+   * unresolved (UNKNOWN) execution, regardless of its persisted state: a schedule with a trade of
+   * indeterminate outcome must not keep firing. Runs once at boot, BEFORE the scheduler ticks.
+   */
+  async quarantineUnresolvedOnBoot(at: number): Promise<{ submittedToUnknown: number; schedulesHalted: number }> {
+    return this.#db.transaction(() => {
+      const submittedToUnknown = this.#db
+        .prepare(`UPDATE executions SET state = 'UNKNOWN', error = 'process restarted mid-confirm — outcome unknown' WHERE state = 'submitted'`)
+        .run().changes;
+      const schedulesHalted = this.#db
+        .prepare(
+          `UPDATE schedules SET state = 'halted', halt_reason = 'unresolved execution across a restart — /resolve required', updated_at = ?
+            WHERE state != 'halted'
+              AND id IN (SELECT DISTINCT schedule_id FROM executions WHERE state = 'UNKNOWN')`,
+        )
+        .run(at).changes;
+      return { submittedToUnknown, schedulesHalted };
+    })();
+  }
+
   /** Resume all of ONE user's paused/halted schedules -> active, clearing any halt reason. The
    *  explicit resume a contract/wallet change requires. Scoped by user_id. Returns how many resumed. */
   async resumeUserSchedules(userId: number): Promise<number> {

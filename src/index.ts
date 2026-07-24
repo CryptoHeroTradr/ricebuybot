@@ -463,6 +463,13 @@ async function main(): Promise<void> {
       execute: cfg.TRADE_LIVE ? executor.execute : dryRunExecutor(log),
       log,
     });
+    // STARTUP SAFETY (Phase 16): a restart must never clear an unresolved trade. Any 'submitted'
+    // execution becomes UNKNOWN (we lost its confirm loop) and any schedule with an unresolved
+    // execution is halted — BEFORE the scheduler can tick and fire it again.
+    const quarantine = await repo.quarantineUnresolvedOnBoot(Date.now());
+    if (quarantine.submittedToUnknown > 0 || quarantine.schedulesHalted > 0) {
+      log.warn(quarantine, 'autotrader: quarantined unresolved executions on boot — schedules halted, /resolve required');
+    }
     await scheduler.logActiveOnBoot(); // schedules survive restart; prove it in the boot log
     scheduler.start();
     shutdown.register('scheduler', () => {

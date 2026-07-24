@@ -108,6 +108,9 @@ async function seed(overrides: Partial<Parameters<SqliteRepo['createSchedule']>[
 // 1. TWO OVERLAPPING TICKS CLAIM THE SAME SLOT — EXACTLY ONE WINS
 // ===========================================================================================
 
+const stateOfExec = (id: number): string | undefined =>
+  repo.raw.prepare<[number], { state: string }>('SELECT state FROM executions WHERE id = ?').get(id)?.state;
+
 describe('the atomic slot claim (INVARIANT 2, reused for real money)', () => {
   it('a second claim of the same slot returns null — the row is the idempotency key', async () => {
     const id = await seed();
@@ -385,3 +388,48 @@ function confirmExecutor(): Executor {
 // Keep the imported Schedule/SlotOutcome types referenced for readers of this file.
 export type _Schedule = Schedule;
 export type _SlotOutcome = SlotOutcome;
+
+// ===========================================================================================
+// PHASE 16 — STARTUP SAFETY: a restart never clears an unresolved trade
+// ===========================================================================================
+
+describe('quarantine on boot', () => {
+  it('an UNKNOWN execution keeps its schedule halted across a restart', async () => {
+    const id = await repo.createSchedule({ userId: USER, mint: MINT, side: 'buy', amountRaw: SOL / 10n, amountKind: 'absolute', intervalMinutes: 5, firstRunAt: 1_000 });
+    const execId = (await repo.claimExecution(id, USER, 1_000))!;
+    await repo.settleExecution(execId, { state: 'UNKNOWN', signature: 'sig-unknown' });
+    // The schedule was left ACTIVE (e.g. a manual resume left the UNKNOWN unresolved).
+    await repo.unhaltSchedule(id);
+    expect((await repo.getSchedule(id))!.state).toBe('active');
+
+    const r = await repo.quarantineUnresolvedOnBoot(2_000);
+    expect(r.schedulesHalted).toBe(1);
+    expect((await repo.getSchedule(id))!.state).toBe('halted'); // stays out of the tick loop
+    expect((await repo.getSchedule(id))!.haltReason).toMatch(/unresolved/);
+    // The UNKNOWN execution is untouched — /resolve is still its exit.
+    expect(stateOfExec(execId)).toBe('UNKNOWN');
+  });
+
+  it('a SUBMITTED execution (crash mid-confirm) becomes UNKNOWN and halts its schedule', async () => {
+    const id = await repo.createSchedule({ userId: USER, mint: MINT, side: 'buy', amountRaw: SOL / 10n, amountKind: 'absolute', intervalMinutes: 5, firstRunAt: 1_000 });
+    const execId = (await repo.claimExecution(id, USER, 1_000))!;
+    // Phase 14 records the signature and 'submitted' BEFORE sending; the process then died mid-confirm.
+    await repo.settleExecution(execId, { state: 'submitted', signature: 'sig-submitted' });
+
+    const r = await repo.quarantineUnresolvedOnBoot(2_000);
+    expect(r.submittedToUnknown).toBe(1);
+    expect(stateOfExec(execId)).toBe('UNKNOWN'); // now resolvable via /resolve
+    expect((await repo.getSchedule(id))!.state).toBe('halted'); // and its schedule is out of the loop
+  });
+
+  it('leaves resolved schedules alone — only unresolved ones are quarantined', async () => {
+    const clean = await repo.createSchedule({ userId: USER, mint: MINT, side: 'buy', amountRaw: SOL / 10n, amountKind: 'absolute', intervalMinutes: 5, firstRunAt: 1_000 });
+    const e = (await repo.claimExecution(clean, USER, 1_000))!;
+    await repo.settleExecution(e, { state: 'confirmed', usdValue: 1 });
+
+    const r = await repo.quarantineUnresolvedOnBoot(2_000);
+    expect(r.schedulesHalted).toBe(0);
+    expect(r.submittedToUnknown).toBe(0);
+    expect((await repo.getSchedule(clean))!.state).toBe('active'); // a confirmed schedule keeps running
+  });
+});
