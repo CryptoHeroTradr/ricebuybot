@@ -50,6 +50,8 @@ export interface TradePanelDeps {
   readonly meta: (mint: string) => Promise<{ symbol: string | null; decimals: number } | null>;
   readonly tradeLive: boolean;
   readonly defaultMint: string;
+  /** Env daily-cap ceiling — /trade caps refuses above it (the executor enforces it too). */
+  readonly maxPerDayUsdCeiling?: number;
   readonly log: Logger;
   /** THE shared DM input arbiter — one awaiting state per user across all handlers. */
   readonly arbiter: InputArbiter;
@@ -171,7 +173,7 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
     const tokens = args.split(/\s+/);
     // stop and the id-taking subcommands all funnel through the shared dispatcher, THEN re-render.
     const contract = await contractOf(userId);
-    const r = await dispatchTradeCommand(repo, userId, contract, tokens, now());
+    const r = await dispatchTradeCommand(repo, userId, contract, tokens, now(), deps.maxPerDayUsdCeiling ?? Infinity);
     await sendPanel(ctx, userId, r.ok ? `✅ ${r.message}` : `⚠️ ${r.message}`);
   });
 
@@ -257,7 +259,7 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
 
     const text = ctx.message.text.trim();
     const contract = await contractOf(userId);
-    const r = await completePrompt(repo, userId, awaiting.verb, text, contract, now());
+    const r = await completePrompt(repo, userId, awaiting.verb, text, contract, now(), deps.maxPerDayUsdCeiling ?? Infinity);
 
     const chatId = ctx.chat?.id;
     if (chatId !== undefined) {
@@ -283,7 +285,7 @@ const PROMPTS: Partial<Record<PanelVerb, string>> = {
  * validate-before-write ownership check still happens inside every apply*.
  */
 export async function completePrompt(
-  repo: PanelRepo, userId: number, verb: PanelVerb, text: string, contract: Mint, now: number,
+  repo: PanelRepo, userId: number, verb: PanelVerb, text: string, contract: Mint, now: number, maxPerDayUsdCeiling = Infinity,
 ): Promise<ApplyResult> {
   const parts = text.split(/\s+/).filter(Boolean);
   const schedules = await repo.listSchedules(userId);
@@ -320,7 +322,7 @@ export async function completePrompt(
       return applyResume(repo, userId, Number(parts[0] ?? soleId ?? NaN));
     }
     case 'caps': {
-      return applyCaps(repo, userId, contract, parts[0] ?? '', parts[1] ?? '');
+      return applyCaps(repo, userId, contract, parts[0] ?? '', parts[1] ?? '', maxPerDayUsdCeiling);
     }
     case 'contract': {
       return applySetContract(repo, userId, parts[0] ?? '');

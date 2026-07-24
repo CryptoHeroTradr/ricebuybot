@@ -24,6 +24,7 @@ import {
   applyPause,
   applyResumeAll,
   applyCaps,
+  applySlippage,
   dispatchTradeCommand,
   parseAmount,
   haltForWalletChange,
@@ -326,5 +327,26 @@ describe('the owner administers membership, never money', () => {
     // (The signatures all read `userId`, never a separate owner+target pair.)
     const panelCmds = files[3]!;
     expect(panelCmds).not.toMatch(/ownerUserId|targetUser|asUser/);
+  });
+});
+
+describe('Phase 16 hard limits at the panel (UX guard; the executor is the authority)', () => {
+  it('refuses slippage above the 10% (1000 bps) hard maximum', async () => {
+    const id = await seed(A);
+    expect((await applySlippage(repo, A, id, '1000')).ok).toBe(true); // 10% is allowed
+    const over = await applySlippage(repo, A, id, '1500');
+    expect(over.ok).toBe(false);
+    expect(over.message).toMatch(/0.1000|0–1000|1000/);
+    expect((await repo.getSchedule(id))!.slippageBps).toBe(1000); // never stored above the max
+  });
+
+  it('refuses a daily cap above the env ceiling', async () => {
+    const ceiling = 200;
+    const over = await applyCaps(repo, A, MINT, '50', '500', ceiling);
+    expect(over.ok).toBe(false);
+    expect(over.message).toMatch(/ceiling/);
+    expect(await repo.getCaps(A, MINT)).toBeNull(); // nothing written
+    // At or below the ceiling is fine.
+    expect((await applyCaps(repo, A, MINT, '50', '200', ceiling)).ok).toBe(true);
   });
 });

@@ -39,7 +39,20 @@ export interface ExecutorConfig {
   /** A null signature status this long after submit means the blockhash expired and it was DROPPED
    *  — definitively failed, because an expired blockhash can never be included. */
   readonly droppedAfterMs: number;
+  /**
+   * ABSOLUTE per-day USD ceiling (Phase 16 hard limit). The daily cap /trade caps sets in the DB can
+   * NEVER exceed this — the executor clamps to it every time, so a bad DB write cannot raise it.
+   * Comes from env (MAX_PER_DAY_USD_CEILING), not the DB, precisely so the DB is not the authority.
+   */
+  readonly maxPerDayUsdCeiling: number;
 }
+
+/**
+ * HARD LIMITS — not configurable away (Phase 16). Enforced HERE, where money moves, against whatever
+ * is in the DB, because a limit that only lives in the input validation is one a bad row bypasses.
+ */
+export const HARD_MAX_SLIPPAGE_BPS = 1000; // 10%. Above that you are not trading, you are donating.
+export const HARD_MIN_INTERVAL_MINUTES = 1; // a sub-minute DCA is a bot fighting its own confirmations.
 
 export const DEFAULT_EXECUTOR_CONFIG: ExecutorConfig = {
   maxPriceImpactPct: 0.03,
@@ -49,6 +62,7 @@ export const DEFAULT_EXECUTOR_CONFIG: ExecutorConfig = {
   resolveTimeoutMs: 15 * 60_000,
   resolvePollMs: 30_000,
   droppedAfterMs: 150_000,
+  maxPerDayUsdCeiling: 1_000, // conservative default; production sets it from env
 };
 
 // --- injected dependencies (all mockable; the real wiring lives in index.ts) -----------------
@@ -94,6 +108,9 @@ export interface BalanceReader {
    *  largest balance, an index into the account list, or any heuristic (a mis-scope sells the
    *  wrong asset on a multi-token wallet). */
   mintBalance(owner: string, mint: string): Promise<bigint>;
+  /** The wallet's native SOL balance in lamports, for the per-buy reserve check. Null if unreadable
+   *  — treated as a breach, because a reserve we cannot rule out is one we assume. */
+  solBalance(owner: string): Promise<bigint | null>;
 }
 
 export interface WalletResolver {
@@ -224,6 +241,12 @@ export class Executor {
     const pubkey = this.#d.wallets.pubkeyOf(schedule.userId);
     if (!pubkey) return { state: 'failed', usdValue: plan.usdValue, error: 'no wallet for user' };
 
+    // --- HARD LIMIT: interval. Enforced here too, not just at input — a bad DB row must not slip a
+    //     sub-minute schedule past the guard (the migration's CHECK is the other half of this). ---
+    if (schedule.intervalMinutes < HARD_MIN_INTERVAL_MINUTES) {
+      return { state: 'failed', usdValue: plan.usdValue, error: `interval ${schedule.intervalMinutes} below the ${HARD_MIN_INTERVAL_MINUTES}-minute hard minimum` };
+    }
+
     // --- amount + direction. The mint is the schedule's, ALWAYS explicit. ---
     let inputMint: string;
     let outputMint: string;
@@ -251,8 +274,38 @@ export class Executor {
       }
     }
 
+    if (schedule.side === 'buy') {
+      // HARD LIMIT: the SOL reserve, on EVERY buy (absolute AND percent), at execution time against
+      // the LIVE balance. A wallet that cannot pay fees cannot sell — so a buy that would leave less
+      // than the reserve does not happen. Phase 14 checked absolute buys in the scheduler; this is
+      // the promised execution-time check that also covers percent buys.
+      const caps = await this.#d.repo.getCaps(schedule.userId, schedule.mint);
+      const reserve = caps?.minSolReserveLamports ?? 0n;
+      if (reserve > 0n) {
+        const balance = await this.#d.balances.solBalance(pubkey);
+        if (balance === null || balance - amount < reserve) {
+          return { state: 'failed', usdValue: plan.usdValue, error: `buy would breach the SOL reserve (${reserve} lamports must remain for fees)` };
+        }
+      }
+      // HARD LIMIT: the daily-cap CEILING binds buys too — the executor re-checks against the
+      // env-clamped cap, so a DB write that raised maxPerDayUsd cannot make a buy go through.
+      const breach = await this.#capRecheck(schedule, plan.usdValue);
+      if (breach) {
+        await this.#d.repo.haltSchedule(schedule.id, breach, this.#now());
+        this.#d.log.warn({ scheduleId: schedule.id, breach }, 'autotrader executor: buy breaches caps at execution — halted');
+        return { state: 'failed', usdValue: plan.usdValue, error: breach };
+      }
+    }
+
+    // --- HARD LIMIT: slippage. Clamp to the ceiling, never above — a schedule (or a bad DB write)
+    //     asking for more than 10% is trading you should not do, so we cap it rather than honour it. ---
+    const slippageBps = Math.min(schedule.slippageBps, HARD_MAX_SLIPPAGE_BPS);
+    if (slippageBps < schedule.slippageBps) {
+      this.#d.log.warn({ scheduleId: schedule.id, asked: schedule.slippageBps, capped: slippageBps }, 'autotrader executor: slippage clamped to the 10% hard maximum');
+    }
+
     // --- 1. QUOTE ---
-    const quote = await this.#d.jupiter.quote({ inputMint, outputMint, amount, slippageBps: schedule.slippageBps });
+    const quote = await this.#d.jupiter.quote({ inputMint, outputMint, amount, slippageBps });
 
     // --- Recompute USD for a sell and RE-CHECK caps against the recomputed value. A sell of 10% of
     //     a balance that has changed is a different trade than the one the caps were checked against. ---
@@ -324,7 +377,10 @@ export class Executor {
     if (!caps) return null; // no caps configured -> nothing to re-check (the scheduler seeds them)
     if (usd > caps.maxPerExecUsd) return `per-exec cap: $${usd.toFixed(2)} > $${caps.maxPerExecUsd.toFixed(2)}`;
     const spent = await this.#d.repo.usdSpent24h(schedule.userId, schedule.mint, this.#now() - DAY_MS);
-    if (spent + usd > caps.maxPerDayUsd) return `24h cap: $${(spent + usd).toFixed(2)} > $${caps.maxPerDayUsd.toFixed(2)}`;
+    // HARD LIMIT: the effective daily cap is the DB value CLAMPED to the env ceiling. A bad DB write
+    // that set maxPerDayUsd to $1M cannot raise the real limit above what env allows.
+    const dayCap = Math.min(caps.maxPerDayUsd, this.#cfg.maxPerDayUsdCeiling);
+    if (spent + usd > dayCap) return `24h cap: $${(spent + usd).toFixed(2)} > $${dayCap.toFixed(2)}`;
     return null;
   }
 
@@ -407,6 +463,18 @@ export class Executor {
    *   - still ambiguous after 15 minutes -> STAY HALTED; only /resolve exits. Never auto-resume from ambiguity.
    */
   async #resolvePassively(executionId: number, signature: string, schedule: Schedule, pubkey: string, tradeUsd: number): Promise<void> {
+    // This runs fire-and-forget, so a throw here (a transient RPC/DB error) would become an
+    // UNHANDLED rejection — which crashes the process, worse than the ambiguity it was resolving.
+    // Wrap it: on any error the schedule simply STAYS halted, which is the safe outcome, and /resolve
+    // remains the exit. Never auto-resume from an error.
+    try {
+      await this.#resolveLoop(executionId, signature, schedule, pubkey, tradeUsd);
+    } catch (err) {
+      this.#d.log.error({ scheduleId: schedule.id, executionId, err: msg(err) }, 'autotrader executor: passive resolution errored — schedule stays halted, /resolve required');
+    }
+  }
+
+  async #resolveLoop(executionId: number, signature: string, schedule: Schedule, pubkey: string, tradeUsd: number): Promise<void> {
     const start = this.#now();
     const deadline = start + this.#cfg.resolveTimeoutMs;
     for (;;) {

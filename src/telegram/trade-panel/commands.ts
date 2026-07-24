@@ -14,7 +14,7 @@ import type { AmountKind, Caps, ExecutionRecord, Schedule, Side } from '../../tr
 
 export const PANEL_TTL_MS = 15 * 60_000;
 const LAMPORTS_PER_SOL = 1_000_000_000;
-const MAX_SLIPPAGE_BPS = 5_000; // 50% — anything near this is a mistake, not a setting
+const MAX_SLIPPAGE_BPS = 1_000; // 10% HARD MAX (Phase 16). Above that you are donating, not trading.
 
 /** The repo surface the panel needs. Concrete SqliteRepo satisfies it structurally. */
 export interface PanelRepo {
@@ -176,12 +176,15 @@ export async function applyResumeAll(repo: PanelRepo, userId: number): Promise<A
   return ok(n === 0 ? 'Nothing to resume.' : `Resumed ${n} schedule(s).`);
 }
 
-export async function applyCaps(repo: PanelRepo, userId: number, contract: Mint, perRaw: string, dayRaw: string): Promise<ApplyResult> {
+export async function applyCaps(repo: PanelRepo, userId: number, contract: Mint, perRaw: string, dayRaw: string, maxPerDayUsdCeiling = Infinity): Promise<ApplyResult> {
   const per = Number(perRaw);
   const day = Number(dayRaw);
   if (!Number.isFinite(per) || per <= 0) return err('per-trade cap must be a positive dollar amount, e.g. 50');
   if (!Number.isFinite(day) || day <= 0) return err('daily cap must be a positive dollar amount, e.g. 200');
   if (day < per) return err(`daily cap ($${day}) is below the per-trade cap ($${per}) — it could never be reached`);
+  // The env ceiling is the authority (the executor enforces it against the DB); refuse here too so
+  // the user is told, rather than silently having a too-high cap clamped at execution.
+  if (day > maxPerDayUsdCeiling) return err(`daily cap ($${day}) is above the $${maxPerDayUsdCeiling} platform ceiling — that is the most the autotrader will spend in a day.`);
   await repo.setCaps({ userId, mint: contract, maxPerExecUsd: per, maxPerDayUsd: day });
   return ok(`Caps set: $${per} per trade, $${day} per day.`);
 }
@@ -208,7 +211,7 @@ export async function haltForWalletChange(repo: PanelRepo, userId: number): Prom
  * do something its typed equivalent cannot, and vice versa. `tokens` is the args after `/trade`.
  */
 export async function dispatchTradeCommand(
-  repo: PanelRepo, userId: number, contract: Mint, tokens: readonly string[], now: number,
+  repo: PanelRepo, userId: number, contract: Mint, tokens: readonly string[], now: number, maxPerDayUsdCeiling = Infinity,
 ): Promise<ApplyResult> {
   const sub = tokens[0] ?? '';
   const a = (i: number): string => tokens[i] ?? '';
@@ -221,7 +224,7 @@ export async function dispatchTradeCommand(
     case 'resume': return applyResume(repo, userId, Number(a(1)));
     case 'delete': return applyDelete(repo, userId, Number(a(1)));
     case 'stop': return applyStopAll(repo, userId);
-    case 'caps': return applyCaps(repo, userId, contract, a(1), a(2));
+    case 'caps': return applyCaps(repo, userId, contract, a(1), a(2), maxPerDayUsdCeiling);
     default:
       return err('Try: new · amount <id> <amt> · interval <id> <min> · pause <id> · resume <id> · stop · slippage <id> <bps> · caps <per> <day> · delete <id>');
   }

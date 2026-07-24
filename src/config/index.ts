@@ -170,6 +170,13 @@ const EnvSchema = z
 
     /** Bounded confirmation wait (ms) before an outcome is declared UNKNOWN. */
     CONFIRM_TIMEOUT_MS: z.coerce.number().int().positive().default(90_000),
+
+    /**
+     * PHASE 16 HARD LIMIT — the absolute per-day USD ceiling no user's caps can exceed. In ENV, not
+     * the DB, on purpose: a bad DB write must not be able to raise it. The executor clamps every
+     * daily cap to this, and /trade caps refuses above it.
+     */
+    MAX_PER_DAY_USD_CEILING: z.coerce.number().positive().default(500),
   })
   .superRefine((env, ctx) => {
     // REFUSE HEADLESS LIVE TRADING. On an UNKNOWN swap the executor halts the schedule and needs a

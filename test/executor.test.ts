@@ -39,6 +39,7 @@ const SIG = signatureOf(SIGNED);
 
 // Fast config so the clock-driven confirm/resolve loops run in microseconds.
 const CFG: Partial<ExecutorConfig> = {
+  maxPerDayUsdCeiling: 1e9, // existing tests set their own caps; do not clamp them
   maxPriceImpactPct: 0.03,
   confirmTimeoutMs: 50,
   confirmPollMs: 10,
@@ -96,6 +97,7 @@ interface Overrides {
   signatureStatus?: () => Promise<SignatureStatus | null>;
   quote?: (p: { inputMint: string; outputMint: string; amount: bigint }) => Promise<JupiterQuote>;
   mintBalance?: (owner: string, mint: string) => Promise<bigint>;
+  solBalance?: (owner: string) => Promise<bigint | null>;
   getTransaction?: () => Promise<unknown>;
   parseSwap?: unknown;
   solUsd?: number | null;
@@ -133,6 +135,7 @@ function mkExecutor(over: Overrides = {}): { executor: Executor; rec: Recorder; 
       getTransaction: (over.getTransaction ?? (async () => ({}))) as never,
     },
     balances: {
+      solBalance: async (owner) => (over.solBalance ? over.solBalance(owner) : 100n * SOL),
       mintBalance: async (owner, mint) => {
         rec.balanceReads.push({ owner, mint });
         return over.mintBalance ? over.mintBalance(owner, mint) : 0n;
@@ -414,3 +417,113 @@ describe('the kill switch', () => {
     expect(rec.dms.some((d) => d.userId === OWNER && /KILL SWITCH/.test(d.text))).toBe(true);
   });
 });
+
+// ===========================================================================================
+// PHASE 16 — HARD LIMITS, enforced at execution against whatever the DB holds
+// ===========================================================================================
+
+describe('hard limits are enforced where money moves, not just at input', () => {
+  it('the slippage passed to Jupiter never exceeds 1000 bps', async () => {
+    let seenBps = -1;
+    const schedule = await seedSchedule({ slippageBps: 5000 });
+    const plan = await claimedPlan(schedule);
+    const { executor } = mkExecutor({
+      quote: async (p) => {
+        seenBps = (p as { slippageBps?: number }).slippageBps ?? -1;
+        return { inputMint: p.inputMint, outputMint: p.outputMint, inAmount: p.amount, outAmount: 1n, priceImpactPct: 0.001, raw: {} };
+      },
+    });
+    await executor.execute(plan);
+    expect(seenBps).toBe(1000); // clamped from 5000
+  });
+
+  it('a sub-1-minute interval is refused at execution (the DB CHECK is the other half)', async () => {
+    // The migration's CHECK (interval_minutes > 0) blocks a bad WRITE — the two halves are
+    // equivalent for integers. This asserts the executor's own guard on a corrupted-DB schedule
+    // object, so the guard survives even if the constraint were ever dropped.
+    const schedule = await seedSchedule();
+    const plan = await claimedPlan({ ...schedule, intervalMinutes: 0 });
+    const { executor, rec } = mkExecutor();
+    const outcome = await executor.execute(plan);
+    expect(outcome.state).toBe('failed');
+    expect(outcome.error).toMatch(/hard minimum/);
+    expect(rec.send).toBe(0);
+  });
+
+  it('the daily cap CANNOT be raised above the env ceiling — a bad DB write is clamped at execution', async () => {
+    // DB says $10,000/day; the env ceiling is $200. A $250 buy must be refused by the ceiling,
+    // not by the DB value.
+    const schedule = await seedSchedule();
+    await repo.setCaps({ userId: USER, mint: MINT, maxPerExecUsd: 1e9, maxPerDayUsd: 10_000 });
+    const plan = await claimedPlan(schedule, 250); // $250 buy
+    const { executor, rec } = mkExecutor({ solUsd: 150 });
+    // Ceiling below the DB cap.
+    (executor as unknown as { }); // executor uses CFG; override the ceiling for this test:
+    const { executor: capped, rec: rec2 } = mkExecutorWithCeiling(200);
+    const outcome = await capped.execute(plan);
+    expect(outcome.state).toBe('failed');
+    expect(outcome.error).toMatch(/24h cap/);
+    expect(rec2.send).toBe(0);
+    expect(await schedState(schedule.id)).toBe('halted');
+    void rec; void executor;
+  });
+
+  it('a buy that would breach the SOL reserve is refused at execution (percent buys too)', async () => {
+    const schedule = await seedSchedule({ amountRaw: SOL }); // spend 1 SOL
+    await repo.setCaps({ userId: USER, mint: MINT, maxPerExecUsd: 1e9, maxPerDayUsd: 1e9, minSolReserveLamports: SOL / 50n }); // 0.02 SOL
+    const plan = await claimedPlan(schedule);
+    // Balance 1.01 SOL -> after a 1 SOL buy, 0.01 SOL left < 0.02 reserve.
+    const { executor, rec } = mkExecutor({ solBalance: async () => SOL + SOL / 100n });
+    const outcome = await executor.execute(plan);
+    expect(outcome.state).toBe('failed');
+    expect(outcome.error).toMatch(/reserve/);
+    expect(rec.send).toBe(0);
+  });
+
+  it('the same buy fires when the balance leaves the reserve intact', async () => {
+    const schedule = await seedSchedule({ amountRaw: SOL });
+    await repo.setCaps({ userId: USER, mint: MINT, maxPerExecUsd: 1e9, maxPerDayUsd: 1e9, minSolReserveLamports: SOL / 50n });
+    const plan = await claimedPlan(schedule);
+    const { executor, rec } = mkExecutor({
+      solBalance: async () => SOL + SOL / 2n, // 1.5 SOL -> 0.5 left, well above reserve
+      signatureStatus: async () => ({ confirmationStatus: 'confirmed', err: null, slot: 1 }),
+      parseSwap: () => ({ event: { kind: 'buy', quoteRaw: 1n, tokensRaw: 1n } }),
+    });
+    const outcome = await executor.execute(plan);
+    expect(outcome.state).toBe('confirmed');
+    expect(rec.send).toBe(1);
+  });
+});
+
+/** A second executor factory that can set the env ceiling for the ceiling test. */
+function mkExecutorWithCeiling(ceiling: number): { executor: Executor; rec: Recorder } {
+  const base = mkExecutor();
+  // Rebuild with a ceiling override.
+  const rec: Recorder = { send: 0, signAllowed: [], quotes: [], balanceReads: [], dms: [] };
+  const executor = new Executor({
+    repo,
+    jupiter: {
+      quote: async (p) => ({ inputMint: p.inputMint, outputMint: p.outputMint, inAmount: p.amount, outAmount: 1n, priceImpactPct: 0.001, raw: {} }),
+      buildSwap: async () => ({ swapTransaction: 'UNSIGNED' }),
+    },
+    signer: { sign: async () => SIGNED },
+    chain: {
+      simulate: async () => ({ err: null }),
+      send: async () => { rec.send++; return SIG; },
+      signatureStatus: async () => ({ confirmationStatus: 'confirmed', err: null, slot: 1 }),
+      getTransaction: (async () => ({})) as never,
+    },
+    balances: { solBalance: async () => 100n * SOL, mintBalance: async () => 0n },
+    wallets: { pubkeyOf: () => PUBKEY },
+    dm: { send: async () => undefined },
+    log,
+    solUsd: () => 150,
+    decimalsOf: async () => 6,
+    config: { ...CFG, maxPerDayUsdCeiling: ceiling },
+    now: () => 1_000_000,
+    sleep: async () => undefined,
+    parseSwap: (() => ({ event: { kind: 'buy', quoteRaw: 1n, tokensRaw: 1n } })) as never,
+  });
+  void base;
+  return { executor, rec };
+}
