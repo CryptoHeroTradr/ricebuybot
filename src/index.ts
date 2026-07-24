@@ -15,6 +15,7 @@ import { TradeChain } from './trade/chain.js';
 import { JupiterHttp } from './trade/jupiter.js';
 import { Executor } from './trade/executor.js';
 import { registerResolveCommand } from './telegram/resolve-command.js';
+import { registerTradePanel } from './telegram/trade-panel/index.js';
 import { registerCuration } from './telegram/curate/index.js';
 import { setPlanWhitelist } from './telegram/plan-gate.js';
 import { BurstDetector, DailyCap, digestText } from './telegram/digest.js';
@@ -536,6 +537,9 @@ async function main(): Promise<void> {
         // Locking or revoking a wallet pauses that user's schedules — a locked wallet must not keep
         // firing DCA slots.
         pauseSchedules: async (userId: number) => void (await repo.pauseUserSchedules(userId)),
+        // CHANGING the wallet (new key imported/generated) HALTS the schedules (Phase 15) — explicit
+        // resume required, because the money would otherwise move from a different wallet silently.
+        onWalletChanged: (userId: number) => repo.haltUserSchedules(userId, 'wallet changed'),
       });
 
       // /resolve <executionId> confirmed|failed — the human exit from an UNKNOWN outcome.
@@ -544,6 +548,21 @@ async function main(): Promise<void> {
         getExecution: (id) => repo.getExecution(id),
         resolve: (id, verdict) => executor.resolve(id, verdict),
         ownerUserId: cfg.OWNER_USER_ID,
+        log,
+      });
+
+      // Phase 15: the control panel — /trade, /setca, /history, and the button board.
+      registerTradePanel(telegram.bot, {
+        repo,
+        access: repo,
+        keystore: { pubkeyOf: (u) => keystore.pubkeyOf(u), isUnlocked: (u) => keystore.isUnlocked(u) },
+        rpc: { getBalance: (p) => rpc.getBalance(p), getTokenBalances: (o, m) => rpc.getTokenBalances(o, m) },
+        meta: async (mint) => {
+          const t = await tokenMeta.get(mint as Mint);
+          return t ? { symbol: t.symbol, decimals: t.decimals } : null;
+        },
+        tradeLive: cfg.TRADE_LIVE,
+        defaultMint: cfg.DEFAULT_MINT,
         log,
       });
 

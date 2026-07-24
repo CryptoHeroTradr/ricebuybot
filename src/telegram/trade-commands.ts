@@ -44,6 +44,12 @@ export interface TradeCommandDeps {
   readonly primarySymbol: string;
   /** Pause every schedule for one user. Phase 13 owns schedules; this is the hook. */
   readonly pauseSchedules: (userId: number) => Promise<void>;
+  /**
+   * The wallet CHANGED (a new key imported or generated). Phase 15: this HALTS the user's schedules
+   * and requires an explicit resume — the wallet is what the money moves from, and a schedule must
+   * never silently continue against a new one. Returns how many were halted (for the message).
+   */
+  readonly onWalletChanged?: (userId: number) => Promise<number>;
 }
 
 const ACK_PHRASE = 'I UNDERSTAND';
@@ -361,12 +367,14 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
           const pubkey = keystore.import(userId, state.secret, passphrase, { overwrite: true });
           keystore.unlock(userId, passphrase);
 
+          const halted = (await deps.onWalletChanged?.(userId)) ?? 0;
           const inv = await fetchInventory(rpc, pubkey, deps.primaryMint, deps.primarySymbol);
           const extra = importValueWarning(inv);
 
           await ctx.reply(
             [
               `✅ Wallet imported — ${shortPubkey(pubkey)}`,
+              ...(halted > 0 ? [`⚠️ ${halted} schedule(s) HALTED — the wallet changed. ▶️ Resume when ready.`] : []),
               '',
               renderWallet(inv, { unlocked: true, mode: unlockModeFor(unlockConfig, userId) }),
               ...(extra ? ['', extra] : []),
@@ -388,12 +396,14 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
 
         const { pubkey, secretBase58 } = keystore.generate(userId, passphrase, { overwrite: false });
         keystore.unlock(userId, passphrase);
+        const haltedGen = (await deps.onWalletChanged?.(userId)) ?? 0;
 
         // SHOWN EXACTLY ONCE. There is no command that will ever print it again except
         // /wallet export, which requires the passphrase.
         await ctx.reply(
           [
             `✅ New wallet — ${shortPubkey(pubkey)}`,
+            ...(haltedGen > 0 ? [`⚠️ ${haltedGen} schedule(s) HALTED — the wallet changed. ▶️ Resume when ready.`] : []),
             '',
             'SAVE THIS SECRET KEY NOW. It will not be shown again:',
             '',

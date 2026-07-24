@@ -1740,6 +1740,100 @@ export class SqliteRepo implements Repo {
       .run(Date.now(), userId).changes;
   }
 
+  // --- Phase 15: control-panel schedule edits + history + per-user contract ---
+  //
+  // Every one of these takes a schedule id AND is expected to be called only AFTER the caller has
+  // verified the schedule belongs to the acting user (validate-before-write). The writes themselves
+  // are by id; the ownership gate lives in the command layer, which holds the user id.
+
+  async setScheduleAmount(id: number, amountRaw: bigint, amountKind: AmountKind): Promise<void> {
+    this.#db
+      .prepare(`UPDATE schedules SET amount_raw = ?, amount_kind = ?, updated_at = ? WHERE id = ?`)
+      .run(amountRaw.toString(), amountKind, Date.now(), id);
+  }
+
+  async setScheduleInterval(id: number, intervalMinutes: number): Promise<void> {
+    this.#db.prepare(`UPDATE schedules SET interval_minutes = ?, updated_at = ? WHERE id = ?`).run(intervalMinutes, Date.now(), id);
+  }
+
+  async setScheduleSlippage(id: number, slippageBps: number): Promise<void> {
+    this.#db.prepare(`UPDATE schedules SET slippage_bps = ?, updated_at = ? WHERE id = ?`).run(slippageBps, Date.now(), id);
+  }
+
+  /** Pause ONE schedule. Resume is `unhaltSchedule` (active + clears any halt reason). */
+  async pauseSchedule(id: number): Promise<void> {
+    this.#db.prepare(`UPDATE schedules SET state = 'paused', updated_at = ? WHERE id = ?`).run(Date.now(), id);
+  }
+
+  /** HALT all of ONE user's active schedules with a reason — used when the contract or wallet
+   *  changes (both change what the money does; neither may silently continue against a new target).
+   *  Scoped by user_id (INVARIANT 14). Returns how many were halted. */
+  async haltUserSchedules(userId: number, reason: string): Promise<number> {
+    return this.#db
+      .prepare(`UPDATE schedules SET state = 'halted', halt_reason = ?, updated_at = ? WHERE user_id = ? AND state = 'active'`)
+      .run(reason, Date.now(), userId).changes;
+  }
+
+  /** Resume all of ONE user's paused/halted schedules -> active, clearing any halt reason. The
+   *  explicit resume a contract/wallet change requires. Scoped by user_id. Returns how many resumed. */
+  async resumeUserSchedules(userId: number): Promise<number> {
+    return this.#db
+      .prepare(`UPDATE schedules SET state = 'active', halt_reason = NULL, updated_at = ? WHERE user_id = ? AND state IN ('paused','halted')`)
+      .run(Date.now(), userId).changes;
+  }
+
+  /** Delete a schedule and its executions (one transaction). Caps are per (user,mint) and shared,
+   *  so they are left alone — same policy as delete-schedule.ts. */
+  async deleteScheduleById(id: number): Promise<void> {
+    this.#db.transaction(() => {
+      this.#db.prepare('DELETE FROM executions WHERE schedule_id = ?').run(id);
+      this.#db.prepare('DELETE FROM schedules WHERE id = ?').run(id);
+    })();
+  }
+
+  /** THIS user's most recent executions, newest first. The /history surface — user-scoped. */
+  async listExecutionsForUser(userId: number, limit: number): Promise<readonly ExecutionRecord[]> {
+    return this.#db
+      .prepare<[number, number], {
+        id: number; schedule_id: number; user_id: number; planned_at: number; state: string;
+        signature: string | null; in_raw: string | null; out_raw: string | null;
+        price_usd: number | null; usd_value: number | null; error: string | null;
+      }>('SELECT * FROM executions WHERE user_id = ? ORDER BY planned_at DESC LIMIT ?')
+      .all(userId, limit)
+      .map((r) => ({
+        id: r.id, scheduleId: r.schedule_id, userId: r.user_id, plannedAt: r.planned_at,
+        state: r.state as ExecutionOutcome['state'], signature: r.signature,
+        inRaw: r.in_raw != null ? BigInt(r.in_raw) : null,
+        outRaw: r.out_raw != null ? BigInt(r.out_raw) : null,
+        priceUsd: r.price_usd, usdValue: r.usd_value, error: r.error,
+      }));
+  }
+
+  /** The most recent execution for one schedule (for the panel's "last …" line), or null. */
+  async lastExecutionForSchedule(scheduleId: number): Promise<ExecutionRecord | null> {
+    const r = this.#db
+      .prepare<[number], { id: number }>('SELECT id FROM executions WHERE schedule_id = ? ORDER BY planned_at DESC LIMIT 1')
+      .get(scheduleId);
+    return r ? this.getExecution(r.id) : null;
+  }
+
+  /** The user's configured contract mint, or null if never set (the panel defaults to DEFAULT_MINT). */
+  async getContract(userId: number): Promise<Mint | null> {
+    const r = this.#db
+      .prepare<[number], { contract_mint: string }>('SELECT contract_mint FROM autotrader_prefs WHERE user_id = ?')
+      .get(userId);
+    return r ? (r.contract_mint as Mint) : null;
+  }
+
+  async setContract(userId: number, mint: Mint): Promise<void> {
+    this.#db
+      .prepare(
+        `INSERT INTO autotrader_prefs (user_id, contract_mint, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT (user_id) DO UPDATE SET contract_mint = excluded.contract_mint, updated_at = excluded.updated_at`,
+      )
+      .run(userId, mint, Date.now());
+  }
+
   // --- Cursors ---
 
   async getCursor(mint: Mint): Promise<number | null> {
