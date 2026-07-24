@@ -649,7 +649,6 @@ describe.skipIf(CORES < 2)('claim concurrency (requires >=2 cores)', () => {
    * barrier has stopped working and the test above has gone vacuous.
    */
   it('negative control: read-then-write DOES double-claim under the same race', async () => {
-    const gate = new Int32Array(new SharedArrayBuffer(4));
     const naive = `
       const { workerData, parentPort } = require('node:worker_threads');
       const Database = require('better-sqlite3');
@@ -675,30 +674,42 @@ describe.skipIf(CORES < 2)('claim concurrency (requires >=2 cores)', () => {
       parentPort.postMessage({ won, error: null });
     `;
 
-    const ready: Array<Promise<void>> = [];
-    const done: Array<Promise<{ won: boolean }>> = [];
-    for (let i = 0; i < 8; i++) {
-      const w = new Worker(naive, {
-        eval: true,
-        workerData: { dbPath, pragmas: [...PRAGMAS], sig: 'naive-sig', chatId: CHAT, gate },
-      });
-      let markReady!: () => void;
-      let settle!: (v: { won: boolean }) => void;
-      ready.push(new Promise<void>((res) => (markReady = res)));
-      done.push(new Promise((res) => (settle = res)));
-      w.on('message', (m: { ready?: boolean; won?: boolean }) => {
-        if (m.ready) markReady();
-        else settle({ won: m.won === true });
-      });
+    // One race, a fresh signature each time, returning how many threads believed they won.
+    const runNaiveRace = async (attempt: number): Promise<number> => {
+      const gate = new Int32Array(new SharedArrayBuffer(4));
+      const ready: Array<Promise<void>> = [];
+      const done: Array<Promise<{ won: boolean }>> = [];
+      for (let i = 0; i < 8; i++) {
+        const w = new Worker(naive, {
+          eval: true,
+          workerData: { dbPath, pragmas: [...PRAGMAS], sig: `naive-sig-${attempt}`, chatId: CHAT, gate },
+        });
+        let markReady!: () => void;
+        let settle!: (v: { won: boolean }) => void;
+        ready.push(new Promise<void>((res) => (markReady = res)));
+        done.push(new Promise((res) => (settle = res)));
+        w.on('message', (m: { ready?: boolean; won?: boolean }) => {
+          if (m.ready) markReady();
+          else settle({ won: m.won === true });
+        });
+      }
+      await Promise.all(ready);
+      Atomics.store(gate, 0, 1);
+      Atomics.notify(gate, 0);
+      const results = await Promise.all(done);
+      return results.filter((r) => r.won).length;
+    };
+
+    // The claim is that the naive pattern CAN double-claim, not that it does on every scheduling.
+    // A single non-overlapping run (a loaded runner momentarily serialising the threads) is not a
+    // counterexample — so retry a bounded number of times and pass as soon as the double-claim is
+    // observed. Only if it NEVER doubles across all attempts has the barrier truly gone vacuous.
+    let maxWinners = 0;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      maxWinners = Math.max(maxWinners, await runNaiveRace(attempt));
+      if (maxWinners > 1) break;
     }
-
-    await Promise.all(ready);
-    Atomics.store(gate, 0, 1);
-    Atomics.notify(gate, 0);
-    const results = await Promise.all(done);
-
-    // THIS is the double-post. More than one thread believes it owns the send.
-    expect(results.filter((r) => r.won).length).toBeGreaterThan(1);
+    expect(maxWinners).toBeGreaterThan(1);
   }, 30_000);
 
   it('a racing swarm cannot resurrect a failed tombstone', async () => {
