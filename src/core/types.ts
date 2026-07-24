@@ -188,6 +188,9 @@ export interface ChatToken {
   /** Arbitrary chart/socials links rendered as buttons. */
   readonly links: Readonly<Record<string, string>> | null;
   readonly enabled: boolean;
+  /** Phase 16: DCA aggregate window (minutes) and whether DCA buys post at all. */
+  readonly dcaWindowMinutes: number;
+  readonly dcaDisplay: 'aggregate' | 'off';
 }
 
 /** Cached SPL mint metadata. Supply is refreshed on a TTL (5 min). */

@@ -121,6 +121,8 @@ interface ChatTokenRow {
   tier_headlines: string;
   links_json: string | null;
   enabled: number;
+  dca_window_minutes: number;
+  dca_display: string;
 }
 
 interface TokenRow {
@@ -522,6 +524,8 @@ export class SqliteRepo implements Repo {
       tierHeadlines: parseJsonOr(row.tier_headlines, [...DEFAULT_HEADLINES], this.#log, 'tier_headlines'),
       links: parseJsonOr<Record<string, string> | null>(row.links_json, null, this.#log, 'links_json'),
       enabled: toBool(row.enabled),
+      dcaWindowMinutes: row.dca_window_minutes,
+      dcaDisplay: row.dca_display === 'off' ? 'off' : 'aggregate',
     };
   }
 
@@ -1906,6 +1910,11 @@ export class SqliteRepo implements Repo {
          ON CONFLICT (chat_id, mint) DO UPDATE SET last_window_start = excluded.last_window_start, updated_at = excluded.updated_at`,
       )
       .run(chatId, mint, windowStart, Date.now());
+  }
+
+  /** OWNER-ONLY (/dcawindow). Set the aggregate window on every chat_token. Global by design. */
+  async setDcaWindowMinutes(minutes: number): Promise<number> {
+    return this.#db.prepare('UPDATE chat_tokens SET dca_window_minutes = ?').run(minutes).changes;
   }
 
   // --- Cursors ---

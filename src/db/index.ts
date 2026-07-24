@@ -239,6 +239,18 @@ export interface Repo {
   // --- Cursors ---
   getCursor(mint: Mint): Promise<number | null>;
   setCursor(mint: Mint, slot: number): Promise<void>;
+
+  // --- Phase 16: DCA aggregation ---
+  /** True iff this buy's signature has an execution row — i.e. it is one of ours (a DCA buy).
+   *  No state filter: 'submitted' and 'UNKNOWN' count, so a DCA buy never leaks onto an organic card. */
+  isDcaSignature(signature: Signature): Promise<boolean>;
+  /** DCA-attributed buys for a mint in [fromMs, toMs), grouped by the caller (BigInt, never SQL SUM). */
+  dcaBuysInWindow(mint: Mint, fromMs: number, toMs: number): Promise<readonly { buyer: string; tokensRaw: bigint }[]>;
+  getDcaCursor(chatId: ChatId, mint: Mint): Promise<number | null>;
+  setDcaCursor(chatId: ChatId, mint: Mint, windowStart: number): Promise<void>;
+  /** OWNER-ONLY (/dcawindow). Set the aggregate window on EVERY chat_token — the owner's program is
+   *  global, not per-group. Returns how many rows changed. */
+  setDcaWindowMinutes(minutes: number): Promise<number>;
 }
 
 /**

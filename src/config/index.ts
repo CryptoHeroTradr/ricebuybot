@@ -177,6 +177,9 @@ const EnvSchema = z
      * daily cap to this, and /trade caps refuses above it.
      */
     MAX_PER_DAY_USD_CEILING: z.coerce.number().positive().default(500),
+
+    /** Phase 16: the wallet whose DCA line renders as "Creator Fee" instead of an address. Optional. */
+    CREATOR_FEE_WALLET: z.string().regex(BASE58, 'must be a base58 address').optional(),
   })
   .superRefine((env, ctx) => {
     // REFUSE HEADLESS LIVE TRADING. On an UNKNOWN swap the executor halts the schedule and needs a

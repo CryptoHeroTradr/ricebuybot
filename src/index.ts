@@ -18,6 +18,7 @@ import { registerResolveCommand } from './telegram/resolve-command.js';
 import { registerTradePanel } from './telegram/trade-panel/index.js';
 import { InputArbiter, registerCancelCommand, registerStopCommand } from './telegram/input-arbiter.js';
 import { registerCuration } from './telegram/curate/index.js';
+import { DcaFlusher, registerDcaWindowCommand } from './telegram/dca-flush.js';
 import { setPlanWhitelist } from './telegram/plan-gate.js';
 import { BurstDetector, DailyCap, digestText } from './telegram/digest.js';
 import { WalletValue } from './pricing/wallet-value.js';
@@ -163,6 +164,22 @@ async function main(): Promise<void> {
   const queue = new DeliveryQueue({ repo, sender, log });
   shutdown.register('queue', () => queue.stop());
 
+  // Phase 16: the DCA flush loop. One aggregate card per (chat, mint, window), built from a query on
+  // the buys table (restart-safe), suppressed from organic fan-out above. Runs regardless of the
+  // autotrader flag — with no executions it is simply a no-op. Text-only for now; the dca/ media
+  // pool (Phase 16(2)) supplies the art.
+  const dcaFlusher = new DcaFlusher({
+    repo,
+    queue,
+    log,
+    ...(cfg.CREATOR_FEE_WALLET !== undefined ? { creatorFeeWallet: cfg.CREATOR_FEE_WALLET } : {}),
+  });
+  dcaFlusher.start();
+  shutdown.register('dca-flush', () => {
+    dcaFlusher.stop();
+    return Promise.resolve();
+  });
+
   // Phase 9: /health reports LOCAL state only. It never calls Helius or Telegram — a health
   // check a third party can make fail is a health check that restarts you for their outage.
   let lastBuyAtMs: number | null = null;
@@ -277,6 +294,15 @@ async function main(): Promise<void> {
     const outcome = await pricer.price(e);
     await applier.onSwap(e, outcome);
     if (outcome.status !== 'priced') return;
+
+    // DCA SUPPRESSION (Phase 16): a buy that is one of OUR executions never fans out as an organic
+    // card — it is rolled into the per-window aggregate instead. Checked here, before tiering/media,
+    // so a DCA buy still recorded in `buys` (for the aggregate) never also posts a full buy card.
+    // Attribution does not wait for confirmation: a 'submitted'/'UNKNOWN' execution still counts.
+    if (await repo.isDcaSignature(e.signature)) {
+      log.debug({ signature: e.signature, mint: e.mint }, 'buy is a DCA execution — suppressed from organic fan-out, rolled into the aggregate');
+      return;
+    }
 
     const { pricing, token } = outcome;
     const quoteAsset = quoteAssetFor(e.quoteMint);
@@ -541,6 +567,9 @@ async function main(): Promise<void> {
       ownerUserId: cfg.OWNER_USER_ID,
       arbiter: inputArbiter,
     });
+
+    // /dcawindow — owner-only DCA-window setter. Registered with the group-config commands.
+    registerDcaWindowCommand(telegram.bot, { repo, ownerUserId: cfg.OWNER_USER_ID, log });
 
     /**
      * Phase 12-14: the autotrader's Telegram COMMAND surface — custody (wallet/trader), key unlock,
