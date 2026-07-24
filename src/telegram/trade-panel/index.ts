@@ -138,6 +138,27 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
     });
   }
 
+  /**
+   * /stop IN A DM — the emergency brake. THE SAME halt as `/trade stop` and the STOP ALL button:
+   * all three call `applyStopAll`, so they cannot diverge. No confirmation (confirm on START, never
+   * on STOP), and the panel is re-rendered so the user SEES the halted state rather than being told.
+   *
+   * A non-member gets no reply at all — the same silence discipline as every other autotrader
+   * surface; a refusal would confirm the autotrader exists.
+   */
+  arbiter.onDmStop(async (ctx: Context, userId: number) => {
+    if (!(await access.check(userId)).allowed) return; // silence
+    const active = (await repo.listSchedules(userId)).filter((s) => s.state === 'active').length;
+    if (active === 0) {
+      // Not silence and not a bare ok — someone typing this word is anxious and needs to know the
+      // system heard them.
+      await ctx.reply('No active schedules to stop.');
+      return;
+    }
+    await applyStopAll(repo, userId);
+    await sendPanel(ctx, userId, `🛑 Stopped ${active} schedule(s). ▶️ Resume when ready.`);
+  });
+
   // ---------------------------------------------------------------------------
   // /trade — the panel, and every typed subcommand
   // ---------------------------------------------------------------------------

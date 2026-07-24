@@ -49,6 +49,9 @@ export class InputArbiter {
   /** Cancellable flows that are NOT arbiter slots (the group /setup wizard). Tried in order when no
    *  slot is open, so one /cancel means one thing everywhere. Returns a label if it cancelled. */
   readonly #fallbacks: Array<{ label: string; fn: (userId: number, chatId: number) => boolean }> = [];
+  /** /stop handlers, split by chat kind — see onDmStop for why /stop is not /cancel. */
+  readonly #dmStop: Array<(ctx: Context, userId: number) => Promise<void>> = [];
+  readonly #groupStop: Array<(ctx: Context, userId: number, chatId: number) => Promise<void>> = [];
   readonly #now: () => number;
 
   constructor(now: () => number = Date.now) {
@@ -63,6 +66,32 @@ export class InputArbiter {
   /** Register a non-slot flow that /cancel should also be able to drop (the /setup wizard). */
   onFallbackCancel(label: string, fn: (userId: number, chatId: number) => boolean): void {
     this.#fallbacks.push({ label, fn });
+  }
+
+  /**
+   * /stop IN A DM — halt running schedules. Registered by the trade panel, which owns the repo, the
+   * membership gate and the render. The arbiter only routes the word.
+   *
+   * /stop AND /cancel ARE NOT SYNONYMS AND MUST NOT BE MERGED. Someone will try:
+   *   /cancel drops a pending INPUT PROMPT (a half-finished import, an amount question).
+   *   /stop   halts RUNNING SCHEDULES — money that is moving on a timer.
+   * One is about a conversation, the other is about a wallet. Collapsing them would mean a user
+   * reaching for the emergency brake and cancelling a text prompt instead, or a user dismissing a
+   * question and silently halting their trading.
+   */
+  onDmStop(fn: (ctx: Context, userId: number) => Promise<void>): void {
+    this.#dmStop.push(fn);
+  }
+
+  /** /stop IN A GROUP — the chat-scoped flows (the /setup wizard). No schedules live in a group. */
+  onGroupStop(fn: (ctx: Context, userId: number, chatId: number) => Promise<void>): void {
+    this.#groupStop.push(fn);
+  }
+
+  /** Route /stop to the handlers for this chat kind. Group messages never reach DM state. */
+  async runStop(ctx: Context, userId: number, chatId: number, isDm: boolean): Promise<void> {
+    for (const fn of isDm ? this.#dmStop : []) await fn(ctx, userId);
+    for (const fn of isDm ? [] : this.#groupStop) await fn(ctx, userId, chatId);
   }
 
   /**
@@ -165,5 +194,24 @@ export function registerCancelCommand(bot: Bot, arbiter: InputArbiter): void {
     const cancelled = arbiter.cancel(userId, chatId, slotScoped);
     // Never a bare "ok": say what state they just left, or that there was none.
     await ctx.reply(cancelled ? `Cancelled the pending ${cancelled}.` : 'Nothing to cancel.');
+  });
+}
+
+/**
+ * /stop — THE EMERGENCY BRAKE, routed here beside /cancel so a fourth handler inherits the routing.
+ *
+ * PANIC REACHES FOR THE SHORTEST WORD. Someone who wants trading to stop RIGHT NOW is not reading
+ * docs; they type /stop. Before this, that cancelled a group setup wizard and answered "nothing to
+ * stop" while their schedules kept ticking — a refusal that does not name its exit, with a live
+ * wallet behind it. In a DM /stop now halts every schedule, exactly as /trade stop and the STOP ALL
+ * button do, through the SAME halt function.
+ *
+ * NO CONFIRMATION, ever: confirm on START, never on STOP.
+ */
+export function registerStopCommand(bot: Bot, arbiter: InputArbiter): void {
+  bot.command('stop', async (ctx: Context) => {
+    const userId = ctx.from?.id ?? 0;
+    const chatId = ctx.chat?.id ?? 0;
+    await arbiter.runStop(ctx, userId, chatId, ctx.chat?.type === 'private');
   });
 }

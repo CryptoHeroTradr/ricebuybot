@@ -308,12 +308,15 @@ export function registerCommands(bot: Bot, deps: CommandDeps): void {
    * the group it is aimed at (see /setmedia), not the DM's own chat id, so clearing only the
    * latter would leave a DM-initiated capture armed.
    */
-  bot.command('stop', async (ctx) => {
-    const userId = userIdOf(ctx);
-    const hadWizard = wizards.cancel(chatIdOf(ctx), userId);
+  // /stop is NOT registered here either. In a DM it is the autotrader EMERGENCY BRAKE (halt every
+  // schedule) — panic reaches for the shortest word — so the arbiter routes it, and only the
+  // GROUP half belongs to this surface: there are no schedules in a group, so /stop here keeps
+  // meaning "abort my in-progress setup", exactly as before.
+  deps.arbiter?.onGroupStop(async (ctx, userId, chatId) => {
+    const hadWizard = wizards.cancel(chatId, userId);
     const target = targetOf(ctx);
     const hadMedia =
-      awaitingMedia.delete(`${chatIdOf(ctx)}:${userId}`) ||
+      awaitingMedia.delete(`${chatId}:${userId}`) ||
       (target !== null && awaitingMedia.delete(`${target}:${userId}`));
     await ctx.reply(
       hadWizard || hadMedia ? '🛑 Stopped. Nothing was changed.' : 'Nothing in progress to stop.',

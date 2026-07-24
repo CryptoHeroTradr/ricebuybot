@@ -5,7 +5,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { InputArbiter, registerCancelCommand } from '../src/telegram/input-arbiter.ts';
+import { InputArbiter, registerCancelCommand, registerStopCommand } from '../src/telegram/input-arbiter.ts';
 import { encodeBase58 } from '../src/trade/base58.ts';
 import { isSecretKeyBase58, scrub, createLogger } from '../src/ops/logger.ts';
 import { SqliteRepo } from '../src/db/sqlite.ts';
@@ -427,5 +427,164 @@ describe('every refusal names its own exit', () => {
     for (const later of ['registerCommands(telegram.bot', 'registerCuration(telegram.bot', 'registerTradeCommands(telegram.bot', 'registerTradePanel(telegram.bot']) {
       expect(cancelAt, `/cancel must be registered before ${later}`).toBeLessThan(at(later));
     }
+  });
+});
+
+// ===========================================================================================
+// 5. /stop — THE EMERGENCY BRAKE. Panic reaches for the shortest word.
+// ===========================================================================================
+
+describe('/stop in a DM halts every schedule', () => {
+  let dir2: string;
+  let repo2: SqliteRepo;
+  let arbiter: InputArbiter;
+  let bot: FakeBot;
+  const OTHER = 7777;
+
+  /** The real panel + the real /stop command, wired exactly as boot wires them. */
+  async function wire(): Promise<void> {
+    const { registerTradePanel } = await import('../src/telegram/trade-panel/index.ts');
+    bot = new FakeBot();
+    arbiter = new InputArbiter();
+    registerCancelCommand(bot as never, arbiter);
+    registerStopCommand(bot as never, arbiter);
+    registerTradePanel(bot as never, {
+      repo: repo2,
+      access: repo2,
+      keystore: { pubkeyOf: () => null, isUnlocked: () => false },
+      rpc: { getBalance: async () => 0n, getTokenBalances: async () => new Map<string, bigint>() },
+      meta: async () => ({ symbol: 'RICE', decimals: 6 }),
+      tradeLive: false,
+      defaultMint: MINT,
+      log,
+      arbiter,
+    });
+  }
+
+  const seed = async (userId: number): Promise<number> =>
+    repo2.createSchedule({
+      userId, mint: MINT, side: 'buy', amountRaw: 50_000_000n, amountKind: 'absolute',
+      intervalMinutes: 15, firstRunAt: 1_000,
+    });
+
+  const stateOf = async (id: number): Promise<string> => (await repo2.getSchedule(id))!.state;
+
+  beforeEach(async () => {
+    dir2 = mkdtempSync(join(tmpdir(), 'ricebuybot-stop-'));
+    repo2 = new SqliteRepo(join(dir2, 't.db'), log);
+    await repo2.init();
+    await repo2.addAutotraderUser(USER, 'alice', 1);
+    await repo2.addAutotraderUser(OTHER, 'bob', 1);
+    await wire();
+  });
+  afterEach(async () => {
+    await repo2.close();
+    rmSync(dir2, { recursive: true, force: true });
+  });
+
+  it('halts every schedule for the caller and NO other user\'s', async () => {
+    const mine = [await seed(USER), await seed(USER)];
+    const theirs = await seed(OTHER);
+
+    const ctx = new FakeCtx(USER);
+    await bot.commands.get('stop')!(ctx);
+
+    for (const id of mine) expect(await stateOf(id)).toBe('paused');
+    expect(await stateOf(theirs), "another member's schedule must be untouched").toBe('active');
+  });
+
+  it('takes effect with NO confirmation step — one message, already done', async () => {
+    const id = await seed(USER);
+    const ctx = new FakeCtx(USER);
+    await bot.commands.get('stop')!(ctx);
+
+    // Already halted by the time we reply: nothing was asked first.
+    expect(await stateOf(id)).toBe('paused');
+    const asked = ctx.replies.some((r) => /are you sure|confirm|yes\/no|\btype\b/i.test(r));
+    expect(asked, 'an emergency stop must never ask for confirmation').toBe(false);
+    // And it re-renders the panel rather than only announcing.
+    expect(ctx.replies.join('\n')).toMatch(/Stopped 1 schedule/);
+    expect(ctx.replies.join('\n')).toMatch(/Autotrader/);
+  });
+
+  it('with nothing running replies "No active schedules to stop." and changes nothing', async () => {
+    const id = await seed(USER);
+    await repo2.pauseSchedule(id); // already paused
+    const ctx = new FakeCtx(USER);
+    await bot.commands.get('stop')!(ctx);
+
+    expect(ctx.replies).toEqual(['No active schedules to stop.']);
+    expect(await stateOf(id)).toBe('paused'); // unchanged
+  });
+
+  it('a NON-MEMBER gets no reply at all', async () => {
+    const stranger = 31337;
+    const ctx = new FakeCtx(stranger);
+    await bot.commands.get('stop')!(ctx);
+    expect(ctx.replies).toEqual([]); // silence, not a refusal
+  });
+
+  it('/stop in a GROUP cancels the wizard and does NOT touch the caller\'s DM schedules', async () => {
+    const id = await seed(USER);
+    let wizardCancelled = false;
+    arbiter.onGroupStop(async (ctx) => {
+      wizardCancelled = true;
+      await ctx.reply('🛑 Stopped. Nothing was changed.');
+    });
+
+    const ctx = new FakeCtx(USER, '', '', 'supergroup');
+    await bot.commands.get('stop')!(ctx);
+
+    expect(wizardCancelled, 'the group half still runs').toBe(true);
+    expect(await stateOf(id), 'a group message must never reach DM schedules').toBe('active');
+  });
+
+  it('/stop and /trade stop reach the SAME halt, producing the same state', async () => {
+    const viaStop = await seed(USER);
+    await bot.commands.get('stop')!(new FakeCtx(USER));
+    expect(await stateOf(viaStop)).toBe('paused');
+
+    // …and the typed equivalent does exactly the same thing.
+    const viaTrade = await seed(USER);
+    await dispatchTradeCommand(repo2, USER, MINT, ['stop'], 1_000);
+    expect(await stateOf(viaTrade)).toBe('paused');
+  });
+});
+
+describe('one halt implementation, three entry points', () => {
+  it('/stop, /trade stop and the STOP ALL button all call applyStopAll', () => {
+    const read = (f: string): string => readFileSync(join(import.meta.dirname, '..', f), 'utf8');
+    const panel = read('src/telegram/trade-panel/index.ts');
+    const cmds = read('src/telegram/trade-panel/commands.ts');
+
+    // The typed subcommand.
+    expect(cmds).toMatch(/case 'stop': return applyStopAll\(repo, userId\);/);
+    // The button (immediate, no prompt) and the DM /stop — both in the panel, both via applyStopAll.
+    expect(panel).toMatch(/onDmStop[\s\S]*?applyStopAll\(repo, userId\)/);
+    expect(panel).toMatch(/verb === 'stop'[\s\S]*?applyStopAll\(repo, userId\)/);
+    // There is no second halt-everything implementation anywhere.
+    expect(panel).not.toMatch(/pauseUserSchedules\(/);
+  });
+
+  it('boot registers /cancel AND /stop before every handler that could swallow them', () => {
+    const boot = readFileSync(join(import.meta.dirname, '..', 'src/index.ts'), 'utf8');
+    const at = (n: string): number => boot.indexOf(n);
+    for (const word of ['registerCancelCommand(telegram.bot', 'registerStopCommand(telegram.bot']) {
+      expect(at(word)).toBeGreaterThan(-1);
+      for (const later of ['registerCommands(telegram.bot', 'registerCuration(telegram.bot', 'registerTradeCommands(telegram.bot', 'registerTradePanel(telegram.bot']) {
+        expect(at(word), `${word} must precede ${later}`).toBeLessThan(at(later));
+      }
+    }
+  });
+
+  it('/stop is NOT merged with /cancel — they are separate commands with separate meanings', () => {
+    const src = readFileSync(join(import.meta.dirname, '..', 'src/telegram/input-arbiter.ts'), 'utf8');
+    expect(src).toMatch(/bot\.command\('cancel'/);
+    expect(src).toMatch(/bot\.command\('stop'/);
+    expect(src).toMatch(/NOT SYNONYMS/); // the comment that stops someone unifying them
+    // The group-config surface no longer owns either word.
+    const cmds = readFileSync(join(import.meta.dirname, '..', 'src/telegram/commands.ts'), 'utf8');
+    expect(cmds).not.toMatch(/bot\.command\('stop'/);
+    expect(cmds).toMatch(/onGroupStop\(/);
   });
 });

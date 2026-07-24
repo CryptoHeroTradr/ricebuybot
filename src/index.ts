@@ -16,7 +16,7 @@ import { JupiterHttp } from './trade/jupiter.js';
 import { Executor } from './trade/executor.js';
 import { registerResolveCommand } from './telegram/resolve-command.js';
 import { registerTradePanel } from './telegram/trade-panel/index.js';
-import { InputArbiter, registerCancelCommand } from './telegram/input-arbiter.js';
+import { InputArbiter, registerCancelCommand, registerStopCommand } from './telegram/input-arbiter.js';
 import { registerCuration } from './telegram/curate/index.js';
 import { setPlanWhitelist } from './telegram/plan-gate.js';
 import { BurstDetector, DailyCap, digestText } from './telegram/digest.js';
@@ -491,6 +491,9 @@ async function main(): Promise<void> {
     // the message; registered after the wallet's text handler, "/cancel" would be read as a
     // passphrase and the user would be locked in for the full TTL.
     registerCancelCommand(telegram.bot, inputArbiter);
+    // /stop rides the same routing. NOT a synonym for /cancel: /cancel drops a pending input
+    // prompt, /stop halts running schedules. In a DM it is the autotrader emergency brake.
+    registerStopCommand(telegram.bot, inputArbiter);
     registerCommands(telegram.bot, {
       repo,
       media: mediaPool,
