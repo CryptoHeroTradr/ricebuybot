@@ -46,6 +46,28 @@ export function isTierFolder(v: unknown): v is TierFolder {
 }
 
 /**
+ * THE dca FOLDER IS NOT A FIFTH TIER (Phase 16).
+ *
+ * The tiers are a fixed 4-tuple on the axis of SIZE — regular < big < whale < massive — with a
+ * priority chain, per-tier headlines and a CHECK constraint that all say "four". `dca` is a sibling
+ * of that whole set on a DIFFERENT axis: category, not size. A DCA card has no tier, no headline
+ * ladder and no threshold; it just needs its own art.
+ *
+ * So TIER_FOLDERS stays four, and only the set of legal media FOLDERS widens. Anything that asks
+ * "which tier is this buy?" keeps its four-way answer; anything that asks "where may media live?"
+ * uses MEDIA_FOLDERS. A folder that is neither remains a hard error.
+ */
+export const DCA_FOLDER = 'dca';
+export type MediaFolder = TierFolder | typeof DCA_FOLDER;
+
+/** Every folder media may live in: the four tiers PLUS `dca`. Not a tier list. */
+export const MEDIA_FOLDERS: readonly MediaFolder[] = Object.freeze([...TIER_FOLDERS, DCA_FOLDER]);
+
+export function isMediaFolder(v: unknown): v is MediaFolder {
+  return typeof v === 'string' && (MEDIA_FOLDERS as readonly string[]).includes(v);
+}
+
+/**
  * The per-chat tier policy. THREE numbers, and one of them is not like the others.
  *
  * `whaleHoldingsUsd` is denominated in what the wallet HOLDS. The other two are

@@ -1834,6 +1834,55 @@ export class SqliteRepo implements Repo {
       .run(userId, mint, Date.now());
   }
 
+  // --- Phase 16: DCA aggregation ---
+  //
+  // A DCA buy is one whose signature has an execution row. Phase 14 records the signature BEFORE
+  // sending, which is exactly what makes this work while the execution is still 'submitted' or
+  // 'UNKNOWN': the attribution does not wait for confirmation, so a DCA buy can never leak onto an
+  // organic card just because the socket saw it before the chain settled.
+
+  /** Is this buy one of ours (a DCA execution)? No state filter — submitted and UNKNOWN count. */
+  async isDcaSignature(signature: string): Promise<boolean> {
+    return this.#db.prepare<[string], { one: number }>('SELECT 1 AS one FROM executions WHERE signature = ? LIMIT 1').get(signature) !== undefined;
+  }
+
+  /**
+   * The DCA-attributed buys for a mint inside a window, as raw rows. Bucketed by the EXECUTION's
+   * planned_at (the scheduled slot) rather than block_time: it is always present, always ms, and it
+   * is what makes the tumbling window deterministic and testable.
+   *
+   * Returns rows, NOT a SQL SUM: tokens_raw is a u64 held as TEXT and SQLite's SUM would round it
+   * through a float and drop the low bits (INVARIANT 6). The caller sums with BigInt.
+   */
+  async dcaBuysInWindow(mint: Mint, fromMs: number, toMs: number): Promise<readonly { buyer: string; tokensRaw: bigint }[]> {
+    return this.#db
+      .prepare<[string, number, number], { buyer: string; tokens_raw: string }>(
+        `SELECT b.buyer AS buyer, b.tokens_raw AS tokens_raw
+           FROM buys b
+           JOIN executions e ON e.signature = b.signature
+          WHERE b.mint = ? AND e.planned_at >= ? AND e.planned_at < ?`,
+      )
+      .all(mint, fromMs, toMs)
+      .map((r) => ({ buyer: r.buyer, tokensRaw: BigInt(r.tokens_raw) }));
+  }
+
+  /** The last window this (chat, mint) already flushed, or null. Stops a double-count or a skip. */
+  async getDcaCursor(chatId: ChatId, mint: Mint): Promise<number | null> {
+    const r = this.#db
+      .prepare<[number, string], { last_window_start: number }>('SELECT last_window_start FROM dca_cursor WHERE chat_id = ? AND mint = ?')
+      .get(chatId, mint);
+    return r?.last_window_start ?? null;
+  }
+
+  async setDcaCursor(chatId: ChatId, mint: Mint, windowStart: number): Promise<void> {
+    this.#db
+      .prepare(
+        `INSERT INTO dca_cursor (chat_id, mint, last_window_start, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT (chat_id, mint) DO UPDATE SET last_window_start = excluded.last_window_start, updated_at = excluded.updated_at`,
+      )
+      .run(chatId, mint, windowStart, Date.now());
+  }
+
   // --- Cursors ---
 
   async getCursor(mint: Mint): Promise<number | null> {
