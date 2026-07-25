@@ -32,7 +32,8 @@ import { createReadStream } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
-import { TIER_FOLDERS, type TierFolder } from '../core/tiers.ts';
+import { TIER_FOLDERS, MEDIA_FOLDERS, type TierFolder, type MediaFolder } from '../core/tiers.ts';
+export type { MediaFolder } from '../core/tiers.ts';
 
 /**
  * The four tiers, as pool folder names.
@@ -44,6 +45,9 @@ import { TIER_FOLDERS, type TierFolder } from '../core/tiers.ts';
  */
 export const TIER_DIRS: readonly TierFolder[] = TIER_FOLDERS;
 export type Tier = TierFolder;
+
+/** Every folder media may live in: the four tiers PLUS `dca` (Phase 16). Not a tier list. */
+export const MEDIA_DIRS: readonly MediaFolder[] = MEDIA_FOLDERS;
 
 /** Holds removals. Never served, never in the manifest, never unlinked. */
 export const ARCHIVE_DIR = '_archive';
@@ -58,7 +62,7 @@ export type MediaKind = 'photo' | 'animation' | 'video';
 export interface ManifestItem {
   /** Lowercase hex sha256 of the file bytes. The item's identity, and the file_id cache key. */
   readonly sha256: string;
-  readonly tier: Tier;
+  readonly tier: MediaFolder;
   /** Path relative to MEDIA_ROOT, e.g. `<mint>/massive/<sha256>.gif`. THE FILENAME IS THE HASH. */
   readonly rel_path: string;
   /** The human name the file arrived with. A HINT, not identity. Nothing may key on it. */
@@ -105,7 +109,9 @@ export function contentName(sha256: string, ext: string): string {
 
 /** Where a given piece of content already lives. */
 export interface PoolLocation {
-  readonly tier: Tier;
+  // MediaFolder, not Tier: `locateInTiers` now scans `dca` too, and a located dca file must
+  // report `dca` as its folder so a move/remove acts on the right bytes.
+  readonly tier: MediaFolder;
   /** Absolute path of the file already in the pool. */
   readonly path: string;
 }
@@ -127,7 +133,12 @@ export interface PoolLocation {
  * `name` is the content-addressed filename — build it with `contentName()`.
  */
 export async function locateInTiers(root: string, mint: string, name: string): Promise<PoolLocation | null> {
-  for (const tier of TIER_DIRS) {
+  // MEDIA_DIRS, not TIER_DIRS: `dca` is a media folder too (Phase 16), and this is BOTH the
+  // dedup check ("one meme, one folder") and the byte-locator for a move/remove. A dca meme
+  // must be found by the second, so it is subject to the first — one content hash lives in one
+  // folder, dca included, which also keeps DCA art distinct from tier art (the whole point of a
+  // separate dca/ pool: a DCA card must never look like an organic buy).
+  for (const tier of MEDIA_DIRS) {
     const candidate = path.join(root, mint, tier, name);
     const st = await fs.stat(candidate).catch(() => null);
     if (st?.isFile()) return { tier, path: candidate };

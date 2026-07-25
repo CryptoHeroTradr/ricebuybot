@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { DEFAULT_TIER_POLICY, pickTier, type TierPolicy, type TierFolder } from '../src/core/tiers.js';
+import { DEFAULT_TIER_POLICY, pickTier, type TierPolicy, type TierFolder, type MediaFolder } from '../src/core/tiers.js';
 import { SqliteRepo } from '../src/db/sqlite.js';
 import { FsMediaPool } from '../src/media/media-pool.js';
 import { resolveTierWithFallback } from '../src/media/select.js';
@@ -221,7 +221,7 @@ describe('shuffle bag', () => {
 
 interface FakeItem {
   sha: string;
-  tier: TierFolder;
+  tier: MediaFolder;
   kind: MediaKind;
 }
 
@@ -480,5 +480,50 @@ describe('FsMediaPool', () => {
     expect(cached.n).toBe(distinct.size);
     expect(uploader.uploads).toHaveLength(distinct.size);
     expect(new Set(uploader.uploads).size).toBe(uploader.uploads.length); // no double upload
+  });
+});
+
+/**
+ * Phase 16(2): the DCA aggregate card draws from its OWN `dca` folder, with the same shuffle-bag
+ * rotation as a tier — but an EMPTY dca/ falls back to a text-only card, NEVER to tier art (which
+ * would make a DCA card read as an organic buy).
+ */
+describe('pickDca — the DCA aggregate card art', () => {
+  const DCA_POOL: FakeItem[] = [
+    ...POOL,
+    ...Array.from({ length: 3 }, (_, i) => ({ sha: `dca${i}`, tier: 'dca' as MediaFolder, kind: 'photo' as MediaKind })),
+  ];
+
+  it('draws from the dca folder, rotating through every meme before repeating', async () => {
+    const { pool } = await makePool(DCA_POOL);
+
+    const drawn: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const pick = await pool.pickDca(MINT, CHAT);
+      expect(pick).not.toBeNull();
+      expect(pick!.kind).toBe('photo');
+      // The FakeUploader mints `file_id::<sha>`, so the file_id reveals which meme was drawn.
+      expect(pick!.fileId).toMatch(/^file_id::dca\d$/); // NEVER a tier meme
+      drawn.push(pick!.fileId);
+    }
+    expect(new Set(drawn).size).toBe(3); // a full cycle, no repeat until dca/ is exhausted
+  });
+
+  it('returns null on an EMPTY dca folder even when every tier is stocked — text-only, not tier art', async () => {
+    const { pool } = await makePool(POOL); // four tiers full, dca empty
+    expect(await pool.pickDca(MINT, CHAT)).toBeNull();
+  });
+
+  it('rotates PER (mint, chat) — one chat draining dca does not empty another chat’s bag', async () => {
+    const { pool } = await makePool(DCA_POOL);
+
+    // CHAT takes two; CHAT_B has still seen nothing, so its first two are its own fresh cycle.
+    await pool.pickDca(MINT, CHAT);
+    await pool.pickDca(MINT, CHAT);
+
+    const bagA = await repo.getBag(MINT, CHAT, 'dca');
+    const bagB = await repo.getBag(MINT, CHAT_B, 'dca');
+    expect(bagA).toHaveLength(1); // 3 - 2 drawn
+    expect(bagB).toBeNull(); // CHAT_B has never drawn — its bag does not exist yet
   });
 });

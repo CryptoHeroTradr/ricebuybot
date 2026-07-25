@@ -1,5 +1,5 @@
 import type { MediaItem } from '../../core/types.js';
-import { TIERS, type TierFolder } from '../../core/tiers.js';
+import { TIERS, DCA_FOLDER, MEDIA_FOLDERS, type MediaFolder } from '../../core/tiers.js';
 import { cb } from './session.js';
 
 /**
@@ -15,24 +15,36 @@ export interface Button {
   readonly callback_data: string;
 }
 
-export function boardText(symbol: string, counts: Readonly<Record<TierFolder, number>>): string {
-  const rows = TIERS.map((t) => {
-    const n = counts[t.folder];
+/**
+ * The display name for a media folder. The four tiers have proper names; `dca` is a sibling on
+ * the category axis, not a tier, so it has no TierSpec — it renders as "DCA". A folder that is
+ * neither would fall through to its own string, but `isMediaFolder` gates every caller.
+ */
+export function folderName(folder: MediaFolder): string {
+  return folder === DCA_FOLDER ? 'DCA' : (TIERS.find((t) => t.folder === folder)?.name ?? folder);
+}
+
+export function boardText(symbol: string, counts: Readonly<Record<MediaFolder, number>>): string {
+  const rows = MEDIA_FOLDERS.map((folder) => {
+    const n = counts[folder];
     const thin = n > 0 && n < THIN_TIER ? '   ⚠️ tier is thin' : n === 0 ? '   ⚠️ empty' : '';
-    return `${t.name.padEnd(9)} ${String(n).padStart(3)}${thin}`;
+    return `${folderName(folder).padEnd(9)} ${String(n).padStart(3)}${thin}`;
   });
 
   return [`🍚 $${symbol} media`, '', '```', ...rows, '```'].join('\n');
 }
 
-export function boardKeyboard(token: string, counts: Readonly<Record<TierFolder, number>>): Button[][] {
-  const b = (t: (typeof TIERS)[number]): Button => ({
-    text: `${t.name} ${counts[t.folder]}`,
-    callback_data: cb(token, `t:${t.folder}`),
+export function boardKeyboard(token: string, counts: Readonly<Record<MediaFolder, number>>): Button[][] {
+  const b = (folder: MediaFolder): Button => ({
+    text: `${folderName(folder)} ${counts[folder]}`,
+    callback_data: cb(token, `t:${folder}`),
   });
   return [
-    [b(TIERS[0]), b(TIERS[1])],
-    [b(TIERS[2]), b(TIERS[3])],
+    [b(TIERS[0].folder), b(TIERS[1].folder)],
+    [b(TIERS[2].folder), b(TIERS[3].folder)],
+    // dca is not a tier — it sits on its own row, below the size ladder, so the board reads as
+    // "four tiers, plus the DCA pool" and never as "five tiers".
+    [b(DCA_FOLDER)],
   ];
 }
 
@@ -40,8 +52,8 @@ export function boardKeyboard(token: string, counts: Readonly<Record<TierFolder,
  * The gallery caption. The counter is ALWAYS the caption — it is the only thing telling a
  * curator where they are in a set they are paging through blind.
  */
-export function galleryCaption(tier: TierFolder, index: number, total: number): string {
-  const name = TIERS.find((t) => t.folder === tier)?.name ?? tier;
+export function galleryCaption(tier: MediaFolder, index: number, total: number): string {
+  const name = folderName(tier);
   return total === 0 ? `${name} — 0/0. No memes yet.` : `${name} — ${index + 1}/${total}`;
 }
 
@@ -72,9 +84,9 @@ export function galleryKeyboard(token: string, total: number): Button[][] {
  * the same manifest and will drop it on the next poll. Surprising someone with a change to
  * a public website is not something to do quietly.
  */
-export function removeConfirm(tier: TierFolder, index: number, total: number): string {
+export function removeConfirm(tier: MediaFolder, index: number, total: number): string {
   return [
-    `Remove this meme from ${TIERS.find((t) => t.folder === tier)?.name ?? tier}? (${index + 1}/${total})`,
+    `Remove this meme from ${folderName(tier)}? (${index + 1}/${total})`,
     '',
     'It stops appearing in buy cards immediately, in every group.',
     '**This also removes it from the website carousel.**',
@@ -93,30 +105,27 @@ export function removeKeyboard(token: string): Button[][] {
 }
 
 /** Offered when a forwarded meme is already in the pool, in a different tier. */
-export function moveKeyboard(token: string, to: TierFolder, from: TierFolder): Button[][] {
-  const name = (t: TierFolder): string => TIERS.find((x) => x.folder === t)?.name ?? t;
+export function moveKeyboard(token: string, to: MediaFolder, from: MediaFolder): Button[][] {
   return [
     [
-      { text: `Move to ${name(to)}`, callback_data: cb(token, `mv:${to}`) },
-      { text: `Keep in ${name(from)}`, callback_data: cb(token, 'keep') },
+      { text: `Move to ${folderName(to)}`, callback_data: cb(token, `mv:${to}`) },
+      { text: `Keep in ${folderName(from)}`, callback_data: cb(token, 'keep') },
     ],
   ];
 }
 
-export function moveText(to: TierFolder, from: TierFolder): string {
-  const name = (t: TierFolder): string => TIERS.find((x) => x.folder === t)?.name ?? t;
+export function moveText(to: MediaFolder, from: MediaFolder): string {
   return (
-    `That meme is already in **${name(from)}**.\n\n` +
-    `A meme lives in exactly one tier — if it were in two, it would come up twice as often and you'd never work out why.`
+    `That meme is already in **${folderName(from)}**.\n\n` +
+    `A meme lives in exactly one folder — if it were in two, it would come up twice as often and you'd never work out why.`
   );
 }
 
 export const EXPIRED = 'This board expired. Send /media again.';
 
 /** The one-line confirmation a batch-forwarding curator sees, 20 times in a row. */
-export function addedLine(tier: TierFolder, count: number): string {
-  const name = TIERS.find((t) => t.folder === tier)?.name ?? tier;
-  return `✅ Added to ${name} — ${count}/${count}`;
+export function addedLine(tier: MediaFolder, count: number): string {
+  return `✅ Added to ${folderName(tier)} — ${count}/${count}`;
 }
 
 export function tooBig(bytes: number): string {

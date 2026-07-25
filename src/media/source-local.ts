@@ -2,14 +2,14 @@ import { readFile, readdir } from 'node:fs/promises';
 import * as path from 'node:path';
 
 import type { MediaItem, MediaKind, Mint } from '../core/types.js';
-import { TIER_FOLDERS, isTierFolder, type TierFolder } from '../core/tiers.js';
+import { MEDIA_FOLDERS, isMediaFolder, type MediaFolder } from '../core/tiers.js';
 import { ARCHIVE_DIR, MANIFEST_NAME, PoolError, type Manifest } from './pool.js';
 import type { MediaSource } from './index.js';
 
 /** One entry from the manifest, normalised into the shape the DB stores. */
 export interface PoolEntry {
   readonly sha256: string;
-  readonly tier: TierFolder;
+  readonly tier: MediaFolder;
   readonly relPath: string;
   readonly kind: MediaKind;
   readonly bytes: number;
@@ -42,7 +42,7 @@ export function parseManifest(raw: unknown, mint: Mint): PoolSnapshot {
       typeof item.rel_path !== 'string' ||
       typeof item.kind !== 'string' ||
       typeof item.bytes !== 'number' ||
-      !isTierFolder(item.tier)
+      !isMediaFolder(item.tier)
     ) {
       throw new PoolError(`manifest entry is malformed: ${JSON.stringify(item)?.slice(0, 120)}`);
     }
@@ -135,7 +135,7 @@ export class LocalFsSource implements MediaSource {
     const published = new Set(snapshot.entries.map((e) => e.relPath.split('/').pop()));
 
     let orphans = 0;
-    for (const tier of TIER_FOLDERS) {
+    for (const tier of MEDIA_FOLDERS) {
       let names: string[];
       try {
         names = await readdir(path.join(this.#root, mint, tier));

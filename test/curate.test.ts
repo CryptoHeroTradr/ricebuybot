@@ -91,8 +91,13 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-const add = (mint: Mint, tier: 'regular' | 'big' | 'whale' | 'massive', bytes: Buffer, ext = '.gif', fileId = 'FID') =>
-  addMedia(curate, mint, tier, bytes, ext, ext === '.png' ? 'photo' : 'animation', fileId);
+const add = (
+  mint: Mint,
+  tier: 'regular' | 'big' | 'whale' | 'massive' | 'dca',
+  bytes: Buffer,
+  ext = '.gif',
+  fileId = 'FID',
+) => addMedia(curate, mint, tier, bytes, ext, ext === '.png' ? 'photo' : 'animation', fileId);
 
 // =============================================================================
 // AUTHORIZATION — the whole security boundary
@@ -270,6 +275,28 @@ describe('adding memes', () => {
     expect(msg).toContain('only lets me download 20MB'); // the reason
     expect(msg).toContain('tier'); // what to do instead
   });
+
+  it('curates into the dca folder and publishes it to the manifest', async () => {
+    const r = await add(RICE, 'dca', GIF);
+    expect(r.kind).toBe('added');
+
+    expect(existsSync(join(root, RICE, 'dca', `${sha(GIF)}.gif`))).toBe(true);
+    expect((await repo.listMedia(RICE, 'dca')).map((i) => i.sha256)).toEqual([sha(GIF)]);
+
+    const manifest = JSON.parse(readFileSync(join(root, RICE, 'manifest.json'), 'utf8')) as {
+      items: { sha256: string; tier: string }[];
+    };
+    expect(manifest.items[0]).toMatchObject({ sha256: sha(GIF), tier: 'dca' });
+  });
+
+  it('holds dca to one-meme-one-folder against a tier — DCA art must stay distinct', async () => {
+    await add(RICE, 'dca', GIF);
+    const clash = await add(RICE, 'whale', GIF);
+
+    // The same content in dca and a tier is offered a move, not silently duplicated.
+    expect(clash).toMatchObject({ kind: 'duplicate-elsewhere', tier: 'dca' });
+    expect(await repo.listMedia(RICE, 'whale')).toHaveLength(0);
+  });
 });
 
 // =============================================================================
@@ -364,13 +391,33 @@ describe('the gallery', () => {
   });
 
   it('flags a thin tier — under 5 means visible repetition', () => {
-    const text = view.boardText('RICE', { regular: 48, big: 22, whale: 9, massive: 3 });
+    const text = view.boardText('RICE', { regular: 48, big: 22, whale: 9, massive: 3, dca: 12 });
     expect(text).toContain('Massive     3   ⚠️ tier is thin');
     expect(text).not.toContain('Regular   48   ⚠️');
   });
 
   it('flags an empty tier too', () => {
-    expect(view.boardText('RICE', { regular: 5, big: 5, whale: 5, massive: 0 })).toContain('⚠️ empty');
+    expect(view.boardText('RICE', { regular: 5, big: 5, whale: 5, massive: 0, dca: 5 })).toContain('⚠️ empty');
+  });
+
+  it('shows dca as its own row — a fifth line, but never a fifth tier', () => {
+    const text = view.boardText('RICE', { regular: 5, big: 5, whale: 5, massive: 5, dca: 7 });
+    expect(text).toContain('DCA         7');
+  });
+
+  it('the board keyboard carries a DCA button, on its own row below the four tiers', () => {
+    const rows = view.boardKeyboard('tok', { regular: 5, big: 5, whale: 5, massive: 5, dca: 7 });
+    // Four tiers in the first two rows, dca alone on the last.
+    expect(rows).toHaveLength(3);
+    expect(rows[2]).toHaveLength(1);
+    expect(rows[2]![0]!.text).toBe('DCA 7');
+    expect(rows[2]![0]!.callback_data).toContain('t:dca');
+  });
+
+  it('renders the dca folder’s display name as "DCA", not the raw folder', () => {
+    expect(view.folderName('dca')).toBe('DCA');
+    expect(view.folderName('whale')).toBe('Whale');
+    expect(view.galleryCaption('dca', 0, 3)).toBe('DCA — 1/3');
   });
 });
 

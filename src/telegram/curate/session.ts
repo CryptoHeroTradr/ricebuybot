@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 
 import type { Mint } from '../../core/types.js';
-import type { TierFolder } from '../../core/tiers.js';
+import type { MediaFolder } from '../../core/tiers.js';
 
 /**
  * THE 64-BYTE WALL.
@@ -26,7 +26,7 @@ export interface Board {
   readonly userId: number;
   readonly mint: Mint;
   /** Null on the tier board; set once they are inside a gallery. */
-  tier: TierFolder | null;
+  tier: MediaFolder | null;
   index: number;
   /** The one message we keep editing. Never a new one — the curator is paging, not chatting. */
   messageId: number | null;
@@ -49,9 +49,9 @@ export const AWAITING_TTL_MS = 10 * 60_000;
 export interface Awaiting {
   readonly userId: number;
   readonly mint: Mint;
-  readonly tier: TierFolder;
+  readonly tier: MediaFolder;
   /** A meme already in another tier, waiting on [Move] / [Keep]. */
-  pendingMove?: { sha256: string; from: TierFolder } | undefined;
+  pendingMove?: { sha256: string; from: MediaFolder } | undefined;
   expiresAt: number;
 }
 
@@ -105,7 +105,7 @@ export class CurationSessions {
 
   // --- awaiting media -----------------------------------------------------------------
 
-  startAwaiting(userId: number, mint: Mint, tier: TierFolder): Awaiting {
+  startAwaiting(userId: number, mint: Mint, tier: MediaFolder): Awaiting {
     const a: Awaiting = { userId, mint, tier, expiresAt: this.#now() + AWAITING_TTL_MS };
     this.#awaiting.set(userId, a);
     return a;

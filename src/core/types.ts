@@ -4,7 +4,7 @@
  */
 
 import type { RawAmount } from './money.js';
-import type { TierFolder, TierName } from './tiers.js';
+import type { TierFolder, TierName, MediaFolder } from './tiers.js';
 
 /** Base58 mint address. */
 export type Mint = string;
@@ -392,7 +392,7 @@ export interface MediaItem {
   /** Lowercase hex sha256 of the file bytes. Stable across renames and re-syncs. */
   readonly sha256: string;
   readonly mint: Mint;
-  readonly tier: TierFolder;
+  readonly tier: MediaFolder;
   /** Path relative to MEDIA_ROOT. Never written to. */
   readonly relPath: string;
   readonly kind: MediaKind;

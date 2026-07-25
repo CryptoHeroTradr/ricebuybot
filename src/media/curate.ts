@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto';
 import type { Logger } from 'pino';
 
 import type { MediaKind, Mint } from '../core/types.js';
-import type { TierFolder } from '../core/tiers.js';
+import type { MediaFolder } from '../core/tiers.js';
 import type { Repo } from '../db/index.js';
 import { generate } from '../../scripts/build-manifest.ts';
 import { ARCHIVE_DIR, contentName, locateInTiers } from './pool.ts';
@@ -68,9 +68,9 @@ export interface CurateDeps {
 
 export type AddResult =
   | { readonly kind: 'added'; readonly sha256: string; readonly count: number }
-  | { readonly kind: 'duplicate-here'; readonly sha256: string; readonly tier: TierFolder }
+  | { readonly kind: 'duplicate-here'; readonly sha256: string; readonly tier: MediaFolder }
   /** Already in the pool, in ANOTHER tier. The caller offers a move; it does not decide. */
-  | { readonly kind: 'duplicate-elsewhere'; readonly sha256: string; readonly tier: TierFolder };
+  | { readonly kind: 'duplicate-elsewhere'; readonly sha256: string; readonly tier: MediaFolder };
 
 /**
  * Write bytes into a tier, content-addressed, and make the change LIVE.
@@ -85,7 +85,7 @@ export type AddResult =
 export async function addMedia(
   deps: CurateDeps,
   mint: Mint,
-  tier: TierFolder,
+  tier: MediaFolder,
   bytes: Buffer,
   ext: string,
   kind: MediaKind,
@@ -156,7 +156,7 @@ export async function addMedia(
 /**
  * Move a meme from whichever tier holds it into another one. One meme, one tier.
  */
-export async function moveMedia(deps: CurateDeps, mint: Mint, sha256: string, to: TierFolder): Promise<boolean> {
+export async function moveMedia(deps: CurateDeps, mint: Mint, sha256: string, to: MediaFolder): Promise<boolean> {
   const item = (await deps.repo.listAllMedia(mint)).find((i) => i.sha256 === sha256);
   if (!item) return false;
 

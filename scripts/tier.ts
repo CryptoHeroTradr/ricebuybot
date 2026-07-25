@@ -36,14 +36,16 @@ import {
   PoolError,
   sha256File,
   TIER_DIRS,
+  MEDIA_DIRS,
+  type MediaFolder,
   type Tier,
 } from '../src/media/pool.ts';
 import { DEFAULT_MINT, DEFAULT_ROOT, generate } from './build-manifest.ts';
 
 /** `archive` is a DESTINATION, not a fifth tier. The tiers are fixed at four. */
-type Destination = Tier | 'archive';
+type Destination = MediaFolder | 'archive';
 
-const DESTINATIONS: readonly string[] = [...TIER_DIRS, 'archive'];
+const DESTINATIONS: readonly string[] = [...MEDIA_DIRS, 'archive'];
 
 /** Files land readable by the group (nginx) and writable only by the owner (the bot). */
 const FILE_MODE = 0o640;
@@ -166,7 +168,7 @@ interface Placement {
   readonly label: string;
   readonly skipped: boolean;
   /** Set when this was a relocation out of another tier, for the summary line. */
-  readonly movedFrom?: Tier;
+  readonly movedFrom?: MediaFolder;
 }
 
 /**

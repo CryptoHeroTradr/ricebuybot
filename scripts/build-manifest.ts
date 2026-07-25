@@ -48,9 +48,11 @@ import {
   PoolError,
   sha256File,
   TIER_DIRS,
+  MEDIA_DIRS,
   type Manifest,
   type ManifestItem,
   type MediaKind,
+  type MediaFolder,
   type Tier,
 } from '../src/media/pool.ts';
 
@@ -72,7 +74,7 @@ export {
 const execFileAsync = promisify(execFile);
 
 /** The only entries allowed to exist under `<root>/<mint>/`. Anything else is an ERROR. */
-const ALLOWED_DIRS: readonly string[] = [...TIER_DIRS, ARCHIVE_DIR];
+const ALLOWED_DIRS: readonly string[] = [...MEDIA_DIRS, ARCHIVE_DIR];
 
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp']);
 const MOVING_EXTS = new Set(['.gif', '.mp4', '.webm']);
@@ -219,7 +221,7 @@ export async function buildManifest(opts: BuildOptions): Promise<BuildResult> {
       if (!ALLOWED_DIRS.includes(entry.name)) {
         throw new PoolError(
           `unexpected folder ${path.join(mintDir, entry.name)}\n` +
-            `  The four tiers are fixed: ${TIER_DIRS.join(', ')} (plus ${ARCHIVE_DIR}).\n` +
+            `  Allowed folders: ${MEDIA_DIRS.join(', ')} (plus ${ARCHIVE_DIR}).\n` +
             `  Refusing to generate a manifest that silently ignores it — its contents would never be posted.`,
         );
       }
@@ -243,7 +245,7 @@ export async function buildManifest(opts: BuildOptions): Promise<BuildResult> {
 
   /** sha256 -> where we first saw it. Populated BEFORE ffprobe, so duplicate detection
    *  does not depend on either copy being probeable. */
-  const seenBySha = new Map<string, { rel_path: string; tier: Tier; name: string }>();
+  const seenBySha = new Map<string, { rel_path: string; tier: MediaFolder; name: string }>();
   const collected: ManifestItem[] = [];
   /**
    * Skips where the TOOL ITSELF failed — ffprobe missing, unrunnable, killed, timed
@@ -254,7 +256,7 @@ export async function buildManifest(opts: BuildOptions): Promise<BuildResult> {
    */
   const environmentFailures: string[] = [];
 
-  for (const tier of TIER_DIRS) {
+  for (const tier of MEDIA_DIRS) {
     const tierDir = path.join(mintDir, tier);
 
     for (const entry of await listDir(tierDir)) {

@@ -3,7 +3,7 @@ import { InputMediaBuilder } from 'grammy';
 import type { Logger } from 'pino';
 
 import type { MediaKind, Mint } from '../../core/types.js';
-import { TIER_FOLDERS, isTierFolder, type TierFolder } from '../../core/tiers.js';
+import { MEDIA_FOLDERS, isMediaFolder, type MediaFolder } from '../../core/tiers.js';
 import { symbol as displaySymbol } from '../../render/format.js';
 import type { Repo } from '../../db/index.js';
 import type { MediaPool } from '../../media/index.js';
@@ -83,13 +83,13 @@ export function registerCuration(bot: Bot, deps: CurateUiDeps): void {
   const symbolOf = async (mint: Mint): Promise<string> =>
     displaySymbol((await deps.repo.getToken(mint))?.symbol ?? null, mint);
 
-  const countsOf = async (mint: Mint): Promise<Record<TierFolder, number>> => {
-    const out = {} as Record<TierFolder, number>;
-    for (const t of TIER_FOLDERS) out[t] = (await deps.repo.listMedia(mint, t)).length;
+  const countsOf = async (mint: Mint): Promise<Record<MediaFolder, number>> => {
+    const out = {} as Record<MediaFolder, number>;
+    for (const t of MEDIA_FOLDERS) out[t] = (await deps.repo.listMedia(mint, t)).length;
     return out;
   };
 
-  const liveItems = async (mint: Mint, tier: TierFolder) => deps.repo.listMedia(mint, tier);
+  const liveItems = async (mint: Mint, tier: MediaFolder) => deps.repo.listMedia(mint, tier);
 
   // -------------------------------------------------------------------------
   // /media — the entry point, and the security gate
@@ -157,7 +157,7 @@ export function registerCuration(bot: Bot, deps: CurateUiDeps): void {
   }
 
   async function showGallery(ctx: Context, board: Board): Promise<void> {
-    const tier = board.tier as TierFolder;
+    const tier = board.tier as MediaFolder;
     const items = await liveItems(board.mint, tier);
 
     // The pool may have shrunk under this board (another curator, a removal). Clamp rather
@@ -254,7 +254,7 @@ export function registerCuration(bot: Bot, deps: CurateUiDeps): void {
 
     if (verb.startsWith('t:')) {
       const tier = verb.slice(2);
-      if (!isTierFolder(tier)) return;
+      if (!isMediaFolder(tier)) return;
       board.tier = tier;
       board.index = 0;
       return void showGallery(ctx, board);
@@ -263,7 +263,7 @@ export function registerCuration(bot: Bot, deps: CurateUiDeps): void {
     if (verb === 'gallery') return void showGallery(ctx, board);
 
     if (verb === 'prev' || verb === 'next') {
-      const items = await liveItems(board.mint, board.tier as TierFolder);
+      const items = await liveItems(board.mint, board.tier as MediaFolder);
       board.index = view.step(board.index, items.length, verb === 'next' ? 1 : -1);
       return void showGallery(ctx, board);
     }
@@ -273,7 +273,7 @@ export function registerCuration(bot: Bot, deps: CurateUiDeps): void {
       if (!claim.ok) {
         return void ctx.reply(`Finish your ${claim.heldLabel} first, or send /cancel to drop it — then tap ➕ Add again.`);
       }
-      sessions.startAwaiting(userId, board.mint, board.tier as TierFolder);
+      sessions.startAwaiting(userId, board.mint, board.tier as MediaFolder);
       if (claim.cancelled) await ctx.reply(`(cancelled the pending ${claim.cancelled})`);
       const name = board.tier;
       await ctx.reply(
@@ -284,9 +284,9 @@ export function registerCuration(bot: Bot, deps: CurateUiDeps): void {
     }
 
     if (verb === 'rm') {
-      const items = await liveItems(board.mint, board.tier as TierFolder);
+      const items = await liveItems(board.mint, board.tier as MediaFolder);
       if (items.length === 0) return;
-      await ctx.reply(view.removeConfirm(board.tier as TierFolder, board.index, items.length), {
+      await ctx.reply(view.removeConfirm(board.tier as MediaFolder, board.index, items.length), {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: view.removeKeyboard(board.token) },
       });
@@ -294,7 +294,7 @@ export function registerCuration(bot: Bot, deps: CurateUiDeps): void {
     }
 
     if (verb === 'rm!') {
-      const items = await liveItems(board.mint, board.tier as TierFolder);
+      const items = await liveItems(board.mint, board.tier as MediaFolder);
       const item = view.itemAt(items, board.index);
       if (!item) return;
 
@@ -302,7 +302,7 @@ export function registerCuration(bot: Bot, deps: CurateUiDeps): void {
 
       // Clamp: removing the last item leaves the EMPTY view, not a crash and not an index
       // pointing past the end of a shorter list.
-      const left = await liveItems(board.mint, board.tier as TierFolder);
+      const left = await liveItems(board.mint, board.tier as MediaFolder);
       board.index = left.length === 0 ? 0 : Math.min(board.index, left.length - 1);
 
       await ctx.reply('🗑 Removed. It’s out of every group’s rotation now, and off the website.');
@@ -313,7 +313,7 @@ export function registerCuration(bot: Bot, deps: CurateUiDeps): void {
     if (verb.startsWith('mv:')) {
       const to = verb.slice(3);
       const awaiting = sessions.awaiting(userId);
-      if (!isTierFolder(to) || !awaiting?.pendingMove) return;
+      if (!isMediaFolder(to) || !awaiting?.pendingMove) return;
 
       await moveMedia(curate, board.mint, awaiting.pendingMove.sha256, to);
       awaiting.pendingMove = undefined;

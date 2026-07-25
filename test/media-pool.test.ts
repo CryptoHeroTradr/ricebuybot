@@ -748,3 +748,65 @@ describe('tier CLI', () => {
     expect(stderr).toMatch(/unknown destination: epic/);
   });
 }, { timeout: SUBPROCESS_TIMEOUT_MS });
+
+/**
+ * `dca` is a media folder but NOT a fifth tier (Phase 16). It carries its own art for the DCA
+ * aggregate card. The generator must publish it like any other folder — and `manifest.tiers`
+ * must STAY four keys, because a DCA card has no tier, no headline and no threshold.
+ */
+describe('the dca folder', () => {
+  it('is a valid media folder — a dca meme is published, tiered `dca`', async () => {
+    await put('dca', addressed(GIF_1X1, '.gif'), GIF_1X1);
+    const manifest = await build();
+
+    expect(manifest.count).toBe(1);
+    expect(manifest.items[0]!.tier).toBe('dca');
+    expect(manifest.items[0]!.rel_path).toBe(`${MINT}/dca/${sha(GIF_1X1)}.gif`);
+  });
+
+  it('does NOT add a fifth key to manifest.tiers — dca is a sibling of the tiers, not one of them', async () => {
+    await put('dca', addressed(GIF_1X1, '.gif'), GIF_1X1);
+    await put('massive', addressed(PNG_1X1, '.png'), PNG_1X1);
+    const manifest = await build();
+
+    // Four keys, exactly. The dca item is in items[] but out of the tier census.
+    expect(manifest.tiers).toEqual({ regular: 0, big: 0, whale: 0, massive: 1 });
+    expect(manifest.count).toBe(2); // ...yet both memes are published
+  });
+
+  it('is subject to the one-meme-one-folder rule against a tier — DCA art stays distinct', async () => {
+    await put('dca', `${sha(GIF_1X1)}.gif`, GIF_1X1);
+    await put('regular', `${sha(GIF_1X1)}.gif`, GIF_1X1);
+
+    await expect(build()).rejects.toThrow(PoolError);
+    await expect(build()).rejects.toThrow(/same content is in two tiers/);
+  });
+
+  it('the CLI seeds dca in one command', async () => {
+    const incoming = path.join(root, '_incoming', MINT, 'seed.gif');
+    await writeFile(incoming, GIF_1X1);
+
+    const { code, stdout } = await runScript('tier.ts', ['dca', 'seed.gif', '--root', root, '--mint', MINT]);
+
+    expect(code).toBe(0);
+    expect(stdout).toMatch(/seed\.gif -> dca/);
+    await expect(stat(path.join(root, MINT, 'dca', addressed(GIF_1X1, '.gif')))).resolves.toBeTruthy();
+
+    const manifest = JSON.parse(await readFile(path.join(root, MINT, 'manifest.json'), 'utf8')) as Manifest;
+    expect(manifest.count).toBe(1);
+    expect(manifest.items[0]!.tier).toBe('dca');
+  });
+
+  it('re-tiers a meme INTO dca with --move, leaving one copy', async () => {
+    const name = addressed(GIF_1X1, '.gif');
+    await put('massive', name, GIF_1X1);
+
+    const { code, stdout } = await runScript('tier.ts', ['dca', name, '--move', '--root', root, '--mint', MINT]);
+
+    expect(code).toBe(0);
+    expect(stdout).toMatch(/massive -> dca/);
+    await expect(stat(path.join(root, MINT, 'dca', name))).resolves.toBeTruthy();
+    await expect(stat(path.join(root, MINT, 'massive', name))).rejects.toThrow();
+    expect((await build()).count).toBe(1);
+  });
+}, { timeout: SUBPROCESS_TIMEOUT_MS });

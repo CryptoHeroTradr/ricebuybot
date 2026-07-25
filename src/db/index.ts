@@ -12,7 +12,7 @@ import type {
   TokenMeta,
   Wallet,
 } from '../core/types.js';
-import type { TierFolder } from '../core/tiers.js';
+import type { TierFolder, MediaFolder } from '../core/tiers.js';
 import type { PositionDisagreement, RecomputeOpts } from './sqlite.js';
 
 export type { Migration } from './migrate.js';
@@ -104,7 +104,7 @@ export interface Repo {
   upsertMediaItem(item: MediaItemInput): Promise<void>;
 
   /** Live media for a tier: everything NOT removed. `missing` items ARE included. */
-  listMedia(mint: Mint, tier: TierFolder): Promise<readonly MediaItem[]>;
+  listMedia(mint: Mint, tier: MediaFolder): Promise<readonly MediaItem[]>;
 
   /** Every item this bot has ever seen for a mint, removed ones included. The diff base. */
   listAllMedia(mint: Mint): Promise<readonly MediaItem[]>;
@@ -132,8 +132,8 @@ export interface Repo {
   listMediaWithoutFileId(mint: Mint): Promise<readonly MediaItem[]>;
 
   // --- Rotation: shuffle bag per (mint, chat, tier) ---
-  getBag(mint: Mint, chatId: ChatId, tier: TierFolder): Promise<readonly string[] | null>;
-  putBag(mint: Mint, chatId: ChatId, tier: TierFolder, bag: readonly string[]): Promise<void>;
+  getBag(mint: Mint, chatId: ChatId, tier: MediaFolder): Promise<readonly string[] | null>;
+  putBag(mint: Mint, chatId: ChatId, tier: MediaFolder, bag: readonly string[]): Promise<void>;
 
   // --- Curators (Phase 8.5). EXPLICIT grants only — never a cache of admin status. ---
   addCurator(userId: number, mint: Mint, grantedBy: number | null): Promise<void>;

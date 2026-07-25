@@ -173,6 +173,9 @@ async function main(): Promise<void> {
     queue,
     log,
     ...(cfg.CREATOR_FEE_WALLET !== undefined ? { creatorFeeWallet: cfg.CREATOR_FEE_WALLET } : {}),
+    // The dca/ pool, with rotation. Returns null on an EMPTY dca/ — the flusher then renders a
+    // text-only card, NEVER tier art (that would make a DCA card read as an organic buy).
+    pickMedia: (mint, chatId) => mediaPool.pickDca(mint, chatId),
   });
   dcaFlusher.start();
   shutdown.register('dca-flush', () => {

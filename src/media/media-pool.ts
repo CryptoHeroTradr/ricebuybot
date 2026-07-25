@@ -1,7 +1,7 @@
 import type { Logger } from 'pino';
 
-import type { ChatId, MediaItem, Mint } from '../core/types.js';
-import { TIER_BY_FOLDER, TIER_FOLDERS, pickTier, type TierFolder, type TierPolicy } from '../core/tiers.js';
+import type { ChatId, MediaItem, MediaKind, Mint } from '../core/types.js';
+import { TIER_BY_FOLDER, TIER_FOLDERS, DCA_FOLDER, pickTier, type TierFolder, type MediaFolder, type TierPolicy } from '../core/tiers.js';
 import type { Repo } from '../db/index.js';
 import type { MediaPool, MediaSource, MediaUploader, Pick, PoolHealth } from './index.js';
 import { popFromBag } from './rotation.js';
@@ -210,6 +210,21 @@ export class FsMediaPool implements MediaPool {
     return { earnedTier: earned.name, usedTier, item };
   }
 
+  /**
+   * PHASE 16 — pick DCA art for a chat, or null. The `dca/` folder rotates on its OWN shuffle bag
+   * (keyed on the folder, so it never syncs with the tier bags), and NEVER borrows tier art: a
+   * DCA card must not look like an organic buy card. An empty `dca/` returns null, and the flusher
+   * posts a TEXT-ONLY card — which is the whole point of the disclosure.
+   */
+  async pickDca(mint: Mint, chatId: ChatId): Promise<{ fileId: string; kind: MediaKind } | null> {
+    const live = await this.#repo.listMedia(mint, DCA_FOLDER);
+    if (live.length === 0) return null; // text-only fallback; NEVER a tier meme
+    const item = await this.#popFor(mint, chatId, DCA_FOLDER, live);
+    if (!item) return null;
+    const fileId = await this.fileIdFor(item);
+    return fileId ? { fileId, kind: item.kind } : null; // no file_id yet -> text-only this time
+  }
+
   /** Live (= not removed; missing INCLUDED) items, grouped by tier. */
   async #liveByTier(mint: Mint): Promise<Map<TierFolder, readonly MediaItem[]>> {
     const out = new Map<TierFolder, readonly MediaItem[]>();
@@ -221,7 +236,7 @@ export class FsMediaPool implements MediaPool {
   async #popFor(
     mint: Mint,
     chatId: ChatId,
-    tier: TierFolder,
+    tier: MediaFolder,
     live: readonly MediaItem[],
   ): Promise<MediaItem | null> {
     if (live.length === 0) return null;
