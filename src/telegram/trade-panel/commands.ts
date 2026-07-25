@@ -1,5 +1,6 @@
 import type { Mint } from '../../core/types.js';
 import type { AmountKind, Caps, ExecutionRecord, Schedule, Side } from '../../trade/scheduler.js';
+import type { SettingChangeInput } from '../../trade/audit.js';
 
 /**
  * PHASE 15 — the command layer behind BOTH the typed commands and the buttons. Everything here is:
@@ -38,12 +39,34 @@ export interface PanelRepo {
   getContract(userId: number): Promise<Mint | null>;
   setContract(userId: number, mint: Mint): Promise<void>;
   listExecutionsForUser(userId: number, limit: number): Promise<readonly ExecutionRecord[]>;
+  /** Phase 16 (6): the what/from/to/when audit. Best-effort — a failed audit never fails the change. */
+  recordSettingChange(entry: SettingChangeInput): Promise<void>;
 }
 
 export type ApplyResult = { readonly ok: boolean; readonly message: string };
 
 const ok = (message: string): ApplyResult => ({ ok: true, message });
 const err = (message: string): ApplyResult => ({ ok: false, message });
+
+/**
+ * Record a setting change, best-effort. THE AUDIT MUST NEVER FAIL THE CHANGE: a full disk or a
+ * locked DB on the trail table is not a reason to refuse a user their pause button. So this swallows,
+ * and only after the write it is auditing has already succeeded.
+ */
+async function audit(repo: PanelRepo, entry: SettingChangeInput): Promise<void> {
+  try {
+    await repo.recordSettingChange(entry);
+  } catch {
+    /* the change already happened; a lost audit row is not worth failing it */
+  }
+}
+
+/** Human-readable rendering of a schedule amount, for the audit trail (never for arithmetic). */
+export function describeAmount(side: Side, amountRaw: bigint, kind: AmountKind): string {
+  if (kind === 'percent_of_balance') return `${Number(amountRaw) / 100}%`; // stored as bps
+  if (side === 'buy') return `${Number(amountRaw) / LAMPORTS_PER_SOL} SOL`;
+  return `${amountRaw.toString()} tokens`;
+}
 
 /** VALIDATE-BEFORE-WRITE: resolve a schedule that both exists AND belongs to the caller, else a
  *  specific error. Every id-taking action goes through this first. */
@@ -109,6 +132,10 @@ export async function applyNew(
     userId, mint: contract, side, amountRaw: amt.amountRaw, amountKind: amt.amountKind,
     intervalMinutes: iv, firstRunAt: now, state: 'active',
   });
+  await audit(repo, {
+    userId, action: 'schedule.create', scheduleId: id, field: null,
+    fromValue: null, toValue: `${side} ${describeAmount(side, amt.amountRaw, amt.amountKind)} every ${iv} min`,
+  });
   const caps = await repo.getCaps(userId, contract);
   const capNote = caps ? '' : ' — ⚠️ set caps (🛡 Caps) before it can trade safely';
   return ok(`Created schedule #${id}: ${side} every ${iv} min${capNote}.`);
@@ -120,6 +147,11 @@ export async function applyAmount(repo: PanelRepo, userId: number, id: number, a
   const amt = parseAmount(amountRaw, s.side);
   if ('error' in amt) return err(amt.error);
   await repo.setScheduleAmount(id, amt.amountRaw, amt.amountKind);
+  await audit(repo, {
+    userId, action: 'schedule.amount', scheduleId: id, field: 'amount',
+    fromValue: describeAmount(s.side, s.amountRaw, s.amountKind),
+    toValue: describeAmount(s.side, amt.amountRaw, amt.amountKind),
+  });
   return ok(`Schedule #${id} amount updated.`);
 }
 
@@ -129,6 +161,10 @@ export async function applyInterval(repo: PanelRepo, userId: number, id: number,
   const iv = parseInterval(intervalRaw);
   if (typeof iv !== 'number') return err(iv.error);
   await repo.setScheduleInterval(id, iv);
+  await audit(repo, {
+    userId, action: 'schedule.interval', scheduleId: id, field: 'interval_minutes',
+    fromValue: String(s.intervalMinutes), toValue: String(iv),
+  });
   return ok(`Schedule #${id} now runs every ${iv} min.`);
 }
 
@@ -138,6 +174,10 @@ export async function applySlippage(repo: PanelRepo, userId: number, id: number,
   const bps = Number(bpsRaw.trim());
   if (!Number.isInteger(bps) || bps < 0 || bps > MAX_SLIPPAGE_BPS) return err(`slippage is basis points, 0–${MAX_SLIPPAGE_BPS} (100 = 1%)`);
   await repo.setScheduleSlippage(id, bps);
+  await audit(repo, {
+    userId, action: 'schedule.slippage', scheduleId: id, field: 'slippage_bps',
+    fromValue: String(s.slippageBps), toValue: String(bps),
+  });
   return ok(`Schedule #${id} slippage set to ${bps} bps.`);
 }
 
@@ -145,6 +185,7 @@ export async function applyPause(repo: PanelRepo, userId: number, id: number): P
   const s = await ownedSchedule(repo, userId, id);
   if (isErr(s)) return s;
   await repo.pauseSchedule(id);
+  await audit(repo, { userId, action: 'schedule.pause', scheduleId: id, field: null, fromValue: s.state, toValue: 'paused' });
   return ok(`Schedule #${id} paused.`);
 }
 
@@ -152,6 +193,7 @@ export async function applyResume(repo: PanelRepo, userId: number, id: number): 
   const s = await ownedSchedule(repo, userId, id);
   if (isErr(s)) return s;
   await repo.unhaltSchedule(id); // active + clears any halt reason
+  await audit(repo, { userId, action: 'schedule.resume', scheduleId: id, field: null, fromValue: s.state, toValue: 'active' });
   return ok(`Schedule #${id} resumed.`);
 }
 
@@ -159,6 +201,11 @@ export async function applyDelete(repo: PanelRepo, userId: number, id: number): 
   const s = await ownedSchedule(repo, userId, id);
   if (isErr(s)) return s;
   await repo.deleteScheduleById(id);
+  await audit(repo, {
+    userId, action: 'schedule.delete', scheduleId: id, field: null,
+    fromValue: `${s.side} ${describeAmount(s.side, s.amountRaw, s.amountKind)} every ${s.intervalMinutes} min`,
+    toValue: null,
+  });
   return ok(`Schedule #${id} deleted.`);
 }
 
@@ -166,6 +213,7 @@ export async function applyDelete(repo: PanelRepo, userId: number, id: number): 
  *  an emergency stop is a design error). Confirm on START, never on STOP. */
 export async function applyStopAll(repo: PanelRepo, userId: number): Promise<ApplyResult> {
   const n = await repo.pauseUserSchedules(userId);
+  if (n > 0) await audit(repo, { userId, action: 'stop_all', scheduleId: null, field: null, fromValue: null, toValue: `${n} paused` });
   return ok(n === 0 ? 'Nothing was running.' : `Stopped ${n} schedule(s). ▶️ Resume when ready.`);
 }
 
@@ -173,6 +221,7 @@ export async function applyStopAll(repo: PanelRepo, userId: number): Promise<App
  *  contract/wallet change requires. */
 export async function applyResumeAll(repo: PanelRepo, userId: number): Promise<ApplyResult> {
   const n = await repo.resumeUserSchedules(userId);
+  if (n > 0) await audit(repo, { userId, action: 'resume_all', scheduleId: null, field: null, fromValue: null, toValue: `${n} resumed` });
   return ok(n === 0 ? 'Nothing to resume.' : `Resumed ${n} schedule(s).`);
 }
 
@@ -185,7 +234,13 @@ export async function applyCaps(repo: PanelRepo, userId: number, contract: Mint,
   // The env ceiling is the authority (the executor enforces it against the DB); refuse here too so
   // the user is told, rather than silently having a too-high cap clamped at execution.
   if (day > maxPerDayUsdCeiling) return err(`daily cap ($${day}) is above the $${maxPerDayUsdCeiling} platform ceiling — that is the most the autotrader will spend in a day.`);
+  const prior = await repo.getCaps(userId, contract);
   await repo.setCaps({ userId, mint: contract, maxPerExecUsd: per, maxPerDayUsd: day });
+  await audit(repo, {
+    userId, action: 'caps', scheduleId: null, field: 'per/day usd',
+    fromValue: prior ? `$${prior.maxPerExecUsd}/$${prior.maxPerDayUsd}` : null,
+    toValue: `$${per}/$${day}`,
+  });
   return ok(`Caps set: $${per} per trade, $${day} per day.`);
 }
 
@@ -195,15 +250,25 @@ export async function applyCaps(repo: PanelRepo, userId: number, contract: Mint,
  */
 export async function applySetContract(repo: PanelRepo, userId: number, mint: string): Promise<ApplyResult> {
   if (!isPlausibleMint(mint)) return err('That does not look like a mint address (base58, 32–44 chars).');
+  const prior = await repo.getContract(userId);
   const halted = await repo.haltUserSchedules(userId, 'contract changed');
   await repo.setContract(userId, mint as Mint);
+  await audit(repo, {
+    userId, action: 'contract', scheduleId: null, field: 'mint',
+    fromValue: prior, toValue: mint,
+  });
   const note = halted > 0 ? ` ${halted} schedule(s) HALTED — ▶️ Resume to continue against the new contract.` : '';
   return ok(`Contract set.${note}`);
 }
 
 /** Called when the WALLET changes (from the wallet flow): halt schedules, explicit resume required. */
 export async function haltForWalletChange(repo: PanelRepo, userId: number): Promise<number> {
-  return repo.haltUserSchedules(userId, 'wallet changed');
+  const halted = await repo.haltUserSchedules(userId, 'wallet changed');
+  await audit(repo, {
+    userId, action: 'wallet', scheduleId: null, field: null,
+    fromValue: null, toValue: halted > 0 ? `changed — ${halted} halted` : 'changed',
+  });
+  return halted;
 }
 
 /**

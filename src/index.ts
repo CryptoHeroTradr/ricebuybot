@@ -16,6 +16,8 @@ import { JupiterHttp } from './trade/jupiter.js';
 import { Executor } from './trade/executor.js';
 import { registerResolveCommand } from './telegram/resolve-command.js';
 import { registerTradePanel } from './telegram/trade-panel/index.js';
+import { haltForWalletChange } from './telegram/trade-panel/commands.js';
+import { DigestScheduler } from './telegram/trade-digest.js';
 import { InputArbiter, registerCancelCommand, registerStopCommand } from './telegram/input-arbiter.js';
 import { registerCuration } from './telegram/curate/index.js';
 import { DcaFlusher, registerDcaWindowCommand } from './telegram/dca-flush.js';
@@ -603,7 +605,8 @@ async function main(): Promise<void> {
         pauseSchedules: async (userId: number) => void (await repo.pauseUserSchedules(userId)),
         // CHANGING the wallet (new key imported/generated) HALTS the schedules (Phase 15) — explicit
         // resume required, because the money would otherwise move from a different wallet silently.
-        onWalletChanged: (userId: number) => repo.haltUserSchedules(userId, 'wallet changed'),
+        // Routes through haltForWalletChange so the settings audit records the wallet change too.
+        onWalletChanged: (userId: number) => haltForWalletChange(repo, userId),
         arbiter: inputArbiter,
       });
 
@@ -643,6 +646,32 @@ async function main(): Promise<void> {
           }
         }
       });
+
+      // Phase 16 (6): the per-user daily digest DM. It reads each member's own 24h and DMs a summary
+      // once a day (only on an active day or an open halt). Wallet balance uses the same pubkey the
+      // executor signs from — no unlock needed, a balance is public.
+      if (cfg.AUTOTRADER_DIGEST) {
+        const digest = new DigestScheduler({
+          repo,
+          pubkeyOf: (u) => keystore.pubkeyOf(u),
+          getBalance: (pk) => rpc.getBalance(pk),
+          send: async (userId, text) => {
+            try {
+              await telegram.bot.api.sendMessage(userId, text);
+            } catch {
+              log.warn({ userId }, 'digest: could not deliver DM');
+            }
+          },
+          log,
+          hourUtc: cfg.AUTOTRADER_DIGEST_HOUR_UTC,
+        });
+        digest.start();
+        shutdown.register('digest', () => {
+          digest.stop();
+          return Promise.resolve();
+        });
+        log.info({ hourUtc: cfg.AUTOTRADER_DIGEST_HOUR_UTC }, 'autotrader: daily digest scheduled');
+      }
 
       log.info('autotrader: Telegram commands registered');
     }

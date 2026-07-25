@@ -350,3 +350,65 @@ describe('Phase 16 hard limits at the panel (UX guard; the executor is the autho
     expect((await applyCaps(repo, A, MINT, '50', '200', ceiling)).ok).toBe(true);
   });
 });
+
+// ===========================================================================================
+// PHASE 16 (6) — the settings audit trail: what / from / to / when, per user
+// ===========================================================================================
+describe('the settings audit trail', () => {
+  it('records an interval change with the OLD and NEW values', async () => {
+    const id = await seed(A, { interval: 15 });
+    await applyInterval(repo, A, id, '30');
+
+    const [row] = await repo.listSettingChanges(A, 10);
+    expect(row).toMatchObject({
+      userId: A, action: 'schedule.interval', scheduleId: id, field: 'interval_minutes',
+      fromValue: '15', toValue: '30',
+    });
+    expect(row!.at).toBeGreaterThan(0); // stamped at write time
+  });
+
+  it('records caps, contract, and a create — the account-wide changes carry no schedule id', async () => {
+    await applyCaps(repo, A, MINT, '50', '200');
+    await applySetContract(repo, A, MINT2);
+
+    const rows = await repo.listSettingChanges(A, 10);
+    const caps = rows.find((r) => r.action === 'caps');
+    const contract = rows.find((r) => r.action === 'contract');
+    expect(caps).toMatchObject({ scheduleId: null, toValue: '$50/$200' });
+    expect(contract).toMatchObject({ scheduleId: null, field: 'mint', toValue: MINT2 });
+  });
+
+  it('records a delete with the old shape and a null to-value', async () => {
+    const id = await seed(A, { interval: 20 });
+    // Clear the create row so we assert on the delete.
+    const before = (await repo.listSettingChanges(A, 50)).length;
+    await dispatchTradeCommand(repo, A, MINT, ['delete', String(id)], 1_000_000);
+
+    const rows = await repo.listSettingChanges(A, 50);
+    expect(rows.length).toBe(before + 1);
+    expect(rows[0]).toMatchObject({ action: 'schedule.delete', scheduleId: id, toValue: null });
+    expect(rows[0]!.fromValue).toMatch(/every 20 min/);
+  });
+
+  it('a REFUSED change records NOTHING — the trail is of changes that happened', async () => {
+    // An interval on a schedule that is not the caller's is refused before any write.
+    const bId = await seed(B);
+    const r = await applyInterval(repo, A, bId, '99');
+    expect(r.ok).toBe(false);
+    expect(await repo.listSettingChanges(A, 10)).toHaveLength(0);
+  });
+
+  it('is user-scoped — one member never sees another’s trail', async () => {
+    await applyCaps(repo, A, MINT, '50', '200');
+    await applyCaps(repo, B, MINT, '10', '30');
+    expect((await repo.listSettingChanges(A, 10)).every((r) => r.userId === A)).toBe(true);
+    expect((await repo.listSettingChanges(B, 10)).every((r) => r.userId === B)).toBe(true);
+  });
+
+  it('a wallet change is audited through haltForWalletChange', async () => {
+    await seed(A);
+    await haltForWalletChange(repo, A);
+    const [row] = await repo.listSettingChanges(A, 10);
+    expect(row).toMatchObject({ action: 'wallet', scheduleId: null });
+  });
+});

@@ -40,6 +40,7 @@ export interface TradePanelRepo extends PanelRepo {
   lastExecutionForSchedule(scheduleId: number): Promise<ExecutionRecord | null>;
   usdSpent24h(userId: number, mint: Mint, sinceMs: number): Promise<number>;
   getCaps(userId: number, mint: Mint): Promise<Caps | null>;
+  listSettingChanges(userId: number, limit: number): Promise<readonly import('../../trade/audit.js').SettingChange[]>;
 }
 
 export interface TradePanelDeps {
@@ -186,11 +187,32 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
     await sendPanel(ctx, userId, r.ok ? `✅ ${r.message}` : `⚠️ ${r.message}`);
   });
 
-  // /history [n] — YOUR last n executions, with signatures. User-scoped; no other user is readable.
+  // /history [n]            — YOUR last n executions, with signatures.
+  // /history settings [n]   — YOUR last n setting changes (the audit trail: what/from/to/when).
+  // User-scoped throughout; no other user's rows are ever readable.
   bot.command('history', async (ctx) => {
     const userId = await gate(ctx);
     if (userId === null) return;
-    const n = Math.min(Math.max(Number((ctx.match ?? '').toString().trim()) || 10, 1), 50);
+    const arg = (ctx.match ?? '').toString().trim();
+    const [head, ...rest] = arg.split(/\s+/);
+
+    if (head === 'settings') {
+      const n = Math.min(Math.max(Number(rest[0]) || 10, 1), 50);
+      const changes = await repo.listSettingChanges(userId, n);
+      if (changes.length === 0) return void ctx.reply('No setting changes recorded yet.');
+      const lines = changes.map((c) => {
+        const when = new Date(c.at).toISOString().replace('T', ' ').slice(0, 16);
+        const target = c.scheduleId != null ? ` #${c.scheduleId}` : '';
+        const move = c.fromValue != null && c.toValue != null ? `: ${c.fromValue} → ${c.toValue}`
+          : c.toValue != null ? `: ${c.toValue}`
+          : c.fromValue != null ? `: was ${c.fromValue}`
+          : '';
+        return `${when}  ${c.action}${target}${move}`;
+      });
+      return void ctx.reply([`Your last ${changes.length} setting changes:`, '', ...lines].join('\n'));
+    }
+
+    const n = Math.min(Math.max(Number(head) || 10, 1), 50);
     const rows = await repo.listExecutionsForUser(userId, n);
     if (rows.length === 0) return void ctx.reply('No executions yet.');
     const lines = rows.map((e) => {

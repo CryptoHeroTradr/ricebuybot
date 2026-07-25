@@ -1846,6 +1846,64 @@ export class SqliteRepo implements Repo {
     return r ? this.getExecution(r.id) : null;
   }
 
+  /** THIS user's executions since `sinceMs` (planned_at >= sinceMs), newest first. The digest window. */
+  async executionsSince(userId: number, sinceMs: number): Promise<readonly ExecutionRecord[]> {
+    return this.#db
+      .prepare<[number, number], {
+        id: number; schedule_id: number; user_id: number; planned_at: number; state: string;
+        signature: string | null; in_raw: string | null; out_raw: string | null;
+        price_usd: number | null; usd_value: number | null; error: string | null;
+      }>('SELECT * FROM executions WHERE user_id = ? AND planned_at >= ? ORDER BY planned_at DESC')
+      .all(userId, sinceMs)
+      .map((r) => ({
+        id: r.id, scheduleId: r.schedule_id, userId: r.user_id, plannedAt: r.planned_at,
+        state: r.state as ExecutionOutcome['state'], signature: r.signature,
+        inRaw: r.in_raw != null ? BigInt(r.in_raw) : null,
+        outRaw: r.out_raw != null ? BigInt(r.out_raw) : null,
+        priceUsd: r.price_usd, usdValue: r.usd_value, error: r.error,
+      }));
+  }
+
+  // --- Settings audit trail (Phase 16 (6)) ---
+  //
+  // Append-only. The `at` is stamped HERE, at write time, so a caller can never pre-date an audit
+  // row — the trail records when the bot recorded the change, which is the only time it can vouch for.
+
+  async recordSettingChange(entry: import('../trade/audit.js').SettingChangeInput): Promise<void> {
+    this.#db
+      .prepare(
+        `INSERT INTO autotrader_settings_audit (user_id, at, action, schedule_id, field, from_value, to_value)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        entry.userId,
+        Date.now(),
+        entry.action,
+        entry.scheduleId,
+        entry.field,
+        entry.fromValue,
+        entry.toValue,
+      );
+  }
+
+  async listSettingChanges(userId: number, limit: number): Promise<readonly import('../trade/audit.js').SettingChange[]> {
+    return this.#db
+      .prepare<[number, number], SettingAuditRow>(
+        'SELECT * FROM autotrader_settings_audit WHERE user_id = ? ORDER BY at DESC, id DESC LIMIT ?',
+      )
+      .all(userId, limit)
+      .map(hydrateSettingChange);
+  }
+
+  async listSettingChangesSince(userId: number, sinceMs: number): Promise<readonly import('../trade/audit.js').SettingChange[]> {
+    return this.#db
+      .prepare<[number, number], SettingAuditRow>(
+        'SELECT * FROM autotrader_settings_audit WHERE user_id = ? AND at >= ? ORDER BY at DESC, id DESC',
+      )
+      .all(userId, sinceMs)
+      .map(hydrateSettingChange);
+  }
+
   /** The user's configured contract mint, or null if never set (the panel defaults to DEFAULT_MINT). */
   async getContract(userId: number): Promise<Mint | null> {
     const r = this.#db
@@ -1917,6 +1975,17 @@ export class SqliteRepo implements Repo {
     return this.#db.prepare('UPDATE chat_tokens SET dca_window_minutes = ?').run(minutes).changes;
   }
 
+  // --- Generic meta kv (also home to #rebuildOnce markers) ---
+
+  async getMeta(key: string): Promise<string | null> {
+    const row = this.#db.prepare<[string], { value: string }>('SELECT value FROM meta WHERE key = ?').get(key);
+    return row?.value ?? null;
+  }
+
+  async setMeta(key: string, value: string): Promise<void> {
+    this.#db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run(key, value);
+  }
+
   // --- Cursors ---
 
   async getCursor(mint: Mint): Promise<number | null> {
@@ -1935,4 +2004,23 @@ export class SqliteRepo implements Repo {
       )
       .run(mint, slot);
   }
+}
+
+/** The `autotrader_settings_audit` row shape, and its hydration into the domain type. */
+interface SettingAuditRow {
+  id: number;
+  user_id: number;
+  at: number;
+  action: string;
+  schedule_id: number | null;
+  field: string | null;
+  from_value: string | null;
+  to_value: string | null;
+}
+
+function hydrateSettingChange(r: SettingAuditRow): import('../trade/audit.js').SettingChange {
+  return {
+    id: r.id, userId: r.user_id, at: r.at, action: r.action,
+    scheduleId: r.schedule_id, field: r.field, fromValue: r.from_value, toValue: r.to_value,
+  };
 }

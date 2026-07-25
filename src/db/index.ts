@@ -236,6 +236,10 @@ export interface Repo {
   /** Cards actually delivered since UTC midnight. /health, and the optional daily cap. */
   deliveredToday(): Promise<number>;
 
+  // --- Generic meta kv ---
+  getMeta(key: string): Promise<string | null>;
+  setMeta(key: string, value: string): Promise<void>;
+
   // --- Cursors ---
   getCursor(mint: Mint): Promise<number | null>;
   setCursor(mint: Mint, slot: number): Promise<void>;
@@ -251,6 +255,16 @@ export interface Repo {
   /** OWNER-ONLY (/dcawindow). Set the aggregate window on EVERY chat_token — the owner's program is
    *  global, not per-group. Returns how many rows changed. */
   setDcaWindowMinutes(minutes: number): Promise<number>;
+
+  // --- Phase 16 (6): the settings audit trail + the digest window ---
+  /** Append a "what/from/to/when" record. `at` is stamped at write time inside the repo. */
+  recordSettingChange(entry: import('../trade/audit.js').SettingChangeInput): Promise<void>;
+  /** THIS user's setting changes, newest first. */
+  listSettingChanges(userId: number, limit: number): Promise<readonly import('../trade/audit.js').SettingChange[]>;
+  /** THIS user's setting changes since `sinceMs`. The daily-digest window. */
+  listSettingChangesSince(userId: number, sinceMs: number): Promise<readonly import('../trade/audit.js').SettingChange[]>;
+  /** THIS user's executions since `sinceMs`, newest first. The daily-digest window. */
+  executionsSince(userId: number, sinceMs: number): Promise<readonly import('../trade/scheduler.js').ExecutionRecord[]>;
 }
 
 /**

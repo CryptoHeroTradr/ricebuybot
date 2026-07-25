@@ -180,6 +180,12 @@ const EnvSchema = z
 
     /** Phase 16: the wallet whose DCA line renders as "Creator Fee" instead of an address. Optional. */
     CREATOR_FEE_WALLET: z.string().regex(BASE58, 'must be a base58 address').optional(),
+
+    /** Phase 16 (6): the per-user daily digest DM. On by default (it only sends on an active day or a
+     *  halt, so it is not noisy). Requires AUTOTRADER + a live bot (not DRY_RUN). */
+    AUTOTRADER_DIGEST: boolVar(true),
+    /** UTC hour (0–23) the daily digest is sent at. Default just after midnight UTC. */
+    AUTOTRADER_DIGEST_HOUR_UTC: z.coerce.number().int().min(0).max(23).default(0),
   })
   .superRefine((env, ctx) => {
     // REFUSE HEADLESS LIVE TRADING. On an UNKNOWN swap the executor halts the schedule and needs a
