@@ -65,6 +65,17 @@ const EnvSchema = z
     /** Shared secret Helius sends in the Authorization header. Required for webhook mode. */
     WEBHOOK_SECRET: z.string().min(16, 'must be at least 16 chars').optional(),
 
+    /**
+     * Shared secret that gates the READ-ONLY site bridge (/site/*) — the website's server sends it
+     * in the x-site-bridge-secret header; the bot compares it constant-time. Optional: the bridge
+     * is mounted only when this is set (and AUTOTRADER is on). Lives in the bot .env (0600), never
+     * committed, and is in the log scrubber so a header carrying it can't reach a log line.
+     */
+    SITE_BRIDGE_SECRET: z.string().min(16, 'must be at least 16 chars').optional(),
+
+    /** Optional site URL shown in the /linksite DM (cosmetic). */
+    SITE_URL: z.string().url('must be a URL').optional(),
+
     /** What a stablecoin quote is worth in USD. A depeg is not ours to paper over. */
     STABLE_USD: z.coerce.number({ message: 'must be a number' }).positive('must be > 0').default(1.0),
     /** Value whale holdings on the post-trade balance (default) or the pre-trade one. */

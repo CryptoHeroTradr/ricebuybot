@@ -1672,6 +1672,38 @@ export class SqliteRepo implements Repo {
     return row?.total ?? 0;
   }
 
+  // ── Site bridge (migration 018): the (telegram_user <-> wallet) identity link ────────────────
+
+  /**
+   * Write the identity link. One-to-one, newest-proof-wins: the wallet is detached from any prior
+   * owner, then the user's row is upserted — so a wallet is never readable under two users and a
+   * re-link REPLACES rather than accumulates. This is the ONLY write the bridge performs; it never
+   * touches a schedule.
+   */
+  async linkSite(userId: number, wallet: string): Promise<void> {
+    const at = Date.now();
+    this.#db.transaction(() => {
+      this.#db.prepare('DELETE FROM site_links WHERE wallet_pubkey = ?').run(wallet);
+      this.#db
+        .prepare(
+          `INSERT INTO site_links (telegram_user_id, wallet_pubkey, created_at) VALUES (?, ?, ?)
+             ON CONFLICT (telegram_user_id)
+             DO UPDATE SET wallet_pubkey = excluded.wallet_pubkey, created_at = excluded.created_at`,
+        )
+        .run(userId, wallet, at);
+    })();
+  }
+
+  /** The Telegram user linked to a wallet, or null. The read endpoint's only lookup. */
+  async userForWallet(wallet: string): Promise<number | null> {
+    const row = this.#db
+      .prepare<[string], { telegram_user_id: number }>(
+        'SELECT telegram_user_id FROM site_links WHERE wallet_pubkey = ?',
+      )
+      .get(wallet);
+    return row?.telegram_user_id ?? null;
+  }
+
   async advanceSchedule(id: number, nextRunAt: number, lastRunAt: number | null): Promise<void> {
     this.#db
       .prepare('UPDATE schedules SET next_run_at = ?, last_run_at = ?, updated_at = ? WHERE id = ?')

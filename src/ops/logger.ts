@@ -34,6 +34,10 @@ const SENSITIVE_KEYS = [
   'HELIUS_API_KEY',
   'HELIUS_RPC_URL',
   'HELIUS_WS_URL',
+  // Site bridge shared secret — by env name AND by the header it rides in, so a logged
+  // request/headers object can never carry it into a log line.
+  'SITE_BRIDGE_SECRET',
+  'x-site-bridge-secret',
   // Phase 12 (INVARIANT 15). A signing key must not reach a log line by ANY name.
   'passphrase',
   'passphrase_hash',
@@ -44,7 +48,7 @@ const SENSITIVE_KEYS = [
   'OWNER_KEYSTORE_PASSPHRASE',
 ];
 
-const REDACT_PATHS = SENSITIVE_KEYS.flatMap((k) => [k, `*.${k}`, `*.*.${k}`]);
+export const REDACT_PATHS = SENSITIVE_KEYS.flatMap((k) => [k, `*.${k}`, `*.*.${k}`]);
 
 const SECRET_QUERY_PARAMS = new Set(['api-key', 'apikey', 'api_key', 'key', 'token', 'access_token']);
 

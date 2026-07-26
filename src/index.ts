@@ -4,6 +4,10 @@ import { HeliusWebhookIngestor, HeliusWsIngestor, type Ingestor } from './ingest
 import { HeliusRpc, Pricer, SolUsdFeed, TokenMetaCache } from './pricing/index.js';
 import { Backfiller, BinanceHistoricalSolUsd, HeliusHistory, makeSwapApplier } from './positions/index.js';
 import { InFlight, Shutdown, createLogger, scrub, startHealthServer, type Logger } from './ops/index.js';
+import type { RouteHandler } from './ops/health.js';
+import { LinkCodeStore, NonceStore } from './site-bridge/store.js';
+import { createSiteBridgeRoute } from './site-bridge/routes.js';
+import { registerLinkSiteCommand } from './site-bridge/command.js';
 import { FsMediaPool, HttpManifestSource, LocalFsSource } from './media/index.js';
 import { DeliveryQueue, DryRunSender, TelegramSender, fanOut, registerCommands, type Sender } from './telegram/index.js';
 import { Keystore } from './trade/keystore.js';
@@ -152,8 +156,19 @@ async function main(): Promise<void> {
 
   // The webhook adapter mounts itself on the health port rather than opening a
   // second listener. Bound to 127.0.0.1 — put a reverse proxy in front of it.
-  const routes =
+  const routes: RouteHandler[] =
     ingestor instanceof HeliusWebhookIngestor ? [ingestor.handle.bind(ingestor)] : [];
+
+  // Site bridge (READ-ONLY): mounted on the SAME :3012 handler, only when a secret is set and the
+  // autotrader is on. The link codes are shared with the /linksite command registered below.
+  const linkCodes = new LinkCodeStore();
+  const readNonces = new NonceStore();
+  if (cfg.AUTOTRADER && cfg.SITE_BRIDGE_SECRET) {
+    routes.push(
+      createSiteBridgeRoute({ repo, codes: linkCodes, nonces: readNonces, secret: cfg.SITE_BRIDGE_SECRET, log }),
+    );
+    log.info({}, 'site bridge (read-only) mounted on the health port');
+  }
 
   // --- delivery ----------------------------------------------------------------
   //
@@ -638,6 +653,18 @@ async function main(): Promise<void> {
         log,
         arbiter: inputArbiter,
       });
+
+      // /linksite — mints the one-time code for the read-only site bridge. Members only; SENDS
+      // only (no DM awaiting-input, so it can't collide with /wallet import). Shares linkCodes
+      // with the /site/link route mounted above.
+      if (cfg.SITE_BRIDGE_SECRET) {
+        registerLinkSiteCommand(telegram.bot, {
+          repo,
+          codes: linkCodes,
+          log,
+          ...(cfg.SITE_URL !== undefined ? { siteUrl: cfg.SITE_URL } : {}),
+        });
+      }
 
       // Tell everyone whose wallet a restart just locked. Best-effort and non-fatal.
       void bootNotices(repo, keystore, atEnvUnlocked).then(async (notices) => {
