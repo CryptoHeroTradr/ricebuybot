@@ -40,12 +40,21 @@ interface ExecRowLite {
   error: string | null;
 }
 
+interface CapsLite {
+  max_per_exec_usd: number;
+  max_per_day_usd: number;
+  max_lifetime_usd: number | null;
+}
+
 export interface ScheduleView {
   readonly schedule: ScheduleRowLite;
   readonly executions: readonly ExecRowLite[];
+  readonly caps: CapsLite | null;
+  /** All-time confirmed+UNKNOWN spend for this (user, mint) — the lifetime denominator. */
+  readonly lifetimeSpentUsd: number;
 }
 
-/** Gather schedules (optionally for one user) with their most recent executions. */
+/** Gather schedules (optionally for one user) with their most recent executions + caps. */
 export function collectSchedules(repo: SqliteRepo, userId?: number, execLimit = 5): ScheduleView[] {
   const schedules = userId === undefined
     ? repo.raw.prepare<[], ScheduleRowLite>('SELECT * FROM schedules ORDER BY id').all()
@@ -55,8 +64,21 @@ export function collectSchedules(repo: SqliteRepo, userId?: number, execLimit = 
     `SELECT id, planned_at, state, usd_value, signature, error
        FROM executions WHERE schedule_id = ? ORDER BY planned_at DESC LIMIT ?`,
   );
+  const capsStmt = repo.raw.prepare<[number, string], CapsLite>(
+    'SELECT max_per_exec_usd, max_per_day_usd, max_lifetime_usd FROM caps WHERE user_id = ? AND mint = ?',
+  );
+  const lifeStmt = repo.raw.prepare<[number, string], { total: number | null }>(
+    `SELECT COALESCE(SUM(e.usd_value), 0) AS total
+       FROM executions e JOIN schedules s ON s.id = e.schedule_id
+      WHERE e.user_id = ? AND s.mint = ? AND e.state IN ('confirmed', 'UNKNOWN')`,
+  );
 
-  return schedules.map((schedule) => ({ schedule, executions: recent.all(schedule.id, execLimit) }));
+  return schedules.map((schedule) => ({
+    schedule,
+    executions: recent.all(schedule.id, execLimit),
+    caps: capsStmt.get(schedule.user_id, schedule.mint) ?? null,
+    lifetimeSpentUsd: lifeStmt.get(schedule.user_id, schedule.mint)?.total ?? 0,
+  }));
 }
 
 function ts(ms: number | null): string {
@@ -66,7 +88,7 @@ function ts(ms: number | null): string {
 function render(views: readonly ScheduleView[]): string {
   if (views.length === 0) return 'no schedules.\n';
   const lines: string[] = [];
-  for (const { schedule: s, executions } of views) {
+  for (const { schedule: s, executions, caps, lifetimeSpentUsd } of views) {
     lines.push(
       `#${s.id}  user ${s.user_id}  ${s.side} ${s.amount_raw} ${s.amount_kind}  every ${s.interval_minutes}m  ` +
         `[${s.state}${s.halt_reason ? `: ${s.halt_reason}` : ''}]`,
@@ -74,6 +96,14 @@ function render(views: readonly ScheduleView[]): string {
     lines.push(`     mint         ${s.mint}`);
     lines.push(`     next_run_at  ${ts(s.next_run_at)}`);
     lines.push(`     last_run_at  ${ts(s.last_run_at)}`);
+    if (caps) {
+      const life = caps.max_lifetime_usd == null
+        ? 'lifetime none'
+        : `lifetime $${lifetimeSpentUsd} of $${caps.max_lifetime_usd}`;
+      lines.push(`     caps         $${caps.max_per_exec_usd}/exec  $${caps.max_per_day_usd}/day  ·  ${life}`);
+    } else {
+      lines.push('     caps         (none set)');
+    }
     if (executions.length === 0) {
       lines.push('     executions   (none yet)');
     } else {

@@ -39,6 +39,7 @@ const EXPIRED = 'Panel expired — send /trade again.';
 export interface TradePanelRepo extends PanelRepo {
   lastExecutionForSchedule(scheduleId: number): Promise<ExecutionRecord | null>;
   usdSpent24h(userId: number, mint: Mint, sinceMs: number): Promise<number>;
+  usdSpentLifetime(userId: number, mint: Mint): Promise<number>;
   getCaps(userId: number, mint: Mint): Promise<Caps | null>;
   listSettingChanges(userId: number, limit: number): Promise<readonly import('../../trade/audit.js').SettingChange[]>;
 }
@@ -53,6 +54,10 @@ export interface TradePanelDeps {
   readonly defaultMint: string;
   /** Env daily-cap ceiling — /trade caps refuses above it (the executor enforces it too). */
   readonly maxPerDayUsdCeiling?: number;
+  /** Env lifetime-cap ceiling — /trade caps refuses a lifetime budget above it. */
+  readonly maxLifetimeUsdCeiling?: number;
+  /** Live SOL/USD, to refuse a below-$1 buy at creation time. Null when the feed is down. */
+  readonly solUsd?: () => number | null;
   readonly log: Logger;
   /** THE shared DM input arbiter — one awaiting state per user across all handlers. */
   readonly arbiter: InputArbiter;
@@ -93,12 +98,13 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
     const symbol = m?.symbol ? `$${m.symbol}` : contract.slice(0, 4);
     const decimals = m?.decimals ?? 6;
     const pubkey = keystore.pubkeyOf(userId);
-    const [solBalance, tokenMap, schedules, caps, spent] = await Promise.all([
+    const [solBalance, tokenMap, schedules, caps, spent, spentLifetime] = await Promise.all([
       pubkey ? rpc.getBalance(pubkey).catch(() => null) : Promise.resolve(null),
       pubkey ? rpc.getTokenBalances(pubkey, [contract]).catch(() => new Map<string, bigint>()) : Promise.resolve(new Map<string, bigint>()),
       repo.listSchedules(userId),
       repo.getCaps(userId, contract),
       repo.usdSpent24h(userId, contract, now() - DAY_MS),
+      repo.usdSpentLifetime(userId, contract),
     ]);
     const views: ScheduleView[] = await Promise.all(
       schedules.map(async (s: Schedule) => ({ schedule: s, last: await repo.lastExecutionForSchedule(s.id) })),
@@ -114,7 +120,10 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
       tokenDecimals: decimals,
       schedules: views,
       spentTodayUsd: spent,
-      caps: caps ? { perExecUsd: caps.maxPerExecUsd, perDayUsd: caps.maxPerDayUsd } : null,
+      spentLifetimeUsd: spentLifetime,
+      caps: caps
+        ? { perExecUsd: caps.maxPerExecUsd, perDayUsd: caps.maxPerDayUsd, lifetimeUsd: caps.maxLifetimeUsd }
+        : null,
       now: now(),
     };
     return renderPanel(data, token);
@@ -174,7 +183,7 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
     const tokens = args.split(/\s+/);
     // stop and the id-taking subcommands all funnel through the shared dispatcher, THEN re-render.
     const contract = await contractOf(userId);
-    const r = await dispatchTradeCommand(repo, userId, contract, tokens, now(), deps.maxPerDayUsdCeiling ?? Infinity);
+    const r = await dispatchTradeCommand(repo, userId, contract, tokens, now(), deps.maxPerDayUsdCeiling ?? Infinity, deps.maxLifetimeUsdCeiling ?? Infinity, deps.solUsd?.() ?? null);
     await sendPanel(ctx, userId, r.ok ? `✅ ${r.message}` : `⚠️ ${r.message}`);
   });
 
@@ -281,7 +290,7 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
 
     const text = ctx.message.text.trim();
     const contract = await contractOf(userId);
-    const r = await completePrompt(repo, userId, awaiting.verb, text, contract, now(), deps.maxPerDayUsdCeiling ?? Infinity);
+    const r = await completePrompt(repo, userId, awaiting.verb, text, contract, now(), deps.maxPerDayUsdCeiling ?? Infinity, deps.maxLifetimeUsdCeiling ?? Infinity, deps.solUsd?.() ?? null);
 
     const chatId = ctx.chat?.id;
     if (chatId !== undefined) {
@@ -307,7 +316,8 @@ const PROMPTS: Partial<Record<PanelVerb, string>> = {
  * validate-before-write ownership check still happens inside every apply*.
  */
 export async function completePrompt(
-  repo: PanelRepo, userId: number, verb: PanelVerb, text: string, contract: Mint, now: number, maxPerDayUsdCeiling = Infinity,
+  repo: PanelRepo, userId: number, verb: PanelVerb, text: string, contract: Mint, now: number,
+  maxPerDayUsdCeiling = Infinity, maxLifetimeUsdCeiling = Infinity, solUsd: number | null = null,
 ): Promise<ApplyResult> {
   const parts = text.split(/\s+/).filter(Boolean);
   const schedules = await repo.listSchedules(userId);
@@ -321,7 +331,7 @@ export async function completePrompt(
 
   switch (verb) {
     case 'new': {
-      return applyNew(repo, userId, contract, parts[0] ?? '', parts[1] ?? '', parts[2] ?? '', now);
+      return applyNew(repo, userId, contract, parts[0] ?? '', parts[1] ?? '', parts[2] ?? '', now, solUsd);
     }
     case 'amount': {
       const { id, value } = idAndValue();
@@ -344,7 +354,7 @@ export async function completePrompt(
       return applyResume(repo, userId, Number(parts[0] ?? soleId ?? NaN));
     }
     case 'caps': {
-      return applyCaps(repo, userId, contract, parts[0] ?? '', parts[1] ?? '', maxPerDayUsdCeiling);
+      return applyCaps(repo, userId, contract, parts[0] ?? '', parts[1] ?? '', parts[2] ?? '', maxPerDayUsdCeiling, maxLifetimeUsdCeiling);
     }
     case 'contract': {
       return applySetContract(repo, userId, parts[0] ?? '');

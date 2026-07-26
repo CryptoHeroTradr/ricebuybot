@@ -466,6 +466,7 @@ async function main(): Promise<void> {
         priorityFeeLamports: cfg.PRIORITY_FEE_LAMPORTS,
         confirmTimeoutMs: cfg.CONFIRM_TIMEOUT_MS,
         maxPerDayUsdCeiling: cfg.MAX_PER_DAY_USD_CEILING,
+        maxLifetimeUsdCeiling: cfg.MAX_LIFETIME_USD_CEILING,
       },
     });
 
@@ -632,6 +633,8 @@ async function main(): Promise<void> {
         tradeLive: cfg.TRADE_LIVE,
         defaultMint: cfg.DEFAULT_MINT,
         maxPerDayUsdCeiling: cfg.MAX_PER_DAY_USD_CEILING,
+        maxLifetimeUsdCeiling: cfg.MAX_LIFETIME_USD_CEILING,
+        solUsd: () => feed.solUsd(),
         log,
         arbiter: inputArbiter,
       });

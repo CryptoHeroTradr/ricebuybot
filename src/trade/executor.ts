@@ -45,6 +45,12 @@ export interface ExecutorConfig {
    * Comes from env (MAX_PER_DAY_USD_CEILING), not the DB, precisely so the DB is not the authority.
    */
   readonly maxPerDayUsdCeiling: number;
+  /**
+   * ABSOLUTE lifetime (all-time) USD ceiling — the same idea as the daily ceiling, for the
+   * lifetime cap. A caps row's max_lifetime_usd is CLAMPED to this at check time, so a bad DB
+   * write cannot raise the real lifetime budget. From env (MAX_LIFETIME_USD_CEILING).
+   */
+  readonly maxLifetimeUsdCeiling: number;
 }
 
 /**
@@ -53,6 +59,7 @@ export interface ExecutorConfig {
  */
 export const HARD_MAX_SLIPPAGE_BPS = 1000; // 10%. Above that you are not trading, you are donating.
 export const HARD_MIN_INTERVAL_MINUTES = 1; // a sub-minute DCA is a bot fighting its own confirmations.
+export const HARD_MIN_BUY_USD = 1; // below $1 a buy is dust — skipped-with-reason, never executed.
 
 export const DEFAULT_EXECUTOR_CONFIG: ExecutorConfig = {
   maxPriceImpactPct: 0.03,
@@ -63,6 +70,7 @@ export const DEFAULT_EXECUTOR_CONFIG: ExecutorConfig = {
   resolvePollMs: 30_000,
   droppedAfterMs: 150_000,
   maxPerDayUsdCeiling: 1_000, // conservative default; production sets it from env
+  maxLifetimeUsdCeiling: 10_000, // conservative default; production sets it from env
 };
 
 // --- injected dependencies (all mockable; the real wiring lives in index.ts) -----------------
@@ -129,6 +137,8 @@ export interface ExecutorRepo {
   getSchedule(id: number): Promise<Schedule | null>;
   getCaps(userId: number, mint: Mint): Promise<Caps | null>;
   usdSpent24h(userId: number, mint: Mint, sinceMs: number): Promise<number>;
+  /** All-time confirmed+UNKNOWN spend for (user, mint) — the lifetime-cap denominator. */
+  usdSpentLifetime(userId: number, mint: Mint): Promise<number>;
   haltSchedule(id: number, reason: string, at: number): Promise<void>;
   unhaltSchedule(id: number): Promise<void>;
   haltAllActiveSchedules(reason: string, at: number): Promise<number>;
@@ -397,6 +407,15 @@ export class Executor {
     // that set maxPerDayUsd to $1M cannot raise the real limit above what env allows.
     const dayCap = Math.min(caps.maxPerDayUsd, this.#cfg.maxPerDayUsdCeiling);
     if (spent + usd > dayCap) return `24h cap: $${(spent + usd).toFixed(2)} > $${dayCap.toFixed(2)}`;
+    // Lifetime cap re-check, env-clamped exactly like the daily cap: null = no cap, otherwise the
+    // effective budget is min(DB value, env ceiling) so a bad DB write cannot raise it.
+    if (caps.maxLifetimeUsd != null) {
+      const lifeSpent = await this.#d.repo.usdSpentLifetime(schedule.userId, schedule.mint);
+      const lifeCap = Math.min(caps.maxLifetimeUsd, this.#cfg.maxLifetimeUsdCeiling);
+      if (lifeSpent + usd > lifeCap) {
+        return `lifetime budget of $${lifeCap.toFixed(2)} reached ($${(lifeSpent + usd).toFixed(2)})`;
+      }
+    }
     return null;
   }
 

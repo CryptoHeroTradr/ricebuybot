@@ -31,7 +31,9 @@ export interface PanelData {
   readonly tokenDecimals: number;
   readonly schedules: readonly ScheduleView[];
   readonly spentTodayUsd: number;
-  readonly caps: { readonly perExecUsd: number; readonly perDayUsd: number } | null;
+  /** All-time confirmed+UNKNOWN spend for this (user, mint), for the lifetime line. */
+  readonly spentLifetimeUsd: number;
+  readonly caps: { readonly perExecUsd: number; readonly perDayUsd: number; readonly lifetimeUsd: number | null } | null;
   /** Now, for "next in …" — passed in, never read from the wall clock. */
   readonly now: number;
 }
@@ -133,6 +135,9 @@ export function renderPanel(data: PanelData, token: string): { text: string; key
     ? `Today  $${num(data.spentTodayUsd)} / $${num(data.caps.perDayUsd)} cap   ·   Per-trade cap $${num(data.caps.perExecUsd)}`
     : `Today  $${num(data.spentTodayUsd)} spent   ·   ⚠️ no caps set — 🛡 Caps`;
   L.push(capLine);
+  if (data.caps?.lifetimeUsd != null) {
+    L.push(`Lifetime  $${num(data.spentLifetimeUsd)} of $${num(data.caps.lifetimeUsd)}`);
+  }
 
   // The button board. Amount and Interval get their own top row (the two settings that change most).
   const keyboard: CallbackButton[][] = [

@@ -45,6 +45,7 @@ export interface ParsedSeed {
   readonly slippageBps: number;
   readonly perExecUsd: number;
   readonly dailyUsd: number;
+  readonly lifetimeUsd: number | null;
   readonly minReserveLamports: bigint;
   readonly firstRunInMinutes: number;
 }
@@ -133,6 +134,14 @@ export function validateSeed(args: Map<string, string>): ParsedSeed {
   if (dailyUsd <= 0) throw new SeedError('--daily-usd must be greater than zero (caps are mandatory)');
   if (dailyUsd < perExecUsd) throw new SeedError(`--daily-usd (${dailyUsd}) is below --per-exec-usd (${perExecUsd}); the daily cap could never be reached`);
 
+  // Optional lifetime (all-time) budget. Omitted -> null = no lifetime cap.
+  let lifetimeUsd: number | null = null;
+  if (args.has('lifetime-usd')) {
+    lifetimeUsd = reqNum(args, 'lifetime-usd');
+    if (lifetimeUsd <= 0) throw new SeedError('--lifetime-usd must be greater than zero (omit it for no lifetime cap)');
+    if (lifetimeUsd < perExecUsd) throw new SeedError(`--lifetime-usd (${lifetimeUsd}) is below --per-exec-usd (${perExecUsd}); it could never fit even one buy`);
+  }
+
   const slippageBps = args.has('slippage-bps') ? reqInt(args, 'slippage-bps') : 100;
   if (slippageBps < 0) throw new SeedError('--slippage-bps must not be negative');
 
@@ -151,7 +160,7 @@ export function validateSeed(args: Map<string, string>): ParsedSeed {
 
   return {
     userId, mint, side, amountRaw, amountKind, intervalMinutes, slippageBps,
-    perExecUsd, dailyUsd, minReserveLamports, firstRunInMinutes,
+    perExecUsd, dailyUsd, lifetimeUsd, minReserveLamports, firstRunInMinutes,
   };
 }
 
@@ -197,6 +206,7 @@ export async function runSeed(
     mint: p.mint,
     maxPerExecUsd: p.perExecUsd,
     maxPerDayUsd: p.dailyUsd,
+    maxLifetimeUsd: p.lifetimeUsd,
     minSolReserveLamports: p.minReserveLamports,
   });
 

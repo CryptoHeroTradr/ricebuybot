@@ -385,6 +385,66 @@ function confirmExecutor(): Executor {
   return async (plan): Promise<ExecutionOutcome> => ({ state: 'confirmed', usdValue: plan.usdValue });
 }
 
+describe('lifetime cap and the $1 minimum buy', () => {
+  // Record a prior settled execution for (USER, MINT), then park its schedule so the tick ignores
+  // it. Its spend STILL counts toward the lifetime sum (which joins on mint, regardless of state).
+  async function priorSpend(usd: number, state: 'confirmed' | 'UNKNOWN'): Promise<void> {
+    const sid = await seed({ firstRunAt: 500_000 });
+    const eid = await repo.claimExecution(sid, USER, 500_000);
+    await repo.settleExecution(eid!, { state, usdValue: usd });
+    await repo.pauseSchedule(sid);
+  }
+
+  const NOW = 1_000_050; // inside the seeded slot's window (firstRunAt 1_000_000, interval 5m)
+  // 1 SOL balance clears the fee reserve so a buy can fire when nothing else stops it.
+  const tickWith = (usd: number | null) =>
+    new Scheduler({ repo, valuer: valuer({ usd, balance: SOL }), execute: confirmExecutor(), log: capturingLog([]), now: () => NOW }).tick();
+
+  it('cumulative spend crossing the lifetime cap HALTS with reason and does not claim', async () => {
+    await priorSpend(90, 'confirmed');
+    const id = await seed();
+    await repo.setCaps({ userId: USER, mint: MINT, maxPerExecUsd: 1000, maxPerDayUsd: 10_000, maxLifetimeUsd: 100 });
+    const before = countExecutions();
+    const outcomes = await tickWith(15); // 90 spent + 15 this = 105 > 100
+    const halt = outcomes.find((o) => o.kind === 'cap-halted');
+    expect(halt).toBeDefined();
+    expect((halt as { reason: string }).reason).toMatch(/lifetime budget/i);
+    expect((await repo.getSchedule(id))!.state).toBe('halted');
+    expect(countExecutions()).toBe(before); // never claimed the slot
+  });
+
+  it('an UNKNOWN execution counts toward the lifetime budget', async () => {
+    await priorSpend(90, 'UNKNOWN'); // NOT confirmed — an UNKNOWN swap may have landed, so it counts
+    const id = await seed();
+    // Daily cap is high, so only the lifetime cap can fire — proving the UNKNOWN spend counted there.
+    await repo.setCaps({ userId: USER, mint: MINT, maxPerExecUsd: 1000, maxPerDayUsd: 1e9, maxLifetimeUsd: 100 });
+    const outcomes = await tickWith(15);
+    const halt = outcomes.find((o) => o.kind === 'cap-halted');
+    expect(halt).toBeDefined();
+    expect((halt as { reason: string }).reason).toMatch(/lifetime budget/i);
+    expect((await repo.getSchedule(id))!.state).toBe('halted');
+  });
+
+  it('a null lifetime cap is unaffected — a huge cumulative spend never lifetime-halts', async () => {
+    await priorSpend(10_000, 'confirmed');
+    await seed();
+    await repo.setCaps({ userId: USER, mint: MINT, maxPerExecUsd: 1000, maxPerDayUsd: 1e9 }); // no lifetime cap
+    const outcomes = await tickWith(15);
+    expect(outcomes.some((o) => o.kind === 'cap-halted')).toBe(false);
+    expect(outcomes.some((o) => o.kind === 'fired')).toBe(true);
+  });
+
+  it('a buy resolving below $1 SKIPS (min-buy) — not an error, not a halt, no claim', async () => {
+    const id = await seed({ amountKind: 'percent_of_balance', amountRaw: 5000n });
+    await repo.setCaps({ userId: USER, mint: MINT, maxPerExecUsd: 1000, maxPerDayUsd: 10_000 });
+    // The real valuer returns 0 for a percent buy; the harness valuer mimics that with usd: 0.
+    const outcomes = await tickWith(0);
+    expect(outcomes.find((o) => o.kind === 'min-buy-skipped')).toBeDefined();
+    expect((await repo.getSchedule(id))!.state).toBe('active'); // skipped, stays active
+    expect(countExecutions()).toBe(0); // never claimed
+  });
+});
+
 // Keep the imported Schedule/SlotOutcome types referenced for readers of this file.
 export type _Schedule = Schedule;
 export type _SlotOutcome = SlotOutcome;

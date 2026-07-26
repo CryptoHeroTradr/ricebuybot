@@ -224,6 +224,7 @@ interface CapsRow {
   mint: string;
   max_per_exec_usd: number;
   max_per_day_usd: number;
+  max_lifetime_usd: number | null;
   min_sol_reserve_lamports: string;
 }
 
@@ -233,6 +234,8 @@ function hydrateCaps(r: CapsRow): Caps {
     mint: r.mint as Mint,
     maxPerExecUsd: r.max_per_exec_usd,
     maxPerDayUsd: r.max_per_day_usd,
+    // NULL column -> null: no lifetime cap (unchanged behaviour for existing rows).
+    maxLifetimeUsd: r.max_lifetime_usd ?? null,
     minSolReserveLamports: BigInt(r.min_sol_reserve_lamports),
   };
 }
@@ -1599,15 +1602,18 @@ export class SqliteRepo implements Repo {
     mint: Mint;
     maxPerExecUsd: number;
     maxPerDayUsd: number;
+    /** null (or omitted) = no lifetime cap. */
+    maxLifetimeUsd?: number | null;
     minSolReserveLamports?: bigint;
   }): Promise<void> {
     this.#db
       .prepare(
-        `INSERT INTO caps (user_id, mint, max_per_exec_usd, max_per_day_usd, min_sol_reserve_lamports)
-         VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO caps (user_id, mint, max_per_exec_usd, max_per_day_usd, max_lifetime_usd, min_sol_reserve_lamports)
+         VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT (user_id, mint) DO UPDATE SET
            max_per_exec_usd = excluded.max_per_exec_usd,
            max_per_day_usd = excluded.max_per_day_usd,
+           max_lifetime_usd = excluded.max_lifetime_usd,
            min_sol_reserve_lamports = excluded.min_sol_reserve_lamports`,
       )
       .run(
@@ -1615,6 +1621,7 @@ export class SqliteRepo implements Repo {
         input.mint,
         input.maxPerExecUsd,
         input.maxPerDayUsd,
+        input.maxLifetimeUsd ?? null,
         (input.minSolReserveLamports ?? 20_000_000n).toString(),
       );
   }
@@ -1643,6 +1650,25 @@ export class SqliteRepo implements Repo {
             AND e.state IN ('confirmed', 'UNKNOWN')`,
       )
       .get(userId, mint, sinceMs);
+    return row?.total ?? 0;
+  }
+
+  /**
+   * ALL-TIME spend for ONE user on ONE mint — the lifetime-cap denominator. Same rule as
+   * usdSpent24h (CONFIRMED and UNKNOWN both count, because an UNKNOWN swap may have landed and
+   * must occupy the budget — INVARIANT 16), just with no time window.
+   */
+  async usdSpentLifetime(userId: number, mint: Mint): Promise<number> {
+    const row = this.#db
+      .prepare<[number, string], { total: number | null }>(
+        `SELECT COALESCE(SUM(e.usd_value), 0) AS total
+           FROM executions e
+           JOIN schedules  s ON s.id = e.schedule_id
+          WHERE e.user_id = ?
+            AND s.mint = ?
+            AND e.state IN ('confirmed', 'UNKNOWN')`,
+      )
+      .get(userId, mint);
     return row?.total ?? 0;
   }
 

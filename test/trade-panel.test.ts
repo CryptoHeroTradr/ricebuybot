@@ -342,12 +342,26 @@ describe('Phase 16 hard limits at the panel (UX guard; the executor is the autho
 
   it('refuses a daily cap above the env ceiling', async () => {
     const ceiling = 200;
-    const over = await applyCaps(repo, A, MINT, '50', '500', ceiling);
+    const over = await applyCaps(repo, A, MINT, '50', '500', '', ceiling);
     expect(over.ok).toBe(false);
     expect(over.message).toMatch(/ceiling/);
     expect(await repo.getCaps(A, MINT)).toBeNull(); // nothing written
     // At or below the ceiling is fine.
-    expect((await applyCaps(repo, A, MINT, '50', '200', ceiling)).ok).toBe(true);
+    expect((await applyCaps(repo, A, MINT, '50', '200', '', ceiling)).ok).toBe(true);
+  });
+
+  it('refuses a lifetime cap above the env ceiling, and clears with "none"', async () => {
+    const lifeCeiling = 1000;
+    const over = await applyCaps(repo, A, MINT, '50', '200', '5000', Infinity, lifeCeiling);
+    expect(over.ok).toBe(false);
+    expect(over.message).toMatch(/ceiling/);
+    expect(await repo.getCaps(A, MINT)).toBeNull(); // nothing written
+
+    // At/below the lifetime ceiling stores it; "none" clears it back to null.
+    expect((await applyCaps(repo, A, MINT, '50', '200', '900', Infinity, lifeCeiling)).ok).toBe(true);
+    expect((await repo.getCaps(A, MINT))!.maxLifetimeUsd).toBe(900);
+    expect((await applyCaps(repo, A, MINT, '50', '200', 'none', Infinity, lifeCeiling)).ok).toBe(true);
+    expect((await repo.getCaps(A, MINT))!.maxLifetimeUsd).toBeNull();
   });
 });
 
@@ -374,7 +388,7 @@ describe('the settings audit trail', () => {
     const rows = await repo.listSettingChanges(A, 10);
     const caps = rows.find((r) => r.action === 'caps');
     const contract = rows.find((r) => r.action === 'contract');
-    expect(caps).toMatchObject({ scheduleId: null, toValue: '$50/$200' });
+    expect(caps).toMatchObject({ scheduleId: null, toValue: '$50/$200/none' });
     expect(contract).toMatchObject({ scheduleId: null, field: 'mint', toValue: MINT2 });
   });
 

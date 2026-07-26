@@ -1,6 +1,7 @@
 import type { Mint } from '../../core/types.js';
 import type { AmountKind, Caps, ExecutionRecord, Schedule, Side } from '../../trade/scheduler.js';
 import type { SettingChangeInput } from '../../trade/audit.js';
+import { HARD_MIN_BUY_USD } from '../../trade/executor.js';
 
 /**
  * PHASE 15 — the command layer behind BOTH the typed commands and the buttons. Everything here is:
@@ -35,7 +36,7 @@ export interface PanelRepo {
   resumeUserSchedules(userId: number): Promise<number>;
   haltUserSchedules(userId: number, reason: string): Promise<number>;
   getCaps(userId: number, mint: Mint): Promise<Caps | null>;
-  setCaps(input: { userId: number; mint: Mint; maxPerExecUsd: number; maxPerDayUsd: number; minSolReserveLamports?: bigint }): Promise<void>;
+  setCaps(input: { userId: number; mint: Mint; maxPerExecUsd: number; maxPerDayUsd: number; maxLifetimeUsd?: number | null; minSolReserveLamports?: bigint }): Promise<void>;
   getContract(userId: number): Promise<Mint | null>;
   setContract(userId: number, mint: Mint): Promise<void>;
   listExecutionsForUser(userId: number, limit: number): Promise<readonly ExecutionRecord[]>;
@@ -121,6 +122,7 @@ export function isPlausibleMint(mint: string): boolean {
 
 export async function applyNew(
   repo: PanelRepo, userId: number, contract: Mint, sideRaw: string, amountRaw: string, intervalRaw: string, now: number,
+  solUsd: number | null = null,
 ): Promise<ApplyResult> {
   const side = parseSide(sideRaw);
   if (!side) return err('side must be buy or sell, e.g. /trade new buy 0.05 15');
@@ -128,6 +130,14 @@ export async function applyNew(
   if ('error' in amt) return err(amt.error);
   const iv = parseInterval(intervalRaw);
   if (typeof iv !== 'number') return err(iv.error);
+  // MIN BUY (hard limit): refuse a buy that resolves below $1 at creation, when it can be priced.
+  // A percent buy is not priceable until execution (the scheduler skips it there); solUsd === null
+  // means the feed is down, so don't block creation on a transient outage — the execution-time skip
+  // is the backstop.
+  if (side === 'buy' && amt.amountKind === 'absolute' && solUsd != null) {
+    const usd = (Number(amt.amountRaw) / LAMPORTS_PER_SOL) * solUsd;
+    if (usd < HARD_MIN_BUY_USD) return err(`that buy is about $${usd.toFixed(2)} — below the $${HARD_MIN_BUY_USD} minimum buy. Increase the amount.`);
+  }
   const id = await repo.createSchedule({
     userId, mint: contract, side, amountRaw: amt.amountRaw, amountKind: amt.amountKind,
     intervalMinutes: iv, firstRunAt: now, state: 'active',
@@ -225,7 +235,16 @@ export async function applyResumeAll(repo: PanelRepo, userId: number): Promise<A
   return ok(n === 0 ? 'Nothing to resume.' : `Resumed ${n} schedule(s).`);
 }
 
-export async function applyCaps(repo: PanelRepo, userId: number, contract: Mint, perRaw: string, dayRaw: string, maxPerDayUsdCeiling = Infinity): Promise<ApplyResult> {
+export async function applyCaps(
+  repo: PanelRepo,
+  userId: number,
+  contract: Mint,
+  perRaw: string,
+  dayRaw: string,
+  lifeRaw = '',
+  maxPerDayUsdCeiling = Infinity,
+  maxLifetimeUsdCeiling = Infinity,
+): Promise<ApplyResult> {
   const per = Number(perRaw);
   const day = Number(dayRaw);
   if (!Number.isFinite(per) || per <= 0) return err('per-trade cap must be a positive dollar amount, e.g. 50');
@@ -234,14 +253,33 @@ export async function applyCaps(repo: PanelRepo, userId: number, contract: Mint,
   // The env ceiling is the authority (the executor enforces it against the DB); refuse here too so
   // the user is told, rather than silently having a too-high cap clamped at execution.
   if (day > maxPerDayUsdCeiling) return err(`daily cap ($${day}) is above the $${maxPerDayUsdCeiling} platform ceiling — that is the most the autotrader will spend in a day.`);
+
   const prior = await repo.getCaps(userId, contract);
-  await repo.setCaps({ userId, mint: contract, maxPerExecUsd: per, maxPerDayUsd: day });
+
+  // Lifetime cap (optional): omitted keeps the current value; "none"/"off"/"0" clears it; a positive
+  // number sets it, refused above the env ceiling — the SAME reasoning as the daily ceiling.
+  let maxLifetimeUsd: number | null;
+  const life = lifeRaw.trim();
+  if (life === '') {
+    maxLifetimeUsd = prior?.maxLifetimeUsd ?? null;
+  } else if (/^(none|off|0)$/i.test(life)) {
+    maxLifetimeUsd = null;
+  } else {
+    const lifeN = Number(life);
+    if (!Number.isFinite(lifeN) || lifeN <= 0) return err('lifetime cap must be a positive dollar amount, or "none" to clear it');
+    if (lifeN < per) return err(`lifetime cap ($${lifeN}) is below the per-trade cap ($${per}) — it could never fit even one buy`);
+    if (lifeN > maxLifetimeUsdCeiling) return err(`lifetime cap ($${lifeN}) is above the $${maxLifetimeUsdCeiling} platform ceiling — that is the most the autotrader will ever spend.`);
+    maxLifetimeUsd = lifeN;
+  }
+
+  await repo.setCaps({ userId, mint: contract, maxPerExecUsd: per, maxPerDayUsd: day, maxLifetimeUsd });
+  const lifeStr = (v: number | null): string => (v == null ? 'none' : `$${v}`);
   await audit(repo, {
-    userId, action: 'caps', scheduleId: null, field: 'per/day usd',
-    fromValue: prior ? `$${prior.maxPerExecUsd}/$${prior.maxPerDayUsd}` : null,
-    toValue: `$${per}/$${day}`,
+    userId, action: 'caps', scheduleId: null, field: 'per/day/lifetime usd',
+    fromValue: prior ? `$${prior.maxPerExecUsd}/$${prior.maxPerDayUsd}/${lifeStr(prior.maxLifetimeUsd)}` : null,
+    toValue: `$${per}/$${day}/${lifeStr(maxLifetimeUsd)}`,
   });
-  return ok(`Caps set: $${per} per trade, $${day} per day.`);
+  return ok(`Caps set: $${per} per trade, $${day} per day, lifetime ${lifeStr(maxLifetimeUsd)}.`);
 }
 
 /**
@@ -276,12 +314,13 @@ export async function haltForWalletChange(repo: PanelRepo, userId: number): Prom
  * do something its typed equivalent cannot, and vice versa. `tokens` is the args after `/trade`.
  */
 export async function dispatchTradeCommand(
-  repo: PanelRepo, userId: number, contract: Mint, tokens: readonly string[], now: number, maxPerDayUsdCeiling = Infinity,
+  repo: PanelRepo, userId: number, contract: Mint, tokens: readonly string[], now: number,
+  maxPerDayUsdCeiling = Infinity, maxLifetimeUsdCeiling = Infinity, solUsd: number | null = null,
 ): Promise<ApplyResult> {
   const sub = tokens[0] ?? '';
   const a = (i: number): string => tokens[i] ?? '';
   switch (sub) {
-    case 'new': return applyNew(repo, userId, contract, a(1), a(2), a(3), now);
+    case 'new': return applyNew(repo, userId, contract, a(1), a(2), a(3), now, solUsd);
     case 'amount': return applyAmount(repo, userId, Number(a(1)), a(2));
     case 'interval': return applyInterval(repo, userId, Number(a(1)), a(2));
     case 'slippage': return applySlippage(repo, userId, Number(a(1)), a(2));
@@ -289,8 +328,8 @@ export async function dispatchTradeCommand(
     case 'resume': return applyResume(repo, userId, Number(a(1)));
     case 'delete': return applyDelete(repo, userId, Number(a(1)));
     case 'stop': return applyStopAll(repo, userId);
-    case 'caps': return applyCaps(repo, userId, contract, a(1), a(2), maxPerDayUsdCeiling);
+    case 'caps': return applyCaps(repo, userId, contract, a(1), a(2), a(3), maxPerDayUsdCeiling, maxLifetimeUsdCeiling);
     default:
-      return err('Try: new · amount <id> <amt> · interval <id> <min> · pause <id> · resume <id> · stop · slippage <id> <bps> · caps <per> <day> · delete <id>');
+      return err('Try: new · amount <id> <amt> · interval <id> <min> · pause <id> · resume <id> · stop · slippage <id> <bps> · caps <per> <day> [lifetime] · delete <id>');
   }
 }

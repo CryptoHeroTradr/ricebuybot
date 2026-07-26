@@ -1,5 +1,8 @@
 import type { Mint } from '../core/types.js';
 import type { Logger } from '../ops/logger.js';
+// Value import of a hard-limit constant only. executor.ts imports scheduler with `import type`
+// (erased), so there is no runtime cycle.
+import { HARD_MIN_BUY_USD } from './executor.js';
 
 /**
  * PHASE 13 — the DCA scheduler. It decides WHAT should happen and WHEN, and logs it.
@@ -51,6 +54,8 @@ export interface Caps {
   readonly mint: Mint;
   readonly maxPerExecUsd: number;
   readonly maxPerDayUsd: number;
+  /** All-time budget cap in USD, or null for no lifetime cap (unchanged behaviour). */
+  readonly maxLifetimeUsd: number | null;
   readonly minSolReserveLamports: bigint;
 }
 
@@ -106,6 +111,7 @@ export type SlotOutcome =
   | { readonly kind: 'gap-skipped'; readonly plannedAt: number; readonly slotsSkipped: number; readonly newNextRunAt: number }
   | { readonly kind: 'cap-halted'; readonly plannedAt: number; readonly reason: string }
   | { readonly kind: 'reserve-skipped'; readonly plannedAt: number }
+  | { readonly kind: 'min-buy-skipped'; readonly plannedAt: number; readonly reason: string }
   | { readonly kind: 'unpriceable-skipped'; readonly plannedAt: number };
 
 /** Prices a planned trade, and reads the wallet SOL balance for the reserve check. */
@@ -143,6 +149,12 @@ export interface SchedulerRepo {
    * `sinceMs`. UNKNOWN counts because it MAY have spent (INVARIANT 16). Scoped by user_id.
    */
   usdSpent24h(userId: number, mint: Mint, sinceMs: number): Promise<number>;
+
+  /**
+   * All-time sum of usd_value across this user's CONFIRMED + UNKNOWN executions for `mint` —
+   * the lifetime-cap denominator. Same confirmed+UNKNOWN rule as usdSpent24h, no time window.
+   */
+  usdSpentLifetime(userId: number, mint: Mint): Promise<number>;
 
   /** Move the scheduling pointer. Advances from the PLANNED time (rule 3), never from now. */
   advanceSchedule(id: number, nextRunAt: number, lastRunAt: number | null): Promise<void>;
@@ -330,6 +342,21 @@ export class Scheduler {
       return { kind: 'unpriceable-skipped', plannedAt };
     }
 
+    // --- MIN BUY (hard limit): a buy resolving below $1 is dust — SKIP the slot, do not halt.
+    //     A percent-of-balance buy is unpriced here (the valuer returns 0), so it always lands
+    //     here; an absolute buy whose SOL value has fallen below $1 skips too. This is a skip,
+    //     not an error, and only buys are min-buy-limited (sells value at 0 here but are priced
+    //     in the executor). ---
+    if (schedule.side === 'buy' && usdValue < HARD_MIN_BUY_USD) {
+      await this.#advanceOnly(schedule, plannedAt, intervalMs);
+      const reason = `per-exec $${usdValue.toFixed(2)} is below the $${HARD_MIN_BUY_USD} minimum buy`;
+      this.#log.warn(
+        { scheduleId: schedule.id, userId: schedule.userId, plannedAt, reason },
+        'autotrader scheduler: MIN-BUY skip — below $1, not fired',
+      );
+      return { kind: 'min-buy-skipped', plannedAt, reason };
+    }
+
     if (caps) {
       // Per-execution cap. A breach is a persistent misconfiguration, not a transient dip:
       // halt and make the owner act, rather than skip forever in silence.
@@ -348,6 +375,19 @@ export class Scheduler {
         await this.#repo.haltSchedule(schedule.id, reason, now);
         this.#log.warn({ scheduleId: schedule.id, userId: schedule.userId, plannedAt, reason }, 'autotrader scheduler: HALTED on cap breach');
         return { kind: 'cap-halted', plannedAt, reason };
+      }
+
+      // Lifetime cap, per user, per mint. null = no lifetime cap (unchanged). Same
+      // confirmed+UNKNOWN spend rule as the daily cap, summed over ALL time. A breach HALTS —
+      // it NEVER shrinks this buy to fit: it either fits under the cap or the schedule stops.
+      if (caps.maxLifetimeUsd != null) {
+        const lifetimeSpent = await this.#repo.usdSpentLifetime(schedule.userId, schedule.mint);
+        if (lifetimeSpent + usdValue > caps.maxLifetimeUsd) {
+          const reason = `lifetime budget of $${caps.maxLifetimeUsd.toFixed(2)} reached ($${(lifetimeSpent + usdValue).toFixed(2)})`;
+          await this.#repo.haltSchedule(schedule.id, reason, now);
+          this.#log.warn({ scheduleId: schedule.id, userId: schedule.userId, plannedAt, reason }, 'autotrader scheduler: HALTED on cap breach');
+          return { kind: 'cap-halted', plannedAt, reason };
+        }
       }
     }
 

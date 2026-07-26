@@ -178,6 +178,13 @@ const EnvSchema = z
      */
     MAX_PER_DAY_USD_CEILING: z.coerce.number().positive().default(500),
 
+    /**
+     * ABSOLUTE lifetime (all-time) USD ceiling for the autotrader, per (user, mint). Same
+     * reasoning as the daily ceiling: from env, not the DB, so a bad DB write cannot raise it.
+     * The executor clamps every lifetime cap to this, and /trade caps refuses above it.
+     */
+    MAX_LIFETIME_USD_CEILING: z.coerce.number().positive().default(10_000),
+
     /** Phase 16: the wallet whose DCA line renders as "Creator Fee" instead of an address. Optional. */
     CREATOR_FEE_WALLET: z.string().regex(BASE58, 'must be a base58 address').optional(),
 

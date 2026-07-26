@@ -470,6 +470,24 @@ describe('hard limits are enforced where money moves, not just at input', () => 
     void rec; void executor;
   });
 
+  it('the lifetime cap CANNOT be raised above the env ceiling — a bad DB write is clamped at execution', async () => {
+    // DB says $1,000,000,000 lifetime; the env ceiling is $200. Prior spend is $150; a $100 buy
+    // must be refused by the clamped $200 ceiling, not honoured against the DB value.
+    const prior = await seedSchedule();
+    const eid = await repo.claimExecution(prior.id, USER, 999_000);
+    await repo.settleExecution(eid!, { state: 'confirmed', usdValue: 150 });
+
+    const schedule = await seedSchedule();
+    await repo.setCaps({ userId: USER, mint: MINT, maxPerExecUsd: 1e9, maxPerDayUsd: 1e9, maxLifetimeUsd: 1e9 });
+    const plan = await claimedPlan(schedule, 100); // $100 buy; 150 + 100 = 250 > clamped 200
+    const { executor: capped, rec } = mkExecutorWithCeiling(1e9, 200); // day ceiling high, lifetime ceiling $200
+    const outcome = await capped.execute(plan);
+    expect(outcome.state).toBe('failed');
+    expect(outcome.error).toMatch(/lifetime budget/i);
+    expect(rec.send).toBe(0);
+    expect(await schedState(schedule.id)).toBe('halted');
+  });
+
   it('a buy that would breach the SOL reserve is refused at execution (percent buys too)', async () => {
     const schedule = await seedSchedule({ amountRaw: SOL }); // spend 1 SOL
     await repo.setCaps({ userId: USER, mint: MINT, maxPerExecUsd: 1e9, maxPerDayUsd: 1e9, minSolReserveLamports: SOL / 50n }); // 0.02 SOL
@@ -497,8 +515,8 @@ describe('hard limits are enforced where money moves, not just at input', () => 
   });
 });
 
-/** A second executor factory that can set the env ceiling for the ceiling test. */
-function mkExecutorWithCeiling(ceiling: number): { executor: Executor; rec: Recorder } {
+/** A second executor factory that can set the env ceilings for the ceiling tests. */
+function mkExecutorWithCeiling(ceiling: number, lifeCeiling = 1e9): { executor: Executor; rec: Recorder } {
   const base = mkExecutor();
   // Rebuild with a ceiling override.
   const rec: Recorder = { send: 0, signAllowed: [], quotes: [], balanceReads: [], dms: [] };
@@ -521,7 +539,7 @@ function mkExecutorWithCeiling(ceiling: number): { executor: Executor; rec: Reco
     log,
     solUsd: () => 150,
     decimalsOf: async () => 6,
-    config: { ...CFG, maxPerDayUsdCeiling: ceiling },
+    config: { ...CFG, maxPerDayUsdCeiling: ceiling, maxLifetimeUsdCeiling: lifeCeiling },
     now: () => 1_000_000,
     sleep: async () => undefined,
     parseSwap: (() => ({ event: { kind: 'buy', quoteRaw: 1n, tokensRaw: 1n } })) as never,
