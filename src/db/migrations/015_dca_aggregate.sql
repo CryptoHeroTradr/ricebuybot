@@ -9,6 +9,25 @@
 -- The stray-folder hard error must still fire on anything that is neither a tier nor `dca`.
 
 -- --- media_items: allow the dca folder -----------------------------------------------------
+--
+-- FK-SAFE REBUILD. media_items is a PARENT: media_file_ids(sha256) (001_init) references
+-- media_items(sha256) with the default ON DELETE NO ACTION. The bot opens the DB with
+-- `PRAGMA foreign_keys = ON`, and under that a `DROP TABLE media_items` first performs an implicit
+-- DELETE of its rows — which orphans every media_file_ids row that references them and throws
+-- SQLITE_CONSTRAINT_FOREIGNKEY. That child is empty in CI (why this passed there) but populated in
+-- production (a cache of Telegram file_ids keyed by content sha256 — INVARIANT 3), which is why the
+-- deploy failed.
+--
+-- `PRAGMA foreign_keys = OFF` cannot help: it is a no-op inside the runner's per-migration
+-- transaction. `PRAGMA defer_foreign_keys = ON` cannot either: DROP's implicit DELETE increments the
+-- deferred-violation counter, the later RENAME (which restores the rows) never decrements it, and
+-- COMMIT checks that counter, not the actual data — so it throws even though the final state is
+-- consistent (a fresh `PRAGMA foreign_key_check` at that point reports zero violations). Proven.
+--
+-- So we rebuild the CHILD alongside the parent and DROP THE CHILD FIRST: once media_file_ids is gone,
+-- nothing references media_items and its drop orphans nobody. All of this stays within
+-- foreign_keys = ON, touches only this migration, and the rebuilt media_file_ids KEEPS its FK to
+-- media_items(sha256) — INVARIANT 3 — so a file_id with no parent item is still rejected afterward.
 CREATE TABLE media_items_new (
   sha256     TEXT PRIMARY KEY,
   mint       TEXT NOT NULL,
@@ -24,8 +43,21 @@ CREATE TABLE media_items_new (
 INSERT INTO media_items_new (sha256, mint, tier, rel_path, kind, bytes, first_seen, missing, removed_at)
 SELECT sha256, mint, tier, rel_path, kind, bytes, first_seen, missing, removed_at FROM media_items;
 
-DROP TABLE media_items;
-ALTER TABLE media_items_new RENAME TO media_items;
+-- Rebuild the child so it references media_items_new; copy every cached file_id across intact. Its FK
+-- must survive the migration (INVARIANT 3), so the constraint is reproduced verbatim from 001_init.
+CREATE TABLE media_file_ids_new (
+  sha256      TEXT PRIMARY KEY REFERENCES media_items_new(sha256),
+  file_id     TEXT NOT NULL,
+  uploaded_at INTEGER NOT NULL
+);
+
+INSERT INTO media_file_ids_new (sha256, file_id, uploaded_at)
+SELECT sha256, file_id, uploaded_at FROM media_file_ids;
+
+DROP TABLE media_file_ids;   -- child first: it has no children of its own, so this orphans nobody
+DROP TABLE media_items;      -- now unreferenced, so its implicit DELETE violates nothing
+ALTER TABLE media_items_new RENAME TO media_items;         -- repoints child_new's FK to `media_items` by name
+ALTER TABLE media_file_ids_new RENAME TO media_file_ids;
 
 CREATE INDEX idx_media_mint_tier ON media_items (mint, tier);
 CREATE INDEX idx_media_live      ON media_items (mint, tier, removed_at);
