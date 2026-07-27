@@ -4,6 +4,7 @@ import type { Logger } from '../ops/logger.js';
 import { SignatureLru } from './dedup.js';
 import type { BuyHandler, Ingestor, SellHandler } from './types.js';
 import { normalizeSwap } from './normalize.js';
+import type { RecurringProgramCheck } from './recurring.js';
 import type { ConfirmedTx } from './solana-types.js';
 
 export interface IngestorDeps {
@@ -17,6 +18,16 @@ export interface IngestorDeps {
    * Optional: without it, ranking falls back to a reference price.
    */
   readonly solUsd?: () => number | null;
+  /**
+   * PHASE 7 — "did a Jupiter recurring program touch this transaction?", built once at boot from
+   * the configured program-id set.
+   *
+   * It lives HERE, not in the normalizer, on purpose. The ingestor is the layer that holds the raw
+   * transaction and hands out events; the parser must stay a pure balance-delta classifier that
+   * has never heard of a program id (INVARIANT 1). Absent — as in every existing test and in the
+   * backfill path — no buy is ever stamped, and wallet-mode attribution simply never fires.
+   */
+  readonly isRecurring?: RecurringProgramCheck;
 }
 
 /**
@@ -33,6 +44,7 @@ export abstract class BaseIngestor implements Ingestor {
 
   readonly #lru: SignatureLru;
   readonly #solUsd: () => number | null;
+  readonly #isRecurring: RecurringProgramCheck;
   readonly #mints = new Set<Mint>();
   readonly #buyHandlers: BuyHandler[] = [];
   readonly #reconnectHandlers: (() => void)[] = [];
@@ -45,6 +57,7 @@ export abstract class BaseIngestor implements Ingestor {
     this.repo = deps.repo;
     this.#lru = deps.lru ?? new SignatureLru(5_000);
     this.#solUsd = deps.solUsd ?? (() => null);
+    this.#isRecurring = deps.isRecurring ?? (() => false);
   }
 
   abstract start(): Promise<void>;
@@ -130,6 +143,11 @@ export abstract class BaseIngestor implements Ingestor {
     const signature = tx.transaction.signatures[0];
     if (!signature) return;
 
+    // PHASE 7. Computed ONCE per transaction, not once per mint: it is a property of the
+    // transaction, not of any token in it. A set lookup over account keys — see recurring.ts for
+    // why this is not the per-DEX decoder INVARIANT 1 forbids.
+    const viaRecurringProgram = this.#isRecurring(tx);
+
     // Cheap in-process gate against reconnect replay. NOT a correctness boundary
     // — the DB claim is (INVARIANT 2).
     if (this.#lru.seen(signature)) {
@@ -162,7 +180,11 @@ export abstract class BaseIngestor implements Ingestor {
 
       try {
         if (event.kind === 'buy') {
-          for (const cb of this.#buyHandlers) await cb(event);
+          // The stamp rides along with the event rather than being re-derived downstream: by the
+          // time a handler sees a BuyEvent the transaction is gone, and this is the only moment
+          // the question is answerable at all.
+          const buy = viaRecurringProgram ? { ...event, viaRecurringProgram: true } : event;
+          for (const cb of this.#buyHandlers) await cb(buy);
         } else {
           // Sells feed cost basis. They are NEVER posted to Telegram.
           for (const cb of this.#sellHandlers) await cb(event);

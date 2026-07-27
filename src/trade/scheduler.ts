@@ -112,7 +112,9 @@ export type SlotOutcome =
   | { readonly kind: 'cap-halted'; readonly plannedAt: number; readonly reason: string }
   | { readonly kind: 'reserve-skipped'; readonly plannedAt: number }
   | { readonly kind: 'min-buy-skipped'; readonly plannedAt: number; readonly reason: string }
-  | { readonly kind: 'unpriceable-skipped'; readonly plannedAt: number };
+  | { readonly kind: 'unpriceable-skipped'; readonly plannedAt: number }
+  /** PHASE 7: the owner is in wallet mode (or off the allowlist). The bot signs nothing for them. */
+  | { readonly kind: 'wallet-mode-skipped'; readonly plannedAt: number };
 
 /** Prices a planned trade, and reads the wallet SOL balance for the reserve check. */
 export interface TradeValuer {
@@ -141,6 +143,20 @@ export interface SchedulerRepo {
   dueSchedules(now: number): Promise<readonly Schedule[]>;
   /** Every active schedule, for the boot log. */
   activeSchedules(): Promise<readonly Schedule[]>;
+
+  /**
+   * PHASE 7 — has this schedule's owner told me not to sign for them?
+   *
+   * DELIBERATELY NARROWER THAN "what mode are they in". True ONLY for a member whose row says
+   * 'wallet'. A user with no allowlist row at all is NOT wallet-mode here and this tick behaves
+   * exactly as it did in phases 13-16 — because a missing row is not somebody asking me to stop,
+   * and this phase adds a mode AROUND the custodial scheduler rather than changing who it runs
+   * for. (Whether the scheduler should also refuse a non-member is a real question, and it is
+   * INVARIANT 14's, not this gate's; /trader remove already pauses their schedules.)
+   *
+   * Optional, so every existing SchedulerRepo — including every test fake — keeps working.
+   */
+  isWalletMode?(userId: number): Promise<boolean>;
 
   getCaps(userId: number, mint: Mint): Promise<Caps | null>;
 
@@ -281,8 +297,36 @@ export class Scheduler {
     try {
       const now = this.#now();
       const due = await this.#repo.dueSchedules(now);
+      // PHASE 7 — the mode gate sits on the WORK LIST, not inside #processDue.
+      //
+      // "The bot runs no scheduler tick for a wallet-mode user" is a promise about custody, and a
+      // promise like that should be kept by the shape of the loop rather than by a condition
+      // somewhere down inside the thing that spends money. #processDue is untouched: a slot that
+      // reaches it is a slot the bot is entitled to sign for, exactly as it was in phases 13-16.
+      //
+      // Cached FOR THIS TICK ONLY. One read per distinct owner keeps a large due list from
+      // hammering the row, while a switch to wallet mode still takes effect on the very next tick
+      // — seconds, not a TTL. Mode is a custody fact; it does not get to go stale.
+      const walletModeThisTick = new Map<number, boolean>();
       for (const schedule of due) {
         try {
+          if (this.#repo.isWalletMode) {
+            let isWallet = walletModeThisTick.get(schedule.userId);
+            if (isWallet === undefined) {
+              isWallet = await this.#repo.isWalletMode(schedule.userId);
+              walletModeThisTick.set(schedule.userId, isWallet);
+            }
+            if (isWallet) {
+              // Not advanced, not halted, not claimed — the slot is simply not ours to act on, and
+              // the schedule is left exactly as its owner left it in case they switch back.
+              this.#log.debug(
+                { scheduleId: schedule.id, userId: schedule.userId },
+                'autotrader scheduler: slot skipped — owner is in WALLET mode; the bot signs nothing for them',
+              );
+              outcomes.push({ kind: 'wallet-mode-skipped', plannedAt: schedule.nextRunAt });
+              continue;
+            }
+          }
           outcomes.push(await this.#processDue(schedule, now));
         } catch (err) {
           // A single schedule blowing up is logged and isolated; the tick carries on.

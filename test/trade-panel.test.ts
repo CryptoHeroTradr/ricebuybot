@@ -10,6 +10,8 @@ import {
   renderPanel,
   LIVE_BANNER,
   DRY_BANNER,
+  KEY_MODE_BANNER,
+  WALLET_MODE_BANNER,
   PANEL_VERBS,
   cb,
   parseCb,
@@ -68,7 +70,9 @@ async function seed(userId: number, over: Partial<{ side: Schedule['side']; amou
 
 function panelData(over: Partial<PanelData> = {}): PanelData {
   return {
-    tradeLive: false, symbol: '$RICE', mint: MINT, pubkey: '7xKXtgsffffffffffffffffffffffffffffff9fPq',
+    // PHASE 7: this whole file describes the CUSTODIAL panel — schedules, caps, a wallet to
+    // unlock — which is the key-mode one. Stated, not defaulted into.
+    tradeLive: false, mode: 'key', symbol: '$RICE', mint: MINT, pubkey: '7xKXtgsffffffffffffffffffffffffffffff9fPq',
     walletUnlocked: true, solBalance: 2_410_000_000n, tokenBalance: 8_204_113_000_000n, tokenDecimals: 6,
     schedules: [], spentTodayUsd: 18.42, caps: { perExecUsd: 50, perDayUsd: 200 }, now: 1_000_000,
     ...over,
@@ -89,6 +93,87 @@ describe('the money-at-stake banner (RULE A)', () => {
     const { text } = renderPanel(panelData({ tradeLive: false }), 'tok');
     expect(text.split('\n')[0]).toBe(DRY_BANNER);
     expect(text).toContain('wallet untouched');
+  });
+});
+
+// ===========================================================================================
+// PHASE 7 — the custody banner, and the wallet-mode panel
+// ===========================================================================================
+
+describe('the custody banner sits beside the money-at-stake one', () => {
+  it('states WHO HOLDS THE KEY on line two, in both modes, on every panel', () => {
+    const key = renderPanel(panelData({ mode: 'key' }), 'tok').text.split('\n');
+    expect(key[1]).toBe(KEY_MODE_BANNER);
+    expect(key[1]).toContain('I hold an encrypted key');
+
+    const wallet = renderPanel(panelData({ mode: 'wallet' }), 'tok').text.split('\n');
+    expect(wallet[1]).toBe(WALLET_MODE_BANNER);
+    expect(wallet[1]).toContain('I hold nothing');
+
+    // Line one is still RULE A's, in both. The custody line is added beside it, not instead.
+    expect(key[0]).toBe(DRY_BANNER);
+    expect(wallet[0]).toBe(DRY_BANNER);
+  });
+});
+
+describe('the wallet-mode panel is a launch point and a read-only view', () => {
+  const walletPanel = (over: Partial<PanelData> = {}) =>
+    renderPanel(panelData({ mode: 'wallet', pubkey: null, caps: null, ...over }), 'tok');
+
+  it('offers NO control that would change a schedule the bot cannot sign for', () => {
+    const { keyboard } = walletPanel({
+      walletMode: { linkedWallet: 'RiceViL1ager11111111111111111111111111111111', recentBuys: [], miniAppUrl: 'https://1grainofrice.com' },
+    });
+    const labels = keyboard.flat().map((b) => b.text).join(' ');
+    for (const gone of ['New schedule', 'Amount', 'Interval', 'Pause', 'Resume', 'Caps', 'Slippage', 'STOP ALL', 'Wallet']) {
+      expect(labels).not.toContain(gone);
+    }
+    // What is left: the way out to the Mini App, and which token this view is about.
+    expect(labels).toContain('Mini App');
+    expect(labels).toContain('Contract');
+  });
+
+  it('launches the Mini App with a web_app button, NOT a plain url', () => {
+    // The distinction is load-bearing (Phase 8): only a web_app launch hands the page a signed
+    // initData, which is the only way it can prove to the bot whose orders to show. A url button
+    // would open a browser with no identity attached and the Mini App would come up empty.
+    const { keyboard } = walletPanel({
+      walletMode: { linkedWallet: 'W', recentBuys: [], miniAppUrl: 'https://1grainofrice.com/onegrainofrice/tma' },
+    });
+    const launcher = keyboard.flat().find((b) => b.text.includes('Mini App'));
+    expect(launcher).toBeDefined();
+    expect(launcher).toMatchObject({ web_app: { url: 'https://1grainofrice.com/onegrainofrice/tma' } });
+    expect(launcher).not.toHaveProperty('url');
+  });
+
+  it('shows no launch button at all when there is nowhere to launch — never a dead one', () => {
+    const { keyboard } = walletPanel({ walletMode: { linkedWallet: 'W', recentBuys: [], miniAppUrl: undefined } });
+    expect(keyboard.flat().some((b) => 'web_app' in b)).toBe(false);
+    expect(keyboard.flat().some((b) => b.text.includes('Mini App'))).toBe(false);
+  });
+
+  it('asks an unlinked user to prove the wallet, and never shows a balance it has no business reading', () => {
+    const { text } = walletPanel({ walletMode: { linkedWallet: null, recentBuys: [] } });
+    expect(text).toContain('No wallet linked yet');
+    expect(text).toContain('/linksite');
+    expect(text).not.toContain('Balance');
+    expect(text).not.toContain('cap');
+  });
+
+  it('lists OBSERVED fills and says plainly that live order state lives in the Mini App', () => {
+    const { text } = walletPanel({
+      walletMode: {
+        linkedWallet: 'RiceViL1ager11111111111111111111111111111111',
+        recentBuys: [{ tokensRaw: 12_345_000_000n, usdIn: 20.5, at: Date.UTC(2026, 6, 24, 14, 30) }],
+        miniAppUrl: 'https://1grainofrice.com',
+      },
+    });
+    expect(text).toContain('linked, proven by signature');
+    expect(text).toContain('12,345 $RICE');
+    expect(text).toContain('$20.5');
+    // The boundary, stated rather than implied by an absence.
+    expect(text).toContain('fills I saw on-chain');
+    expect(text).toContain('Mini App');
   });
 });
 

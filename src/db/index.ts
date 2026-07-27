@@ -248,8 +248,28 @@ export interface Repo {
   /** True iff this buy's signature has an execution row — i.e. it is one of ours (a DCA buy).
    *  No state filter: 'submitted' and 'UNKNOWN' count, so a DCA buy never leaks onto an organic card. */
   isDcaSignature(signature: Signature): Promise<boolean>;
-  /** DCA-attributed buys for a mint in [fromMs, toMs), grouped by the caller (BigInt, never SQL SUM). */
+  /** DCA-attributed buys for a mint in [fromMs, toMs), grouped by the caller (BigInt, never SQL SUM).
+   *  BOTH halves of the attribution set (Phase 7): custodial executions AND wallet-mode Jupiter
+   *  recurring fills. One query, one card, one disclosure path. */
   dcaBuysInWindow(mint: Mint, fromMs: number, toMs: number): Promise<readonly { buyer: string; tokensRaw: bigint }[]>;
+
+  // --- Phase 7: per-user custody mode ---
+  /** The custody mode of a user. A missing or locked member reads as 'wallet' — no custody. */
+  traderMode(userId: number): Promise<import('../trade/mode.js').TraderMode>;
+  /** The scheduler's narrower gate: true only when the row actually says 'wallet'. */
+  isWalletMode(userId: number): Promise<boolean>;
+
+  // --- Phase 7: wallet-mode DCA attribution (the other half of the set above) ---
+  /** Is this proven wallet address an allowlisted, unlocked, WALLET-mode member's? Never cached. */
+  isWalletModeAddress(wallet: Wallet): Promise<boolean>;
+  /** The wallet a member proved they own (Phase 6 signature), or null. */
+  walletForUser(userId: number): Promise<string | null>;
+  /** Attribute one observed buy as a wallet-mode DCA. Idempotent on (signature, mint, buyer). */
+  recordWalletDcaBuy(signature: Signature, mint: Mint, buyer: Wallet, atMs: number): Promise<void>;
+  /** Already attributed as a wallet-mode DCA? The suppression path's second question. */
+  isWalletDcaBuy(signature: Signature): Promise<boolean>;
+  /** THIS wallet's observed DCA fills, newest first — the wallet-mode panel's read-only view. */
+  recentWalletDcaBuys(wallet: Wallet, mint: Mint, limit: number): Promise<readonly { tokensRaw: bigint; usdIn: number; at: number }[]>;
   getDcaCursor(chatId: ChatId, mint: Mint): Promise<number | null>;
   setDcaCursor(chatId: ChatId, mint: Mint, windowStart: number): Promise<void>;
   /** OWNER-ONLY (/dcawindow). Set the aggregate window on EVERY chat_token — the owner's program is

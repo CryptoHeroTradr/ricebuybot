@@ -69,6 +69,21 @@ export interface SwapEventBase {
 export interface BuyEvent extends SwapEventBase {
   readonly kind: 'buy';
   readonly buyer: Wallet;
+
+  /**
+   * PHASE 7 — a Jupiter recurring-order program appeared in this transaction's account keys.
+   *
+   * NOT A CLASSIFICATION, AND NOT PRODUCED BY THE PARSER. `normalizeSwap` never sets this: it is
+   * stamped by the ingestor, which is the layer holding the raw transaction, and it plays no part
+   * in deciding whether this is a buy, who the buyer is, or what it was worth. Invariant 1 is
+   * about how a swap is DETECTED; this is one downstream question about how it was INITIATED,
+   * asked only of buys from wallets we already have a proven identity link to.
+   *
+   * OPTIONAL, and `undefined` means "nobody asked" — the backfiller and every test that builds an
+   * event by hand leave it unset. Only `true` is ever treated as evidence, so an absent field can
+   * never promote a manual buy into an automated one. See src/ingest/recurring.ts.
+   */
+  readonly viaRecurringProgram?: boolean;
 }
 
 /** Sells feed cost basis (Phase 4). They are NEVER posted to Telegram. */

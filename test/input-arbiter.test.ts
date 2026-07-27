@@ -356,6 +356,9 @@ describe('/cancel during a real wallet import leaves NO fragment behind', () => 
     const repo2 = new SqliteRepo(':memory:', log);
     await repo2.init();
     await repo2.addAutotraderUser(USER, 'tester', 1);
+    // PHASE 7: /wallet import is refused in the default WALLET mode. This test is about the
+    // custody flow's interaction with /cancel, so its user is a key-mode user.
+    await repo2.setAutotraderMode(USER, 'key');
     const arbiter = new InputArbiter();
     const bot = new FakeBot();
 
@@ -475,6 +478,9 @@ describe('/stop in a DM halts every schedule', () => {
     await repo2.init();
     await repo2.addAutotraderUser(USER, 'alice', 1);
     await repo2.addAutotraderUser(OTHER, 'bob', 1);
+    // PHASE 7: /stop halts CUSTODIAL schedules, which only key-mode users have.
+    await repo2.setAutotraderMode(USER, 'key');
+    await repo2.setAutotraderMode(OTHER, 'key');
     await wire();
   });
   afterEach(async () => {

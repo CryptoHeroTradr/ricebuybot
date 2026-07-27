@@ -67,8 +67,14 @@ describe('migrations apply against a POPULATED file_id cache (prod condition, no
     // 3. Apply the full set — 015's media_items rebuild runs here (the statement that crashed prod).
     expect(() => migrate(db, log, migrationsDir())).not.toThrow();
 
-    // 4. All four applied; the DB reached 18.
-    expect(db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get()).toEqual({ v: 18 });
+    // 4. Everything after 14 applied; the DB reached the LATEST migration on disk.
+    //
+    // Derived, not a literal. This assertion used to read `{ v: 18 }`, which meant every later
+    // phase broke a test about foreign keys — a failure that says nothing about what it guards and
+    // trains you to edit the number. What is actually under test is that the whole remaining set
+    // applies against a populated file_id cache, and that is what this now says.
+    const latest = Math.max(...loadMigrations().map((m) => m.version));
+    expect(db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get()).toEqual({ v: latest });
 
     // 5. The cached file_id survived, its parent intact, and no FK is left dangling.
     expect(db.prepare('SELECT file_id FROM media_file_ids WHERE sha256 = ?').get('sha-parent')).toEqual({

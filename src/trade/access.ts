@@ -1,4 +1,5 @@
 import type { Logger } from '../ops/logger.js';
+import { DEFAULT_MODE, type TraderMode } from './mode.js';
 
 /**
  * THE ALLOWLIST (INVARIANT 14).
@@ -26,6 +27,12 @@ export interface AutotraderMember {
   /** Revoked but NOT destroyed. Off the allowlist; keystore file still on disk. */
   readonly locked: boolean;
   readonly lockedAt: number | null;
+  /**
+   * PHASE 7 — which half of the autotrader this member is in, and so whether the bot holds a key
+   * that can spend their money. 'wallet' for every new member (migration 019). Never widened by a
+   * plan, a flag or the owner: only the member themselves can move it, and only through /mode.
+   */
+  readonly mode: TraderMode;
 }
 
 export type AccessAction = 'add' | 'remove' | 'purge';
@@ -39,6 +46,8 @@ export interface AutotraderAccessRepo {
   listAutotraderUsers(): Promise<readonly AutotraderMember[]>;
   addAutotraderUser(userId: number, label: string | null, addedBy: number | null): Promise<void>;
   setAutotraderLocked(userId: number, locked: boolean): Promise<void>;
+  /** PHASE 7. The ONLY writer of the mode column. Called by /mode and by nothing else. */
+  setAutotraderMode(userId: number, mode: TraderMode): Promise<void>;
   deleteAutotraderUser(userId: number): Promise<void>;
   logAutotraderAccess(userId: number, action: AccessAction, actor: number | null, note?: string): Promise<void>;
 }
@@ -101,6 +110,34 @@ export class AutotraderAccess {
 
   get(userId: number): Promise<AutotraderMember | null> {
     return this.#repo.getAutotraderUser(userId);
+  }
+
+  /**
+   * PHASE 7 — the mode of a user, resolved for callers who have no member row in hand.
+   *
+   * A NON-MEMBER READS AS 'wallet'. That is not a courtesy default, it is the accurate answer to
+   * the question this function is asked: "does the bot hold a key for this person and act on it?"
+   * For someone who is not on the allowlist the answer is no, and every caller — the scheduler's
+   * work list, the panel, the attribution set — wants exactly that reading. The alternative,
+   * a null the callers each have to remember to treat as no-custody, is one forgotten branch away
+   * from the bot ticking a schedule for someone it no longer serves.
+   */
+  async mode(userId: number): Promise<TraderMode> {
+    const member = await this.#repo.getAutotraderUser(userId);
+    if (!member || member.locked) return DEFAULT_MODE;
+    return member.mode;
+  }
+
+  /**
+   * Move a member between modes. The PRECONDITIONS ARE THE CALLER'S (see `checkModeSwitch` and the
+   * /mode flow): this writes the column and the audit line, and deliberately holds no policy —
+   * a guard that lives in two places is a guard with two different opinions.
+   */
+  async setMode(userId: number, mode: TraderMode): Promise<void> {
+    await this.#repo.setAutotraderMode(userId, mode);
+    // The mode is not a secret and the user id is not either. Whether the bot holds a key for
+    // someone is precisely the kind of change that must be reconstructable from the logs.
+    this.#log.warn({ userId, mode, at: this.#now() }, 'autotrader: trader MODE changed');
   }
 
   async add(userId: number, label: string | null, actor: number): Promise<void> {

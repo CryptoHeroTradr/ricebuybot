@@ -146,6 +146,68 @@ describe('the DCA flush loop', () => {
   });
 });
 
+/**
+ * PHASE 7 — the wallet-mode half of the attribution set, asserted at the CARD, not at the query.
+ *
+ * The whole claim of the phase is "zero new pipeline": a Jupiter recurring order signed by a
+ * villager's own wallet has to come out of the same flusher, in the same window, on the same card,
+ * beside a custodial execution. Asserting the repo query would prove the row is findable; this
+ * proves the group actually gets told.
+ */
+describe('a wallet-mode DCA buy reaches the SAME card as a custodial one', () => {
+  const VILLAGER = 'ViL1agerWa11etAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+
+  /** A Jupiter recurring fill: a `buys` row plus an attribution row. No execution, no signature of ours. */
+  async function walletDcaBuy(sig: string, buyer: string, tokensRaw: bigint, atMs: number): Promise<void> {
+    await repo.recordBuy({
+      signature: sig as never, mint: MINT, buyer: buyer as never,
+      quoteMint: 'So11111111111111111111111111111111111111112' as never, quoteSymbol: 'SOL',
+      quoteRaw: 50_000_000n, tokensRaw, usdIn: 5, priceUsd: 0.0001, slot: 1, blockTime: null,
+    });
+    await repo.recordWalletDcaBuy(sig as never, MINT, buyer as never, atMs);
+  }
+
+  it('renders one card carrying BOTH a custodial line and a wallet-mode line, summed and sorted', async () => {
+    const s = await scheduleId();
+    await dcaBuy(s, 'exec-1', W1, 100_000_000_000n, WSTART + 60_000); // ours, via executions
+    await walletDcaBuy('jup-1', VILLAGER, 250_000_000_000n, WSTART + 90_000); // theirs, via Jupiter
+    await walletDcaBuy('jup-2', VILLAGER, 10_000_000_000n, WSTART + 120_000);
+
+    const sink: Enqueued[] = [];
+    expect(await flusher(sink).tick()).toBe(1); // ONE card, not one per source
+    await new Promise((r) => setTimeout(r, 0));
+
+    const body = sink[0]!.card.text.split('\n').filter(Boolean);
+    expect(body[0]).toBe('🌾 DCA Buys');
+    expect(body.slice(1)).toHaveLength(2);
+    expect(body[1]).toContain('260,000 grains'); // the villager's two fills, summed, leading
+    expect(body[2]).toContain('100,000 grains');
+  });
+
+  it('THE CREATOR FEE RULE IS UNCHANGED — matched by address, whichever mode it arrived by', async () => {
+    const CREATOR = 'CrEaToRFeeWa11etAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+    await walletDcaBuy('jup-creator', CREATOR, 7_000_000_000n, WSTART + 60_000);
+
+    const sink: Enqueued[] = [];
+    await new DcaFlusher({ repo, queue: fakeQueue(sink), log, creatorFeeWallet: CREATOR, now: () => NOW }).tick();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(sink[0]!.card.text).toContain('Creator Fee');
+    expect(sink[0]!.card.text).not.toContain(CREATOR.slice(0, 4)); // named, never addressed
+  });
+
+  it('a buy with NO attribution row is invisible here — a manual ape keeps its organic card', async () => {
+    await repo.recordBuy({
+      signature: 'manual-1' as never, mint: MINT, buyer: VILLAGER as never,
+      quoteMint: 'So11111111111111111111111111111111111111112' as never, quoteSymbol: 'SOL',
+      quoteRaw: 50_000_000n, tokensRaw: 999_000_000_000n, usdIn: 5, priceUsd: 0.0001, slot: 1, blockTime: null,
+    });
+    const sink: Enqueued[] = [];
+    expect(await flusher(sink).tick()).toBe(0);
+    expect(sink).toHaveLength(0);
+  });
+});
+
 describe('/dcawindow is owner-only', () => {
   it('sets the window across chat_tokens (owner) and is a no-op for anyone else', async () => {
     // The repo setter is what /dcawindow calls; the command gate is tested by the owner check.

@@ -6,6 +6,16 @@ import { Keystore, KeystoreError } from '../trade/keystore.js';
 import { decodeBase58, looksLikeSecretKey } from '../trade/base58.js';
 import { fetchInventory, exposureWarning, importValueWarning, renderWallet, shortPubkey, type WalletRpc } from '../trade/wallet.js';
 import { unlockModeFor, type UnlockConfig } from '../trade/unlock.js';
+import {
+  CUSTODY_ACK_PHRASE,
+  checkModeSwitch,
+  custodyWarning,
+  importRefusedInWalletMode,
+  keyToWalletNotice,
+  parseMode,
+  walletToKeyNotice,
+  type TraderMode,
+} from '../trade/mode.js';
 import { InputArbiter } from './input-arbiter.js';
 
 /**
@@ -33,7 +43,9 @@ type Pending =
   | { readonly kind: 'export-confirm' }
   | { readonly kind: 'export-passphrase' }
   | { readonly kind: 'generate-passphrase' }
-  | { readonly kind: 'purge-confirm'; readonly target: number };
+  | { readonly kind: 'purge-confirm'; readonly target: number }
+  /** PHASE 7: wallet -> key. The custody warning has been shown; the ack is what we are waiting on. */
+  | { readonly kind: 'mode-key-ack' };
 
 export interface TradeCommandDeps {
   readonly repo: AutotraderAccessRepo;
@@ -53,6 +65,14 @@ export interface TradeCommandDeps {
   readonly onWalletChanged?: (userId: number) => Promise<number>;
   /** The shared DM input arbiter — one awaiting state per user across all handlers. */
   readonly arbiter: InputArbiter;
+  /**
+   * PHASE 7 — how many of this user's custodial schedules are still ACTIVE. Gates key -> wallet:
+   * the switch locks the key, and a running schedule that can no longer sign is a failure its
+   * owner did not ask for. Supplied by the boot wiring, which owns the schedule tables.
+   */
+  readonly activeScheduleCount?: (userId: number) => Promise<number>;
+  /** PHASE 7 — append the mode change to the settings audit trail (/history settings). */
+  readonly recordModeChange?: (userId: number, from: TraderMode, to: TraderMode) => Promise<void>;
 }
 
 const ACK_PHRASE = 'I UNDERSTAND';
@@ -107,6 +127,23 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
   async function showWallet(ctx: Context, userId: number): Promise<void> {
     const pubkey = keystore.pubkeyOf(userId);
     if (pubkey === null) {
+      // PHASE 7. In wallet mode, "no wallet yet" is not a gap to fill — it is the whole point.
+      // Offering generate/import here would advertise custody as the obvious next step to someone
+      // who has not chosen it, which is precisely the nudge this phase removes.
+      if ((await access.mode(userId)) === 'wallet') {
+        await ctx.reply(
+          [
+            '🔐 WALLET mode — I hold no key for you.',
+            '',
+            'Your DCA runs from your own wallet as Jupiter recurring orders. Open',
+            'the Mini App from /trade to create, edit or cancel them; nothing',
+            'secret ever leaves your device.',
+            '',
+            'If you want me holding a key and trading for you instead: /mode key.',
+          ].join('\n'),
+        );
+        return;
+      }
       await ctx.reply(
         ['No wallet yet.', '', '/wallet generate — a fresh one (lowest exposure)', '/wallet import — bring your own'].join('\n'),
       );
@@ -250,6 +287,13 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
         return;
 
       case 'import': {
+        // PHASE 7 — REFUSED IN WALLET MODE, before the warning and before the ack. In wallet mode
+        // the bot holds nothing of theirs, and the honest way to keep that promise is to have no
+        // path from this command to a keystore at all. The refusal names the deliberate way in.
+        if ((await access.mode(userId)) === 'wallet') {
+          await ctx.reply(importRefusedInWalletMode('import'));
+          return;
+        }
         // The warning comes BEFORE the key, and an acknowledgement is required. A person who
         // has already pasted their secret has already taken the risk; asking afterwards is
         // theatre.
@@ -270,6 +314,13 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
       }
 
       case 'generate': {
+        // Refused in wallet mode for the same reason as import, and it matters that BOTH are: a
+        // key the bot generated and kept is exactly as custodial as one that was pasted in. Closing
+        // only the scarier-looking door would leave the quiet one as the path of least resistance.
+        if ((await access.mode(userId)) === 'wallet') {
+          await ctx.reply(importRefusedInWalletMode('generate'));
+          return;
+        }
         if (keystore.has(userId)) {
           await ctx.reply('You already have a wallet. /wallet export it first if you want to keep it.');
           return;
@@ -322,6 +373,114 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
     }
   });
 
+  // ---------------------------------------------------------------------------------------
+  // /mode — PHASE 7. The one door between the two halves of the autotrader.
+  //
+  // Deliberate in both directions, and asymmetric on purpose:
+  //   * -> key    is gated on UNDERSTANDING (the Phase 12 custody warning, verbatim, plus a typed
+  //               acknowledgement). Nothing about the user's state can make handing over a key
+  //               safe, so nothing about their state gates it.
+  //   * -> wallet is gated on STATE (no active custodial schedule). Nothing needs explaining to
+  //               someone taking their key back — but a schedule that suddenly cannot sign is a
+  //               failure they did not ask for and would have to debug.
+  // ---------------------------------------------------------------------------------------
+  bot.command('mode', async (ctx) => {
+    const userId = await guard(ctx);
+    if (userId === null) return; // SILENCE
+
+    const current = await access.mode(userId);
+    const arg = (ctx.match?.toString() ?? '').trim();
+
+    if (arg === '') {
+      // A bare /mode always ANSWERS. Whether the bot is holding a key that can spend your money is
+      // not something a person should have to work out from which commands happen to reply.
+      await ctx.reply(
+        current === 'wallet'
+          ? [
+              '🔐 You are in WALLET mode.',
+              '',
+              'I hold no key for you, run no schedule for you, and sign nothing',
+              'for you. Your DCA lives in your own wallet as Jupiter recurring',
+              'orders — /trade opens the Mini App.',
+              '',
+              '/mode key — hand me a key and let me trade for you (custodial).',
+            ].join('\n')
+          : [
+              '🔑 You are in KEY mode.',
+              '',
+              `I hold an encrypted key for you${keystore.has(userId) ? '' : ' — none imported yet'} and my scheduler`,
+              'spends from that wallet on your timer.',
+              '',
+              '/mode wallet — take the key back and run DCA from your own wallet.',
+            ].join('\n'),
+      );
+      return;
+    }
+
+    const target = parseMode(arg);
+    if (target === null) {
+      await ctx.reply('Usage: /mode wallet|key   (/mode on its own shows the current one)');
+      return;
+    }
+
+    const active = (await deps.activeScheduleCount?.(userId)) ?? 0;
+    const verdict = checkModeSwitch(current, target, active);
+
+    if (!verdict.ok) {
+      if (verdict.reason === 'same-mode') {
+        await ctx.reply(`Already in ${verdict.mode} mode. Nothing changed.`);
+        return;
+      }
+      // REFUSED, and the refusal says exactly what to do about it. A "no" with no next step is a
+      // dead end someone will just retry.
+      await ctx.reply(
+        [
+          `🚫 Not switched — you still have ${verdict.activeSchedules} ACTIVE schedule(s).`,
+          '',
+          'Switching to wallet mode locks the key those schedules sign with, and',
+          'I am not going to break them out from under you. Stop them first:',
+          '',
+          '/stop  — halts every active schedule, one command',
+          '',
+          'then /mode wallet again. Nothing has changed yet.',
+        ].join('\n'),
+      );
+      return;
+    }
+
+    if (target === 'key') {
+      // The warning comes BEFORE the switch, not after. Same discipline as /wallet import: asking
+      // someone to accept a risk they have already taken is theatre.
+      const cancelled = setPending(userId, { kind: 'mode-key-ack' });
+      if (cancelled) await ctx.reply(`(cancelled the pending ${cancelled})`);
+      await ctx.reply(
+        [
+          '⚠️ KEY MODE MEANS I HOLD A KEY THAT CAN SPEND YOUR MONEY.',
+          '',
+          custodyWarning(),
+          '',
+          'In wallet mode none of the above applies to you, because there is',
+          'nothing of yours here to lose.',
+          '',
+          `If you accept that, reply exactly:  ${CUSTODY_ACK_PHRASE}`,
+        ].join('\n'),
+      );
+      return;
+    }
+
+    // key -> wallet. No confirmation: this direction only ever REDUCES what the bot holds, and a
+    // confirmation on giving custody back is a speed bump in front of the safe choice.
+    await access.setMode(userId, 'wallet');
+    await deps.recordModeChange?.(userId, current, 'wallet').catch(() => undefined);
+    // Belt and braces on top of the mode gate: pause anything left (paused/halted rows stay as
+    // they are) and drop the live key from memory. The keystore FILE is untouched — it is theirs.
+    await deps.pauseSchedules(userId);
+    const hadKeystore = keystore.has(userId);
+    keystore.lock(userId);
+    log.warn({ userId, hadKeystore }, 'autotrader: mode key -> wallet; keystore LOCKED, retained');
+    await ctx.reply(keyToWalletNotice(hadKeystore));
+  });
+
   bot.command('unlock', async (ctx) => {
     const userId = await guard(ctx);
     if (userId === null) return;
@@ -369,6 +528,27 @@ export function registerTradeCommands(bot: Bot, deps: TradeCommandDeps): void {
     if (!(await access.check(userId)).allowed) return next(); // silence
 
     switch (state.kind) {
+      case 'mode-key-ack': {
+        clearPending(userId);
+        if (ctx.message.text.trim() !== CUSTODY_ACK_PHRASE) {
+          // Not acknowledged is not a retry prompt. Nothing changed, and they can start over.
+          await ctx.reply('Not acknowledged — you are still in wallet mode and I hold nothing of yours.');
+          return;
+        }
+        // Re-read the mode instead of trusting what it was when the warning was sent: an ack can
+        // arrive minutes later, and by then the answer may have moved.
+        const before = await access.mode(userId);
+        if (before === 'key') {
+          await ctx.reply('Already in key mode. Nothing changed.');
+          return;
+        }
+        await access.setMode(userId, 'key');
+        await deps.recordModeChange?.(userId, before, 'key').catch(() => undefined);
+        log.warn({ userId }, 'autotrader: mode wallet -> key ACKNOWLEDGED — custodial from here');
+        await ctx.reply(walletToKeyNotice());
+        return;
+      }
+
       case 'import-ack': {
         if (ctx.message.text.trim() !== ACK_PHRASE) {
           clearPending(userId);

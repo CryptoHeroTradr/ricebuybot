@@ -34,10 +34,18 @@ import { InputArbiter } from '../input-arbiter.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const EXPIRED = 'Panel expired — send /trade again.';
+/** How many observed DCA fills the wallet-mode panel lists. A panel, not a statement. */
+const WALLET_MODE_BUY_ROWS = 5;
 
 /** Everything the panel reads. Superset of PanelRepo with the read-only bits gather needs. */
 export interface TradePanelRepo extends PanelRepo {
   lastExecutionForSchedule(scheduleId: number): Promise<ExecutionRecord | null>;
+  // PHASE 7 — the wallet-mode half of the panel. All three are READS; there is deliberately no
+  // method here that could change an on-chain order, because the bot cannot sign one.
+  /** The proven wallet a member linked, or null. */
+  walletForUser(userId: number): Promise<string | null>;
+  /** Observed DCA fills for that wallet, newest first. */
+  recentWalletDcaBuys(wallet: string, mint: Mint, limit: number): Promise<readonly { tokensRaw: bigint; usdIn: number; at: number }[]>;
   usdSpent24h(userId: number, mint: Mint, sinceMs: number): Promise<number>;
   usdSpentLifetime(userId: number, mint: Mint): Promise<number>;
   getCaps(userId: number, mint: Mint): Promise<Caps | null>;
@@ -52,6 +60,8 @@ export interface TradePanelDeps {
   readonly meta: (mint: string) => Promise<{ symbol: string | null; decimals: number } | null>;
   readonly tradeLive: boolean;
   readonly defaultMint: string;
+  /** PHASE 7 — where the DCA Mini App lives (cfg.SITE_URL). Absent = no launch button. */
+  readonly miniAppUrl?: string | undefined;
   /** Env daily-cap ceiling — /trade caps refuses above it (the executor enforces it too). */
   readonly maxPerDayUsdCeiling?: number;
   /** Env lifetime-cap ceiling — /trade caps refuses a lifetime budget above it. */
@@ -88,6 +98,22 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
     return (await access.check(userId)).allowed ? userId : null;
   }
 
+  /**
+   * PHASE 7 — a custodial action attempted from wallet mode.
+   *
+   * Every one of these edits a SCHEDULE THE BOT WOULD SIGN FOR, and in wallet mode there is no such
+   * thing. The panel does not offer them, but the typed commands still exist and a button from a
+   * panel opened before a mode switch is still in someone's chat history — so the check lives at
+   * action time, next to the write, exactly like the membership gate above it.
+   *
+   * `contract` is the exception and stays reachable: it selects which token this user's view is
+   * about, and it is ours, not theirs.
+   */
+  const CUSTODIAL_VERBS = new Set<PanelVerb>(['new', 'amount', 'interval', 'pause', 'resume', 'slippage', 'caps', 'stop', 'wallet']);
+  const WALLET_MODE_REFUSAL =
+    '🔐 You are in WALLET mode — I hold no key and run no schedule for you, so there is nothing here for me to change. ' +
+    'Your DCA lives in your own wallet: open the Mini App from /trade. To hand me a key instead: /mode key.';
+
   async function contractOf(userId: number): Promise<Mint> {
     return (await repo.getContract(userId)) ?? (deps.defaultMint as Mint);
   }
@@ -97,6 +123,41 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
     const m = await deps.meta(contract).catch(() => null);
     const symbol = m?.symbol ? `$${m.symbol}` : contract.slice(0, 4);
     const decimals = m?.decimals ?? 6;
+    const mode = await access.mode(userId);
+
+    // PHASE 7 — wallet mode gathers a DIFFERENT set of facts, and none of the custodial ones.
+    //
+    // It does not read the keystore, does not hit the RPC for a balance we have no business
+    // showing, and does not list schedules the bot would never fire. Skipping those reads is not an
+    // optimisation: a panel that quietly went and looked up a wallet-mode user's key material would
+    // contradict the sentence printed at the top of it.
+    if (mode === 'wallet') {
+      const linkedWallet = await repo.walletForUser(userId).catch(() => null);
+      const recentBuys = linkedWallet
+        ? await repo.recentWalletDcaBuys(linkedWallet, contract, WALLET_MODE_BUY_ROWS).catch(() => [])
+        : [];
+      return renderPanel(
+        {
+          tradeLive: deps.tradeLive,
+          mode,
+          walletMode: { linkedWallet, recentBuys, miniAppUrl: deps.miniAppUrl },
+          symbol,
+          mint: contract,
+          pubkey: null,
+          walletUnlocked: false,
+          solBalance: null,
+          tokenBalance: null,
+          tokenDecimals: decimals,
+          schedules: [],
+          spentTodayUsd: 0,
+          spentLifetimeUsd: 0,
+          caps: null,
+          now: now(),
+        },
+        token,
+      );
+    }
+
     const pubkey = keystore.pubkeyOf(userId);
     const [solBalance, tokenMap, schedules, caps, spent, spentLifetime] = await Promise.all([
       pubkey ? rpc.getBalance(pubkey).catch(() => null) : Promise.resolve(null),
@@ -111,6 +172,7 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
     );
     const data: PanelData = {
       tradeLive: deps.tradeLive,
+      mode,
       symbol,
       mint: contract,
       pubkey,
@@ -180,6 +242,12 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
     const args = (ctx.match ?? '').toString().trim();
     if (args === '') return void sendPanel(ctx, userId);
 
+    // A wallet-mode user gets the panel, not a scheduler edit. Checked before the dispatcher so no
+    // custodial write is even attempted.
+    if ((await access.mode(userId)) === 'wallet') {
+      return void sendPanel(ctx, userId, WALLET_MODE_REFUSAL);
+    }
+
     const tokens = args.split(/\s+/);
     // stop and the id-taking subcommands all funnel through the shared dispatcher, THEN re-render.
     const contract = await contractOf(userId);
@@ -248,6 +316,15 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
     if (!(await access.check(userId)).allowed) return void ctx.answerCallbackQuery().catch(() => {});
 
     const verb = parsed.verb as PanelVerb;
+    // A button tapped from a panel that was rendered BEFORE a switch to wallet mode. Refuse the
+    // action and re-render, so the panel they are looking at stops being out of date.
+    if (CUSTODIAL_VERBS.has(verb) && (await access.mode(userId)) === 'wallet') {
+      await ctx.answerCallbackQuery({ text: 'Wallet mode — nothing here for me to change.', show_alert: true }).catch(() => {});
+      const chat = ctx.chat?.id;
+      const msg = panel.messageId ?? ctx.callbackQuery.message?.message_id ?? null;
+      if (chat !== undefined && msg !== null) await editPanel(ctx, panel.token, userId, chat, msg, WALLET_MODE_REFUSAL);
+      return;
+    }
     const chatId = ctx.chat?.id;
     const messageId = panel.messageId ?? ctx.callbackQuery.message?.message_id ?? null;
     await ctx.answerCallbackQuery().catch(() => {});

@@ -117,6 +117,10 @@ beforeEach(async () => {
   setup();
   await repo.init(); // runs migrations, including 012_autotrader_users
   await repo.addAutotraderUser(MEMBER, 'member', OWNER);
+  // PHASE 7: a new member defaults to WALLET mode, where /wallet import and /wallet generate are
+  // refused outright. The custody flows below are the KEY-mode ones, so this member has opted in.
+  // The wallet-mode refusals get their own file (test/trader-mode.test.ts).
+  await repo.setAutotraderMode(MEMBER, 'key');
 });
 
 // ------------------------------------------------------------------------------------------

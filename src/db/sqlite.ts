@@ -34,6 +34,7 @@ import {
 import { reconcile } from '../positions/reconcile.js';
 import type { Logger } from '../ops/logger.js';
 import type { AutotraderMember } from '../trade/access.js';
+import { DEFAULT_MODE, isTraderMode, type TraderMode } from '../trade/mode.js';
 import type {
   AmountKind,
   Caps,
@@ -170,6 +171,7 @@ interface AutotraderRow {
   added_at: number;
   locked: number;
   locked_at: number | null;
+  mode: string;
 }
 
 function hydrateAutotrader(r: AutotraderRow): AutotraderMember {
@@ -180,6 +182,10 @@ function hydrateAutotrader(r: AutotraderRow): AutotraderMember {
     addedAt: r.added_at,
     locked: r.locked === 1,
     lockedAt: r.locked_at,
+    // The column is CHECK-constrained to the two values (migration 019), so anything else means
+    // the row was written by something that is not this code. Read it as the NO-CUSTODY mode:
+    // a hydrator is not the place to discover that the bot is allowed to spend someone's money.
+    mode: isTraderMode(r.mode) ? r.mode : DEFAULT_MODE,
   };
 }
 
@@ -1515,6 +1521,106 @@ export class SqliteRepo implements Repo {
       .run(locked ? 1 : 0, locked ? Date.now() : null, userId);
   }
 
+  /**
+   * PHASE 7 — the mode write. Deliberately UPDATE-only, never an upsert: a mode is a property of
+   * an existing membership, and creating a member as a side effect of a mode switch would be a
+   * second door into the hand-entered allowlist (INVARIANT 14). A missing row changes nothing.
+   */
+  async setAutotraderMode(userId: number, mode: TraderMode): Promise<void> {
+    this.#db.prepare('UPDATE autotrader_users SET mode = ? WHERE user_id = ?').run(mode, userId);
+  }
+
+  /**
+   * PHASE 7 — is this buyer address one of ours in the wallet-mode sense?
+   *
+   * All three conditions are load-bearing:
+   *   * `site_links` — the address is bound to a Telegram user by the Phase 6 wallet-ownership
+   *     SIGNATURE. Not a self-declared address; a proven one.
+   *   * `mode = 'wallet'` — a key-mode user's buys are already attributed through `executions`,
+   *     and counting them here as well would double them into the aggregate.
+   *   * `locked = 0` — a revoked member is not a member (access.ts), here as everywhere else.
+   *
+   * Read per observed buy and NEVER cached. A cache is a revocation with a TTL, and when someone
+   * comes off the allowlist their trades must go back to carding as ordinary buys immediately.
+   */
+  async isWalletModeAddress(wallet: Wallet): Promise<boolean> {
+    return (
+      this.#db
+        .prepare<[string], { one: number }>(
+          `SELECT 1 AS one
+             FROM site_links s
+             JOIN autotrader_users u ON u.user_id = s.telegram_user_id
+            WHERE s.wallet_pubkey = ? AND u.mode = 'wallet' AND u.locked = 0
+            LIMIT 1`,
+        )
+        .get(wallet) !== undefined
+    );
+  }
+
+  /**
+   * PHASE 7 — the custody mode of one user.
+   *
+   * A MISSING OR LOCKED MEMBER READS AS 'wallet': the question this answers is "does the bot hold a
+   * key for this person and act on it", and for someone who is not (or is no longer) on the
+   * allowlist the answer is no.
+   */
+  async traderMode(userId: number): Promise<TraderMode> {
+    const row = this.#db
+      .prepare<[number], { mode: string; locked: number }>('SELECT mode, locked FROM autotrader_users WHERE user_id = ?')
+      .get(userId);
+    if (!row || row.locked === 1) return DEFAULT_MODE;
+    return isTraderMode(row.mode) ? row.mode : DEFAULT_MODE;
+  }
+
+  /**
+   * PHASE 7 — the SCHEDULER'S gate, and deliberately not `traderMode(u) === 'wallet'`.
+   *
+   * True only for a member whose row actually SAYS 'wallet'. The difference is the absent row:
+   * `traderMode` reads it as no-custody, which is right for "is the bot holding a key", but the
+   * scheduler is asking the narrower question "has this owner told me to stop signing". A missing
+   * row has told it nothing, and this phase adds a mode around the custodial scheduler rather than
+   * changing who that scheduler runs for.
+   */
+  async isWalletMode(userId: number): Promise<boolean> {
+    const row = this.#db
+      .prepare<[number], { mode: string }>('SELECT mode FROM autotrader_users WHERE user_id = ?')
+      .get(userId);
+    return row !== undefined && row.mode === 'wallet';
+  }
+
+  /** The proven wallet a member linked (Phase 6), or null. The panel's read-only view needs it. */
+  async walletForUser(userId: number): Promise<string | null> {
+    const row = this.#db
+      .prepare<[number], { wallet_pubkey: string }>('SELECT wallet_pubkey FROM site_links WHERE telegram_user_id = ?')
+      .get(userId);
+    return row?.wallet_pubkey ?? null;
+  }
+
+  /**
+   * PHASE 7 — record a wallet-mode DCA buy into the attribution set.
+   *
+   * INSERT OR IGNORE on the same key `buys` uses, so a gap-recovery replay of the same transaction
+   * collides with the row it already wrote. Without that, a reconnect would count one Jupiter fill
+   * twice in the aggregate — the same class of bug `claimSend` exists to prevent, one table over.
+   */
+  async recordWalletDcaBuy(signature: Signature, mint: Mint, buyer: Wallet, atMs: number): Promise<void> {
+    this.#db
+      .prepare(
+        `INSERT INTO wallet_dca_buys (signature, mint, buyer, at) VALUES (?, ?, ?, ?)
+         ON CONFLICT (signature, mint, buyer) DO NOTHING`,
+      )
+      .run(signature, mint, buyer, atMs);
+  }
+
+  /** Is this buy already attributed as a wallet-mode DCA? The suppression path's second question. */
+  async isWalletDcaBuy(signature: Signature): Promise<boolean> {
+    return (
+      this.#db
+        .prepare<[string], { one: number }>('SELECT 1 AS one FROM wallet_dca_buys WHERE signature = ? LIMIT 1')
+        .get(signature) !== undefined
+    );
+  }
+
   async deleteAutotraderUser(userId: number): Promise<void> {
     this.#db.prepare('DELETE FROM autotrader_users WHERE user_id = ?').run(userId);
   }
@@ -1992,23 +2098,69 @@ export class SqliteRepo implements Repo {
   }
 
   /**
-   * The DCA-attributed buys for a mint inside a window, as raw rows. Bucketed by the EXECUTION's
-   * planned_at (the scheduled slot) rather than block_time: it is always present, always ms, and it
-   * is what makes the tumbling window deterministic and testable.
+   * The DCA-attributed buys for a mint inside a window, as raw rows.
+   *
+   * TWO SOURCES, ONE SET (Phase 7). Both halves of the attribution set land here and nowhere else,
+   * which is what lets a wallet-mode DCA reach the aggregate card, the tumbling window, the flush
+   * cursor and the disclosure copy through the EXACT Phase 16 path with no second pipeline:
+   *
+   *   * `executions` — a custodial send. Bucketed by the execution's `planned_at`: the scheduled
+   *     slot is always present, always ms, and it is what makes the window deterministic.
+   *   * `wallet_dca_buys` — a Jupiter recurring order the USER's own wallet signed. There is no
+   *     planned_at to bucket by, because the bot did not plan it; the row carries the buy's own
+   *     time (block time where the chain gave us one), stamped once at write time.
+   *
+   * The NOT EXISTS on the second branch is what makes UNION ALL safe. A signature could in
+   * principle reach both tables — and a buy counted twice would overstate a wallet's grains on a
+   * card whose entire purpose is honest disclosure. The custodial row wins because it is the more
+   * specific fact: we know we sent it.
    *
    * Returns rows, NOT a SQL SUM: tokens_raw is a u64 held as TEXT and SQLite's SUM would round it
    * through a float and drop the low bits (INVARIANT 6). The caller sums with BigInt.
    */
   async dcaBuysInWindow(mint: Mint, fromMs: number, toMs: number): Promise<readonly { buyer: string; tokensRaw: bigint }[]> {
     return this.#db
-      .prepare<[string, number, number], { buyer: string; tokens_raw: string }>(
+      .prepare<[string, number, number, string, number, number], { buyer: string; tokens_raw: string }>(
         `SELECT b.buyer AS buyer, b.tokens_raw AS tokens_raw
            FROM buys b
            JOIN executions e ON e.signature = b.signature
-          WHERE b.mint = ? AND e.planned_at >= ? AND e.planned_at < ?`,
+          WHERE b.mint = ? AND e.planned_at >= ? AND e.planned_at < ?
+          UNION ALL
+         SELECT b.buyer AS buyer, b.tokens_raw AS tokens_raw
+           FROM buys b
+           JOIN wallet_dca_buys w ON w.signature = b.signature AND w.mint = b.mint AND w.buyer = b.buyer
+          WHERE b.mint = ? AND w.at >= ? AND w.at < ?
+            AND NOT EXISTS (SELECT 1 FROM executions e2 WHERE e2.signature = b.signature)`,
       )
-      .all(mint, fromMs, toMs)
+      .all(mint, fromMs, toMs, mint, fromMs, toMs)
       .map((r) => ({ buyer: r.buyer, tokensRaw: BigInt(r.tokens_raw) }));
+  }
+
+  /**
+   * PHASE 7 — a wallet-mode member's own recent DCA buys, newest first.
+   *
+   * This is the panel's READ-ONLY view: on-chain fills the bot observed in the Helius stream it
+   * already watches, for the one wallet this user proved they own. It is NOT a list of their open
+   * Jupiter orders — the bot never asks Jupiter anything on their behalf, and the Mini App, which
+   * has their wallet connected, is where live order state belongs. Showing observed fills here and
+   * orders there keeps this surface at zero new outbound calls and zero new state.
+   */
+  async recentWalletDcaBuys(
+    wallet: Wallet,
+    mint: Mint,
+    limit: number,
+  ): Promise<readonly { tokensRaw: bigint; usdIn: number; at: number }[]> {
+    return this.#db
+      .prepare<[string, string, number], { tokens_raw: string; usd_in: number; at: number }>(
+        `SELECT b.tokens_raw AS tokens_raw, b.usd_in AS usd_in, w.at AS at
+           FROM wallet_dca_buys w
+           JOIN buys b ON b.signature = w.signature AND b.mint = w.mint AND b.buyer = w.buyer
+          WHERE w.buyer = ? AND w.mint = ?
+          ORDER BY w.at DESC
+          LIMIT ?`,
+      )
+      .all(wallet, mint, limit)
+      .map((r) => ({ tokensRaw: BigInt(r.tokens_raw), usdIn: r.usd_in, at: r.at }));
   }
 
   /** The last window this (chat, mint) already flushed, or null. Stops a double-count or a skip. */

@@ -6,6 +6,7 @@ import type { Mint } from '../core/types.js';
 import type { Caps, Schedule } from '../trade/scheduler.js';
 import type { LinkCodeStore, NonceStore } from './store.js';
 import { verifyWalletSignature } from './verify.js';
+import { verifyInitData } from './init-data.js';
 import { challengeMessage, linkMessage } from './messages.js';
 
 /**
@@ -25,6 +26,10 @@ export interface SiteBridgeRepo {
   /** Write the (telegram_user_id <-> wallet) mapping. Re-link REPLACES; never mutates a schedule. */
   linkSite(userId: number, wallet: string): Promise<void>;
   userForWallet(wallet: string): Promise<number | null>;
+  /** PHASE 8: the reverse lookup — the wallet a Telegram user proved they own. Read-only. */
+  walletForUser(userId: number): Promise<string | null>;
+  /** PHASE 8: the user's custody mode, so the Mini App can say which half they are in. */
+  traderMode(userId: number): Promise<'wallet' | 'key'>;
   listSchedules(userId: number): Promise<readonly Schedule[]>;
   getCaps(userId: number, mint: Mint): Promise<Caps | null>;
   usdSpent24h(userId: number, mint: Mint, sinceMs: number): Promise<number>;
@@ -38,6 +43,13 @@ export interface SiteBridgeDeps {
   readonly secret: string;
   readonly log: Logger;
   readonly now?: () => number;
+  /**
+   * PHASE 8. The bot token, used ONLY to verify a Mini App's `initData` HMAC — never sent
+   * anywhere, never logged, never returned. Absent = the Mini App identity route is not mounted at
+   * all, which is the right failure: a route that cannot verify identity must not exist rather
+   * than fall back to trusting the caller.
+   */
+  readonly botToken?: string | undefined;
 }
 
 const DAY_MS = 86_400_000;
@@ -195,6 +207,48 @@ export function createSiteBridgeRoute(deps: SiteBridgeDeps): RouteHandler {
         const schedules = await deps.repo.listSchedules(userId);
         const dto = await Promise.all(schedules.map((s) => scheduleDto(deps.repo, s, now)));
         sendJson(res, 200, { ok: true, linked: true, schedules: dto });
+      });
+      return true;
+    }
+
+    /**
+     * PHASE 8 — the Mini App asks "who am I, and which wallet is mine?".
+     *
+     * The ONLY thing this returns is an ADDRESS the user already proved they own (Phase 6) plus
+     * their custody mode. No key, no signature, no schedule mutation, no ability to act. The Mini
+     * App uses the address to read that wallet's open Jupiter orders — a public, on-chain read it
+     * could perform for any address it happened to know; the bridge's job is only to say WHICH
+     * address belongs to this Telegram user, which is the one part the browser cannot establish
+     * for itself.
+     *
+     * Mounted only when a bot token is available to check the signature with. Identity that
+     * cannot be verified is not degraded gracefully — the route simply is not there.
+     */
+    if (req.method === 'POST' && path === '/site/tma-wallet') {
+      if (deps.botToken === undefined || deps.botToken.length === 0) {
+        sendJson(res, 404, { ok: false, error: 'not found' });
+        return true;
+      }
+      readJsonBody(req, res, deps.log, async (body) => {
+        const initData = body.initData;
+        if (typeof initData !== 'string') {
+          sendJson(res, 400, { ok: false, error: 'initData is required' });
+          return;
+        }
+        const verdict = verifyInitData(initData, deps.botToken as string, now());
+        if (!verdict.ok || verdict.userId === undefined) {
+          // The REASON goes to the log, never to the caller. "stale" vs "bad-signature" tells an
+          // attacker which half of their forgery to work on; the operator debugging a real user
+          // needs it, and the log is where they will be looking.
+          deps.log.warn({ reason: verdict.reason }, 'site-bridge: rejected Mini App initData');
+          sendJson(res, 401, { ok: false, error: 'could not verify this Mini App session' });
+          return;
+        }
+        const [wallet, mode] = await Promise.all([
+          deps.repo.walletForUser(verdict.userId),
+          deps.repo.traderMode(verdict.userId),
+        ]);
+        sendJson(res, 200, { ok: true, linked: wallet !== null, wallet, mode });
       });
       return true;
     }

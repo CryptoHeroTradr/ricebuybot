@@ -75,6 +75,10 @@ beforeEach(async () => {
   await repo.init();
   // schedules.user_id REFERENCES autotrader_users — the owner must exist (foreign_keys = ON).
   await repo.addAutotraderUser(USER, 'tester', 1);
+  // PHASE 7: a new member is a WALLET-mode member and the scheduler will not sign for them. This
+  // whole file is about the CUSTODIAL scheduler, so its user has to be the custodial kind — stated
+  // here rather than assumed, which is the point of the mode existing at all.
+  await repo.setAutotraderMode(USER, 'key');
 });
 
 afterEach(async () => {

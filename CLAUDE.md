@@ -26,6 +26,140 @@ These are load-bearing. Do not violate them, and do not "temporarily" work aroun
 12. **ONE parser. `normalizeSwap` classifies every transaction, live and backfilled. Never write a second classifier — and never put a classification (`kind`) in an identity key.**
 13. **A free receipt is not an unpriced purchase. Never price an unvaluable leg — ABSTAIN. `usd_value = 0` is the truth only when nothing was given up.**
 
+### Autotrader modes (Phase 7)
+
+**The autotrader has two halves, and the difference between them is WHO HOLDS THE KEY.**
+`autotrader_users.mode` (migration 019) is `'wallet' | 'key'`, per user, and nothing else in the
+system may set it — no plan, no flag, no owner command. Same shape as INVARIANT 14: the mode is
+moved by the member, through `/mode`, and by nothing else.
+
+| | wallet (**DEFAULT**) | key (opt-in) |
+| --- | --- | --- |
+| keystore | none. `/wallet import` and `/wallet generate` are **refused** | the Phase 12 keystore |
+| scheduler | **no tick**, ever — gated on the tick's work list | phases 13–16, unchanged |
+| signing | nothing | the Signer, unchanged |
+| `/trade` | Mini App launch point + read-only view of observed fills | the full control panel |
+| DCA lives in | the user's own wallet, as Jupiter recurring orders | our `schedules` table |
+
+**A new member is a wallet-mode member.** Sending someone else your private key must never be the
+path of least resistance — it has to be chosen, on purpose, against the Phase 12 custody warning
+shown verbatim (`mode.ts` *calls* `exposureWarning()`; it does not re-type it) and a typed
+acknowledgement. Migration 019 backfills every **pre-existing** row to `'key'`, which is not the
+abstention principle being broken but applied: those rows were written when custody was the only
+thing membership meant, and letting the new default fall on them would assert the wallet-mode claim
+about exactly the people it is false for — stopping live schedules and disowning keys still on disk.
+
+**Switching is asymmetric, deliberately.** `wallet -> key` is gated on *understanding* (nothing
+about a user's state can make handing over a key safe). `key -> wallet` is gated on *state*: it is
+**refused while any custodial schedule is active**, because the switch locks the key and a running
+schedule that suddenly cannot sign is a failure its owner did not ask for. Stop them first.
+
+**The key is LOCKED, never destroyed** (INVARIANT 14) — and the message that confirms the switch is
+also the one that tells them to `/wallet export` and withdraw. A locked key someone has forgotten
+about is a wallet whose funds quietly become unreachable; `/trader purge` remains the only thing
+that deletes it.
+
+**The mode is on line two of `/trade`, under the LIVE/DRY banner, always.** Same reasoning as
+RULE A: a person must be able to *see* whether the bot is holding a key that can spend their money,
+never infer it from which controls happen to be missing. Wallet mode renders a **different panel**,
+not the custodial one with the buttons greyed out — there is no wallet to unlock, no cap to set and
+no schedule of ours to pause, and every disabled control is an invitation to ask why.
+
+#### Wallet-mode buy-card attribution — the same card, zero new pipeline
+
+A Jupiter recurring order buys from the user's own wallet, on-chain, in the **same Helius stream the
+bot already watches**. Phase 16 asked "is this buy a DCA?" as "does its signature have an
+`executions` row". Wallet mode adds the second half of that set, and both halves land in **one**
+query (`dcaBuysInWindow`) and **one** answer (`telegram/dca-attribution.ts`), so a wallet-mode fill
+reaches the existing aggregate card, tumbling window, flush cursor and claim key with nothing new
+bolted on. A split answer is how a buy ends up suppressed from the organic feed by one rule and
+dropped from the aggregate by another — which is worse than either, because the buy vanishes and an
+automated buy the group was never told about is exactly what the disclosure card exists to prevent.
+
+A buy is a wallet-mode DCA iff **both** hold:
+
+1. the buyer address belongs to an allowlisted, **unlocked**, wallet-mode member — proven by the
+   Phase 6 wallet-ownership signature that wrote `site_links`. Read per buy and **never cached**: a
+   revoked member's buys must go back to carding organically *now*, not at the end of a TTL.
+2. the transaction touched a **Jupiter recurring-order program**.
+
+**Condition 2 is the judgement call, and it is deliberately conservative.** A linked villager who
+opens their wallet and apes in by hand has automated nothing; rolling that trade into a card headed
+"automatic" would be the bot asserting something false about a person's behaviour *and* robbing
+their manual buy of the organic card it has every right to. Under-attributing costs a roll-up;
+over-attributing publishes a lie. We take the first — and only `viaRecurringProgram === true` is
+ever evidence, so an absent flag can never promote a manual buy.
+
+**`src/ingest/recurring.ts` is not the per-DEX decoder INVARIANT 1 forbids.** Invariant 1 governs
+swap *detection* — what moved, who moved it, what it was worth — and nothing here touches any of it:
+`normalizeSwap` does not import this module and will classify a transaction identically whether the
+check says yes, no, or is never called. What this answers is one downstream question about how a
+buy was *initiated*, asked only of wallets we already have a proven identity link to, by **set
+membership over account keys** (including ALT-loaded ones — Jupiter routes live in lookup tables).
+No instruction is read and no layout is assumed, so a program that reorders its accounts breaks
+decoders but not this.
+
+The program-id set is **config** (`JUPITER_RECURRING_PROGRAM_IDS`), not a constant, because the
+correct set is a fact about the live chain rather than about this repo — Jupiter has shipped several
+generations of the recurring product. **The defaults are unverified against a live fill.** The
+failure mode is benign and visible (the buy cards as an ordinary organic buy) and fixable without a
+deploy; the effective set is logged at boot so "why did no DCA card fire" is answerable from the
+logs. An empty set attributes **nothing**, never everything.
+
+**The Creator Fee wallet rule is unchanged** — matched by address, whichever mode the buy arrived by.
+
+### The Mini App (Phase 8)
+
+**The bot's entire server-side role on the wallet-mode path is: open a webview, and answer one
+read.** It does not serve the Mini App, does not proxy Jupiter, does not see the transaction, holds
+no key and cannot sign. `/dca` and the wallet-mode `/trade` panel both open a Telegram `web_app`
+button pointing at `MINI_APP_URL`; the app itself is the **website's** `/tma` route.
+
+That split is not a convenience. A Mini App needs a public HTTPS origin, and the less of this path
+runs on the machine holding keys, the smaller the thing anyone has to trust. `test/mini-app.test.ts`
+greps every file on the path (`src/site-bridge/*`, `src/telegram/dca-command.ts`) for signing
+primitives and for runtime imports out of `src/trade/`, and fails on either. **The temptation the
+phase brief names — a server-side signer added "to make Telegram smoother" — would be send-key
+custody wearing wallet mode's label, and that test is what stops it landing quietly.**
+
+`web_app`, never a plain `url` button: only a `web_app` launch hands the page a signed `initData`,
+which is the only way it can prove to the bot which Telegram user is looking at it.
+
+#### `/site/tma-wallet` — identity in, an address out
+
+`initData` is signed with a key derived from the **bot token**, so only this process can verify it.
+That is the whole reason the endpoint exists: the website cannot check it (and must never hold the
+token — it is the one secret that lets you *be* the bot), and the browser's own claims about who it
+is are claims the user typed. See `src/site-bridge/init-data.ts` for Telegram's algorithm.
+
+What comes back is an **address and a mode, and nothing else** — asserted by test, including that
+the response body contains no key/secret/token-shaped field. The Mini App then reads that wallet's
+open Jupiter orders itself, straight from Jupiter: a public on-chain read anyone could do for any
+address. The bridge's only contribution is saying *which* address.
+
+Three independent gates, all required: the shared secret (site server → bot), a valid initData HMAC,
+and freshness (`auth_date` within 24h — a signature never expires, so a captured blob would
+otherwise be a permanent credential). Without a bot token the route **is not mounted at all** —
+identity that cannot be verified is absent, not degraded.
+
+#### Wallet connection in Telegram: the honest answer
+
+**Telegram's webview has no browser extensions and no injected wallet provider.** Wallet-adapter's
+Wallet Standard discovery finds nothing there — that is a property of the container, not a bug.
+Phantom's official answer for Mini Apps is still "use deeplinks", and Telegram's single-`startapp`
+return parameter makes that round trip lossy; the widely-used workaround is to send the user out to
+a page and have them come back.
+
+So **the Mini App composes and the browser signs.** It shows live orders and builds the order with
+every rail enforced, then hands the composed schedule to the site's `/dca` page — in the system
+browser, via `WebApp.openLink` — where the user's own wallet signs it. Nothing is retyped, and the
+signature is produced by the same wallet-adapter path the website has always used.
+
+An order created either way is **the same on-chain Jupiter order**, because neither frame stores
+orders: both read them live, by wallet address. That is what makes "create in Telegram, cancel on
+the site" work, and the site's `test/one-interface.test.ts` asserts the property it rests on — no
+storage, one Jupiter client, no second order endpoint.
+
 ### Autotrader (phases 12–16)
 
 **Phase 12 is built: key custody only. There is no trading.** `src/trade/` holds the allowlist,
@@ -757,6 +891,16 @@ timer, and only the timer, which is the failure nobody is watching.
 | `*.coinbase.com` | SOL/USD secondary | always |
 | the media host | `manifest.json` + media bytes | **only** when `MEDIA_SOURCE=http` |
 | `lite-api.jup.ag` (`JUPITER_API_URL`) | Jupiter swap quote + build (Phase 14) | **only** when `TRADE_LIVE=true` |
+
+**Phase 8 adds NO host either.** The Mini App is served by the website, from the user's Telegram
+client — this process never fetches it. `/site/tma-wallet` is an inbound request on the existing
+:3012 handler, and verifying `initData` is local HMAC over bytes already in hand.
+
+**Phase 7 adds NO host.** Wallet-mode DCA attribution never asks Jupiter anything: it compares
+configured program ids against account keys the bot already has in hand, and the wallet-mode panel
+lists fills observed in the Helius stream rather than fetching anyone's open orders. Live order
+state belongs to the Mini App, which has the user's wallet connected and talks to Jupiter from
+*their* browser, not from this process.
 
 Nothing else. No analytics, no crash reporter, no phone-home, in our code **or in any
 transitive dependency**. `pnpm audit:network` greps the entire *production* dependency tree

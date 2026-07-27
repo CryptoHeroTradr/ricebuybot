@@ -8,6 +8,7 @@ import type { RouteHandler } from './ops/health.js';
 import { LinkCodeStore, NonceStore } from './site-bridge/store.js';
 import { createSiteBridgeRoute } from './site-bridge/routes.js';
 import { registerLinkSiteCommand } from './site-bridge/command.js';
+import { registerDcaCommand } from './telegram/dca-command.js';
 import { FsMediaPool, HttpManifestSource, LocalFsSource } from './media/index.js';
 import { DeliveryQueue, DryRunSender, TelegramSender, fanOut, registerCommands, type Sender } from './telegram/index.js';
 import { Keystore } from './trade/keystore.js';
@@ -25,6 +26,8 @@ import { DigestScheduler } from './telegram/trade-digest.js';
 import { InputArbiter, registerCancelCommand, registerStopCommand } from './telegram/input-arbiter.js';
 import { registerCuration } from './telegram/curate/index.js';
 import { DcaFlusher, registerDcaWindowCommand } from './telegram/dca-flush.js';
+import { makeDcaAttribution } from './telegram/dca-attribution.js';
+import { makeRecurringProgramCheck, parseRecurringProgramIds } from './ingest/recurring.js';
 import { setPlanWhitelist } from './telegram/plan-gate.js';
 import { BurstDetector, DailyCap, digestText } from './telegram/digest.js';
 import { WalletValue } from './pricing/wallet-value.js';
@@ -149,10 +152,25 @@ async function main(): Promise<void> {
   });
 
   // --- ingestion --------------------------------------------------------------
+  //
+  // PHASE 7: the recurring-program check is built ONCE here and given to whichever adapter runs,
+  // so the WS and the webhook cannot disagree about it any more than they can about the parser.
+  // The effective set is logged because "why did no wallet-mode DCA card ever fire" has to be
+  // answerable from the boot log alone — these ids are a fact about the live chain, and
+  // JUPITER_RECURRING_PROGRAM_IDS is how they are corrected without a deploy.
+  const recurringProgramIds = parseRecurringProgramIds(cfg.JUPITER_RECURRING_PROGRAM_IDS);
+  const isRecurring = makeRecurringProgramCheck(recurringProgramIds);
+  log.info(
+    { programIds: recurringProgramIds, overridden: cfg.JUPITER_RECURRING_PROGRAM_IDS !== undefined },
+    recurringProgramIds.length > 0
+      ? 'wallet-mode DCA attribution: recurring programs armed'
+      : 'wallet-mode DCA attribution: DISABLED (empty program set) — linked wallets card as organic buys',
+  );
+
   const ingestor: Ingestor =
     cfg.INGEST_MODE === 'webhook'
-      ? new HeliusWebhookIngestor(cfg.WEBHOOK_SECRET as string, { log, repo, solUsd: () => feed.solUsd() })
-      : new HeliusWsIngestor(cfg.HELIUS_WS_URL, { log, repo, solUsd: () => feed.solUsd() });
+      ? new HeliusWebhookIngestor(cfg.WEBHOOK_SECRET as string, { log, repo, solUsd: () => feed.solUsd(), isRecurring })
+      : new HeliusWsIngestor(cfg.HELIUS_WS_URL, { log, repo, solUsd: () => feed.solUsd(), isRecurring });
 
   // The webhook adapter mounts itself on the health port rather than opening a
   // second listener. Bound to 127.0.0.1 — put a reverse proxy in front of it.
@@ -165,7 +183,16 @@ async function main(): Promise<void> {
   const readNonces = new NonceStore();
   if (cfg.AUTOTRADER && cfg.SITE_BRIDGE_SECRET) {
     routes.push(
-      createSiteBridgeRoute({ repo, codes: linkCodes, nonces: readNonces, secret: cfg.SITE_BRIDGE_SECRET, log }),
+      createSiteBridgeRoute({
+        repo,
+        codes: linkCodes,
+        nonces: readNonces,
+        secret: cfg.SITE_BRIDGE_SECRET,
+        log,
+        // PHASE 8: used ONLY to verify a Mini App's initData HMAC (see site-bridge/init-data.ts).
+        // It never leaves this process. Without it the /site/tma-wallet route is not mounted.
+        botToken: cfg.TELEGRAM_BOT_TOKEN,
+      }),
     );
     log.info({}, 'site bridge (read-only) mounted on the health port');
   }
@@ -180,6 +207,11 @@ async function main(): Promise<void> {
 
   const queue = new DeliveryQueue({ repo, sender, log });
   shutdown.register('queue', () => queue.stop());
+
+  // PHASE 7: the one place that answers "is this buy a DCA". Feeds the suppression check in the
+  // buy handler below and, by writing wallet-mode fills into the attribution set, the flusher's
+  // window query — so both consumers can never disagree about one buy. See dca-attribution.ts.
+  const dcaAttribution = makeDcaAttribution({ repo, log });
 
   // Phase 16: the DCA flush loop. One aggregate card per (chat, mint, window), built from a query on
   // the buys table (restart-safe), suppressed from organic fan-out above. Runs regardless of the
@@ -315,12 +347,14 @@ async function main(): Promise<void> {
     await applier.onSwap(e, outcome);
     if (outcome.status !== 'priced') return;
 
-    // DCA SUPPRESSION (Phase 16): a buy that is one of OUR executions never fans out as an organic
-    // card — it is rolled into the per-window aggregate instead. Checked here, before tiering/media,
-    // so a DCA buy still recorded in `buys` (for the aggregate) never also posts a full buy card.
-    // Attribution does not wait for confirmation: a 'submitted'/'UNKNOWN' execution still counts.
-    if (await repo.isDcaSignature(e.signature)) {
-      log.debug({ signature: e.signature, mint: e.mint }, 'buy is a DCA execution — suppressed from organic fan-out, rolled into the aggregate');
+    // DCA SUPPRESSION (Phase 16, widened in Phase 7): a buy that is a DCA never fans out as an
+    // organic card — it is rolled into the per-window aggregate instead. Checked here, before
+    // tiering/media, so a DCA buy still recorded in `buys` (for the aggregate) never also posts a
+    // full buy card. Attribution does not wait for confirmation: a 'submitted'/'UNKNOWN' execution
+    // still counts. Both halves of the set — our custodial sends AND a wallet-mode member's own
+    // Jupiter recurring fills — answer through the one `isDca` above.
+    if (await dcaAttribution.isDca(e)) {
+      log.debug({ signature: e.signature, mint: e.mint }, 'buy is a DCA — suppressed from organic fan-out, rolled into the aggregate');
       return;
     }
 
@@ -624,6 +658,14 @@ async function main(): Promise<void> {
         // Routes through haltForWalletChange so the settings audit records the wallet change too.
         onWalletChanged: (userId: number) => haltForWalletChange(repo, userId),
         arbiter: inputArbiter,
+        // PHASE 7: key -> wallet is refused while anything is still running. Counted here rather
+        // than assumed, because "stop them first" is only a fair instruction if it is checked.
+        activeScheduleCount: async (userId: number) =>
+          (await repo.listSchedules(userId)).filter((s) => s.state === 'active').length,
+        // The mode lands in the SAME audit trail as every other setting a user turns, so
+        // /history settings answers "when did I hand over a key" without a second surface.
+        recordModeChange: (userId, from, to) =>
+          repo.recordSettingChange({ userId, action: 'mode', scheduleId: null, field: 'custody', fromValue: from, toValue: to }),
       });
 
       // /resolve <executionId> confirmed|failed — the human exit from an UNKNOWN outcome.
@@ -647,11 +689,23 @@ async function main(): Promise<void> {
         },
         tradeLive: cfg.TRADE_LIVE,
         defaultMint: cfg.DEFAULT_MINT,
+        // PHASE 7/8: the wallet-mode panel's launch button opens the Mini App. Absent
+        // MINI_APP_URL simply means no button — the read-only view still renders, and nothing
+        // pretends there is somewhere to go.
+        ...(cfg.MINI_APP_URL !== undefined ? { miniAppUrl: cfg.MINI_APP_URL } : {}),
         maxPerDayUsdCeiling: cfg.MAX_PER_DAY_USD_CEILING,
         maxLifetimeUsdCeiling: cfg.MAX_LIFETIME_USD_CEILING,
         solUsd: () => feed.solUsd(),
         log,
         arbiter: inputArbiter,
+      });
+
+      // /dca — PHASE 8: opens the Mini App. The bot's ENTIRE role on the wallet-mode DCA path.
+      registerDcaCommand(telegram.bot, {
+        repo,
+        log,
+        ...(cfg.MINI_APP_URL !== undefined ? { miniAppUrl: cfg.MINI_APP_URL } : {}),
+        ...(cfg.SITE_URL !== undefined ? { siteUrl: cfg.SITE_URL } : {}),
       });
 
       // /linksite — mints the one-time code for the read-only site bridge. Members only; SENDS

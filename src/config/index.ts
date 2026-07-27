@@ -76,6 +76,24 @@ const EnvSchema = z
     /** Optional site URL shown in the /linksite DM (cosmetic). */
     SITE_URL: z.string().url('must be a URL').optional(),
 
+    /**
+     * PHASE 8 — the Telegram Mini App's URL (the site's /tma route).
+     *
+     * MUST BE HTTPS: Telegram refuses to open a `web_app` button on anything else, and it must be
+     * a public origin — a Mini App is loaded by the user's Telegram client, not by this process.
+     * It points at the WEBSITE, which already serves the shared Swap/DCA UI over TLS; the bot has
+     * no static-asset server and deliberately gains none, because the less of this path runs on
+     * the machine holding keys, the smaller the thing anyone has to trust.
+     *
+     * Absent = no Mini App buttons anywhere. The /dca command then explains where to go instead of
+     * opening a button that would fail, which is the honest degradation.
+     */
+    MINI_APP_URL: z
+      .string()
+      .url('must be a URL')
+      .refine((u) => u.startsWith('https://'), 'must be https — Telegram refuses to open a Mini App over http')
+      .optional(),
+
     /** What a stablecoin quote is worth in USD. A depeg is not ours to paper over. */
     STABLE_USD: z.coerce.number({ message: 'must be a number' }).positive('must be > 0').default(1.0),
     /** Value whale holdings on the post-trade balance (default) or the pre-trade one. */
@@ -198,6 +216,27 @@ const EnvSchema = z
 
     /** Phase 16: the wallet whose DCA line renders as "Creator Fee" instead of an address. Optional. */
     CREATOR_FEE_WALLET: z.string().regex(BASE58, 'must be a base58 address').optional(),
+
+    /**
+     * PHASE 7 — the Jupiter recurring-order programs that make a wallet-mode buy count as DCA.
+     *
+     * Comma-separated base58 program ids. Absent = the built-in defaults in
+     * `src/ingest/recurring.ts`; set = REPLACES them wholesale (an empty string therefore turns
+     * wallet-mode DCA attribution off entirely, which is a legitimate thing to want).
+     *
+     * It is config rather than a constant because the correct set is a fact about the live chain,
+     * not about this repo: Jupiter has shipped several generations of the recurring product, and
+     * being wrong here should be a one-line env fix, not a deploy. The effective set is logged at
+     * boot. This adds NO outbound host — it is a string compared against account keys we already
+     * have in hand.
+     */
+    JUPITER_RECURRING_PROGRAM_IDS: z
+      .string()
+      .refine(
+        (s) => s.split(',').every((p) => p.trim() === '' || BASE58.test(p.trim())),
+        'must be a comma-separated list of base58 program addresses',
+      )
+      .optional(),
 
     /** Phase 16 (6): the per-user daily digest DM. On by default (it only sends on an active day or a
      *  halt, so it is not noisy). Requires AUTOTRADER + a live bot (not DRY_RUN). */
