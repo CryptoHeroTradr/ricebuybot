@@ -207,23 +207,39 @@ async function main(): Promise<void> {
           symbolOf: async (mint: string) => (await tokenMeta.get(mint as Mint).catch(() => null))?.symbol ?? null,
         },
         /**
-         * PHASE 9 — the write surface. `repo` and `access` are THE SAME objects the Telegram panel
-         * is registered with below, and the ceilings are the same env values, because a guard that
-         * reads a different ceiling per surface is two guards. The panel's apply* functions do the
-         * work; this only hands them the same world.
+         * PHASE 9 — the write surface, and it is OPT-IN (SITE_BRIDGE_WRITES, default false).
+         *
+         * Undefined here means the six mutation routes are never mounted and 404 exactly as they
+         * did before the write path existed — the factory's own supported state, not a flag checked
+         * inside each handler. Whether this bot may be mutated from a website is a deployment
+         * decision, and an upgrade must not make it on the operator's behalf.
+         *
+         * When it IS on: `repo` and `access` are THE SAME objects the Telegram panel is registered
+         * with below, and the ceilings and the price feed are the same values, because a guard that
+         * reads a different ceiling — or a different SOL price — per surface is two guards. The
+         * panel's apply* functions do the work; this only hands them the same world.
          */
-        write: {
-          repo,
-          access: repo,
-          defaultMint: cfg.DEFAULT_MINT,
-          maxPerDayUsdCeiling: cfg.MAX_PER_DAY_USD_CEILING,
-          maxLifetimeUsdCeiling: cfg.MAX_LIFETIME_USD_CEILING,
-        },
+        write: cfg.SITE_BRIDGE_WRITES
+          ? {
+              repo,
+              access: repo,
+              defaultMint: cfg.DEFAULT_MINT,
+              maxPerDayUsdCeiling: cfg.MAX_PER_DAY_USD_CEILING,
+              maxLifetimeUsdCeiling: cfg.MAX_LIFETIME_USD_CEILING,
+              solUsd: () => feed.solUsd(),
+            }
+          : undefined,
       }),
     );
-    // Say WHICH it is. The bridge stopped being read-only in Phase 9, and an operator reading a
-    // boot log should learn that from the log rather than from a surprise.
-    log.info({}, 'site bridge mounted on the health port (reads + gated writes)');
+    // Say WHICH SURFACES ARE UP, separately and by name. "The bridge is mounted" is the sentence an
+    // operator would have to interpret; whether a website can currently pause their schedules is
+    // the thing they actually came to the boot log to find out.
+    log.info(
+      { reads: true, writes: cfg.SITE_BRIDGE_WRITES },
+      cfg.SITE_BRIDGE_WRITES
+        ? 'site bridge mounted on the health port — reads ON, writes ON (SITE_BRIDGE_WRITES=true)'
+        : 'site bridge mounted on the health port — reads ON, writes OFF (set SITE_BRIDGE_WRITES=true to enable)',
+    );
   }
 
   // --- delivery ----------------------------------------------------------------

@@ -410,7 +410,7 @@ export async function completePrompt(
     }
     case 'amount': {
       const { id, value } = idAndValue();
-      return applyAmount(repo, userId, id, value);
+      return applyAmount(repo, userId, id, value, solUsd);
     }
     case 'interval': {
       const { id, value } = idAndValue();

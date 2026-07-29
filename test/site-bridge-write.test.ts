@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { generateKeyPairSync, sign } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -19,6 +19,7 @@ import { KEY_ONLY_PATHS, KEY_REFUSAL, withAuditSource } from '../src/site-bridge
 import {
   applyAmount,
   applyCaps,
+  applyNew,
   applyInterval,
   applyPause,
   applyResume,
@@ -53,6 +54,9 @@ const USER_TWIN = 333;
 const SOL = 1_000_000_000n;
 const DAY_CEILING = 500;
 const LIFETIME_CEILING = 5_000;
+/** Live SOL/USD for the tests. Chosen so the $1 minimum buy lands on round numbers: at $200/SOL,
+ *  0.005 SOL is EXACTLY $1 (the boundary), and 0.004 SOL is $0.80 (below it). */
+const SOL_USD = 200;
 const log = createLogger('silent' as 'info', false);
 
 function makeWallet(): { address: string; sign: (m: string) => string } {
@@ -123,6 +127,9 @@ beforeEach(async () => {
       defaultMint: MINT,
       maxPerDayUsdCeiling: DAY_CEILING,
       maxLifetimeUsdCeiling: LIFETIME_CEILING,
+      // The SAME price feed the panel prices an edit against — see index.ts, which passes
+      // `() => feed.solUsd()` here. A different price per surface would be a different guard.
+      solUsd: () => SOL_USD,
     },
   });
   route = r as unknown as (req: unknown, res: unknown) => boolean;
@@ -309,6 +316,74 @@ describe('site bridge WRITE — the proof', () => {
   });
 });
 
+// ── 1b. THE SITE_BRIDGE_WRITES GATE ───────────────────────────────────────────────────────────
+
+/**
+ * The write surface is OPT-IN (SITE_BRIDGE_WRITES, default false), and reads do not depend on it.
+ *
+ * The flag is honoured at the COMPOSITION ROOT by supplying `write` or not — the factory's own
+ * supported state — rather than by a boolean checked inside each handler. A gate that lives in the
+ * handlers is a gate someone can forget to write into the seventh handler; a route that was never
+ * mounted cannot be reached by an endpoint nobody remembered to guard.
+ */
+describe('site bridge WRITE — off unless the operator turns it on', () => {
+  /** Mount the same bridge with the write surface present or absent, as index.ts does per the flag. */
+  function mountWith(writes: boolean): void {
+    const r = createSiteBridgeRoute({
+      repo, codes, nonces, secret: SECRET, log, now: () => clock,
+      dashboard: { tradeLive: false, defaultMint: MINT },
+      write: writes
+        ? { repo, access: repo, defaultMint: MINT, maxPerDayUsdCeiling: DAY_CEILING, maxLifetimeUsdCeiling: LIFETIME_CEILING, solUsd: () => SOL_USD }
+        : undefined,
+    });
+    route = r as unknown as (req: unknown, res: unknown) => boolean;
+  }
+
+  const MUTATION_PATHS = ['/site/pause', '/site/resume', '/site/stop-all', '/site/amount', '/site/interval', '/site/caps'];
+
+  it('OFF: all six mutation routes 404, and nothing can be changed through them', async () => {
+    const id = await seedSchedule(USER_A);
+    mountWith(false);
+
+    for (const p of MUTATION_PATHS) {
+      const r = await call('POST', p, { body: { wallet: wallet.address, scheduleId: id } });
+      expect(r.status, p).toBe(404);
+    }
+    // The challenge that would mint a proof for one is gone too — there is nothing to prove to.
+    expect((await call('POST', '/site/action-challenge', { body: { action: 'pause', scheduleId: id } })).status).toBe(404);
+    expect((await repo.getSchedule(id))!.state).toBe('active');
+  });
+
+  it('OFF: the READ still works — the flag gates writes, not the bridge', async () => {
+    await seedSchedule(USER_A);
+    mountWith(false);
+
+    const nonce = (await call('GET', '/site/challenge')).json.nonce as string;
+    const r = await call('POST', '/site/schedules', {
+      body: { wallet: wallet.address, nonce, signature: wallet.sign(challengeMessage(nonce)) },
+    });
+    expect(r.status).toBe(200);
+    expect(r.json.linked).toBe(true);
+    expect((r.json.schedules as unknown[]).length).toBe(1);
+  });
+
+  it('ON: the six routes mount and a signed write lands', async () => {
+    const id = await seedSchedule(USER_A);
+    mountWith(true);
+    expect((await signedWrite(wallet, 'pause', { scheduleId: id })).status).toBe(200);
+    expect((await repo.getSchedule(id))!.state).toBe('paused');
+  });
+
+  it('index.ts supplies the write surface ONLY under the flag', () => {
+    // The two tests above prove the factory honours `write: undefined`. This one proves the boot
+    // path actually decides it from SITE_BRIDGE_WRITES — the wiring between the flag and the
+    // factory is the part that would regress silently, because everything else still passes.
+    const src = readFileSync(join(import.meta.dirname, '..', 'src/index.ts'), 'utf8');
+    expect(src).toMatch(/write:\s*cfg\.SITE_BRIDGE_WRITES\s*\n?\s*\?/);
+    expect(src).toMatch(/:\s*undefined,/);
+  });
+});
+
 // ── 2. OWNERSHIP ──────────────────────────────────────────────────────────────────────────────
 
 describe('site bridge WRITE — acts only on the signer’s own schedules', () => {
@@ -442,7 +517,7 @@ describe('site bridge WRITE — a guard that blocks the panel blocks the site, i
 
     for (const bad of ['0', '-1', 'abc']) {
       const site = await signedWrite(wallet, 'amount', { scheduleId: mine, amount: bad });
-      const panel = await applyAmount(repo, USER_TWIN, theirs, bad);
+      const panel = await applyAmount(repo, USER_TWIN, theirs, bad, SOL_USD);
       expect(site.status).toBe(400);
       expect(site.json.error).toBe(panel.message);
     }
@@ -450,24 +525,47 @@ describe('site bridge WRITE — a guard that blocks the panel blocks the site, i
   });
 
   /**
-   * THE $1 MINIMUM BUY, HONESTLY.
+   * THE $1 MINIMUM BUY, ON AN EDIT.
    *
-   * It is enforced at CREATION (`applyNew`, when the buy can be priced) and again at EXECUTION
-   * (the scheduler skips a sub-$1 buy with a reason). An AMOUNT EDIT is floor-checked by neither
-   * surface — and the site must not grow a guard the panel does not have, because a rule enforced
-   * on one surface only is exactly the divergence this phase exists to prevent. So the test asserts
-   * the two agree, whatever they agree on: today they both accept it, and if that ever changes it
-   * has to change for both or this fails.
+   * This test used to assert that the two surfaces AGREED — and they did, on accepting a sub-$1
+   * edit, because the floor was checked at creation and at execution but nowhere in between. That
+   * made create-at-$2/edit-to-$0.50 a way around it from either surface. The agreement was real and
+   * the behaviour was wrong; now they agree on REFUSING, which is what the assertion says.
    */
-  it('a sub-$1 amount edit resolves identically on both surfaces (neither floors an edit)', async () => {
+  it('a sub-$1 amount edit is REFUSED, identically on both surfaces', async () => {
     const mine = await seedSchedule(USER_A);
     const theirs = await twin();
 
-    const dust = '0.0000001'; // ~$0.00002 of SOL
+    const dust = '0.004'; // $0.80 at $200/SOL
     const site = await signedWrite(wallet, 'amount', { scheduleId: mine, amount: dust });
-    const panel = await applyAmount(repo, USER_TWIN, theirs, dust);
-    expect(site.json.ok ?? false).toBe(panel.ok);
-    expect((await repo.getSchedule(mine))!.amountRaw).toBe((await repo.getSchedule(theirs))!.amountRaw);
+    const panel = await applyAmount(repo, USER_TWIN, theirs, dust, SOL_USD);
+
+    expect(site.status).toBe(400);
+    expect(panel.ok).toBe(false);
+    expect(site.json.error).toBe(panel.message);
+    expect(String(site.json.error)).toContain('below the $1 minimum buy');
+    // Neither schedule moved: a refused edit writes nothing on either surface.
+    expect((await repo.getSchedule(mine))!.amountRaw).toBe(SOL / 10n);
+    expect((await repo.getSchedule(theirs))!.amountRaw).toBe(SOL / 10n);
+  });
+
+  it('an edit AT or ABOVE the minimum still succeeds — the floor is `<`, not `<=`', async () => {
+    const mine = await seedSchedule(USER_A);
+
+    // Exactly $1.00 at $200/SOL. The boundary belongs to the user.
+    expect((await signedWrite(wallet, 'amount', { scheduleId: mine, amount: '0.005' })).status).toBe(200);
+    expect((await repo.getSchedule(mine))!.amountRaw).toBe(5_000_000n);
+
+    expect((await signedWrite(wallet, 'amount', { scheduleId: mine, amount: '0.05' })).status).toBe(200);
+    expect((await repo.getSchedule(mine))!.amountRaw).toBe(50_000_000n);
+  });
+
+  it('creating below the floor and editing below it now refuse in the SAME words', async () => {
+    const mine = await seedSchedule(USER_A);
+    const created = await applyNew(repo, USER_TWIN, MINT, 'buy', '0.004', '60', clock, SOL_USD);
+    const edited = await signedWrite(wallet, 'amount', { scheduleId: mine, amount: '0.004' });
+    expect(created.ok).toBe(false);
+    expect(edited.json.error).toBe(created.message); // one sentence, one rule, two moments
   });
 
   it('an over-ceiling cap is refused with the same message — same ceiling, both surfaces', async () => {

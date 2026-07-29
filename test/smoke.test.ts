@@ -28,6 +28,19 @@ describe('config', () => {
     expect(cfg.BACKFILL_POSITIONS).toBe(true); // backfill is on by default (Phase 4)
   });
 
+  /**
+   * PHASE 9 — the write bridge is OPT-IN, and the default is the assertion.
+   *
+   * Every other gate on that path proves WHO is asking. None of them answers whether the operator
+   * meant this bot to be mutable from a website at all, and an upgrade must not decide that for
+   * them: a deploy of new code has to leave the surface exactly as narrow as it was.
+   */
+  it('SITE_BRIDGE_WRITES defaults to FALSE — a new deploy does not open the write bridge', () => {
+    expect(loadConfig(VALID_ENV).SITE_BRIDGE_WRITES).toBe(false);
+    expect(loadConfig({ ...VALID_ENV, SITE_BRIDGE_SECRET: 'a'.repeat(32) }).SITE_BRIDGE_WRITES).toBe(false);
+    expect(loadConfig({ ...VALID_ENV, SITE_BRIDGE_WRITES: 'true' }).SITE_BRIDGE_WRITES).toBe(true);
+  });
+
   it('reports EVERY problem at once, not just the first', () => {
     let caught: ConfigError | null = null;
     try {

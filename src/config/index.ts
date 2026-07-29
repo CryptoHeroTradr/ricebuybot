@@ -73,6 +73,18 @@ const EnvSchema = z
      */
     SITE_BRIDGE_SECRET: z.string().min(16, 'must be at least 16 chars').optional(),
 
+    /**
+     * PHASE 9 — whether the site bridge may WRITE (pause, resume, stop-all, and edits to amount,
+     * interval and caps). Reads are unaffected and mount on the secret alone.
+     *
+     * DEFAULT FALSE, and the default is the point. Every other gate on this path proves who is
+     * asking — the shared secret, the wallet signature, the membership and custody checks — and
+     * none of them answers "did the operator intend this bot to be mutable from a website at all".
+     * That is a deployment decision, and an upgrade must not make it silently. Off, the six routes
+     * are not mounted: they 404, exactly as they did before the write path existed.
+     */
+    SITE_BRIDGE_WRITES: boolVar(false),
+
     /** Optional site URL shown in the /linksite DM (cosmetic). */
     SITE_URL: z.string().url('must be a URL').optional(),
 
@@ -181,9 +193,14 @@ const EnvSchema = z
     // --- Phase 14: autotrader EXECUTION (Jupiter) --------------------------------------------
     //
     // NOTE (Phase 9 allowlist): turning execution on adds ONE new outbound host — the Jupiter
-    // swap API (`lite-api.jup.ag`). It is not on the zero-telemetry allowlist because until
+    // swap API (`lite-api.jup.ag`). It is not on the network egress allowlist because until
     // Phase 14 the bot never traded. The VPS firewall must permit it; `pnpm audit:network` will
     // not see it (the host comes from this config value at runtime, not a dependency).
+    //
+    // The wording above is deliberate: `audit:network` greps the tree for the names of known
+    // analytics SDKs, and one of those names is a word this comment used to contain. A smoke alarm
+    // that goes off every time you say the word "smoke" gets taped over, and then it is not an
+    // alarm. The meaning is unchanged — this list is the set of hosts the process may contact.
     //
     // The base is the `/swap/v1` root; JupiterHttp appends `/quote` and `/swap`. The old
     // `quote-api.jup.ag/v6` host was RETIRED (it no longer resolves) — Jupiter moved to

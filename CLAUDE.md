@@ -158,6 +158,13 @@ interval and caps — and nothing else. They are the ONLY way the website can ch
 and they exist so that a person who manages their DCA on the site is not sent back to Telegram to
 press pause.
 
+**Writes are OPT-IN: `SITE_BRIDGE_WRITES`, default false.** Reads mount on `SITE_BRIDGE_SECRET`
+alone and are unaffected by it. Off, the six routes are not mounted and 404 — the composition root
+simply does not supply the write surface, so the gate is the absence of a route rather than a
+boolean each handler has to remember to check. Every other gate on this path proves *who* is
+asking; none of them answers whether the operator meant this bot to be mutable from a website at
+all, and an upgrade must not decide that for them. The boot log names reads and writes separately.
+
 **One command layer, two entry points.** Every one of the six calls the SAME `apply*` function in
 `telegram/trade-panel/commands.ts` that the Telegram panel calls. Not a copy with the same rules
 retyped — the same function. This is the whole design, and everything else follows from it: a guard
@@ -167,6 +174,16 @@ because there is only one place where the rule exists. `test/site-bridge-write.t
 refusals by running the panel's `apply*` on an identical twin user and comparing the message
 character for character — a test that merely checked "the site refuses too" would still pass on the
 day the two surfaces start refusing differently.
+
+**The $1 minimum buy applies to an EDIT, not only to a creation.** It used to be checked in
+`applyNew` and again at execution and nowhere in between, so create at $2, edit to $0.50, and it was
+gone — from the panel, and over this bridge the moment it could write. `applyAmount` now prices the
+new amount against the same live SOL/USD feed the panel uses and refuses below the floor in
+`applyNew`'s exact words. The execution-time skip was never a substitute: it advances the slot and
+logs a reason, so the schedule sits there looking active and silently never trades, which is a worse
+answer than a refusal at the moment someone typed the number. The two cases it does not block are
+`applyNew`'s own, matched rather than reinvented — a percent-of-balance amount is not priceable
+until execution, and a null price feed is a transient outage that must not block an edit.
 
 **The gauntlet, in order, per request:**
 

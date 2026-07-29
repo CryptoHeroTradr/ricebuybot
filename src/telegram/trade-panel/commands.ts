@@ -77,6 +77,12 @@ async function audit(repo: PanelRepo, entry: SettingChangeInput): Promise<void> 
   }
 }
 
+/** The one sentence for a sub-minimum buy, so creating one and editing into one read alike — and
+ *  so the two surfaces cannot drift, since both reach it through the same apply*. */
+function belowMinBuy(usd: number): string {
+  return `that buy is about $${usd.toFixed(2)} — below the $${HARD_MIN_BUY_USD} minimum buy. Increase the amount.`;
+}
+
 /** Human-readable rendering of a schedule amount, for the audit trail (never for arithmetic). */
 export function describeAmount(side: Side, amountRaw: bigint, kind: AmountKind): string {
   if (kind === 'percent_of_balance') return `${Number(amountRaw) / 100}%`; // stored as bps
@@ -151,7 +157,7 @@ export async function applyNew(
   // is the backstop.
   if (side === 'buy' && amt.amountKind === 'absolute' && solUsd != null) {
     const usd = (Number(amt.amountRaw) / LAMPORTS_PER_SOL) * solUsd;
-    if (usd < HARD_MIN_BUY_USD) return err(`that buy is about $${usd.toFixed(2)} — below the $${HARD_MIN_BUY_USD} minimum buy. Increase the amount.`);
+    if (usd < HARD_MIN_BUY_USD) return err(belowMinBuy(usd));
   }
   const id = await repo.createSchedule({
     userId, mint: contract, side, amountRaw: amt.amountRaw, amountKind: amt.amountKind,
@@ -166,11 +172,42 @@ export async function applyNew(
   return ok(`Created schedule #${id}: ${side} every ${iv} min${capNote}.`);
 }
 
-export async function applyAmount(repo: PanelRepo, userId: number, id: number, amountRaw: string): Promise<ApplyResult> {
+/**
+ * THE MINIMUM BUY APPLIES TO AN EDIT, NOT ONLY TO A CREATION.
+ *
+ * It used to be checked in `applyNew` and again at execution, and nowhere in between — so create at
+ * $2, edit to $0.50, and the floor was gone. From the panel, and (once the site could write) over
+ * the bridge, since both reach this one function.
+ *
+ * The execution-time skip is not a substitute for refusing here. It advances the slot and logs a
+ * reason, so the schedule sits there looking active and silently never trades, and the person who
+ * set it is told nothing. A clean refusal at the moment they typed the number is the whole
+ * difference between "that is below the $1 minimum" and a DCA that mysteriously does nothing.
+ *
+ * `solUsd` HAS NO DEFAULT, unlike `applyNew`'s trailing one. A default would be `null`, and a call
+ * site that forgot to thread it would silently disable the floor again — which is precisely the bug
+ * being closed. Making it required means the compiler names every caller that has to care.
+ *
+ * The two cases it does NOT block are `applyNew`'s, matched deliberately rather than reinvented:
+ * a PERCENT-OF-BALANCE amount is not priceable until execution (the scheduler skips it there), and
+ * a NULL solUsd means the price feed is down — a transient outage must not block an edit, and the
+ * execution-time skip is the backstop for both.
+ */
+export async function applyAmount(
+  repo: PanelRepo,
+  userId: number,
+  id: number,
+  amountRaw: string,
+  solUsd: number | null,
+): Promise<ApplyResult> {
   const s = await ownedSchedule(repo, userId, id);
   if (isErr(s)) return s;
   const amt = parseAmount(amountRaw, s.side);
   if ('error' in amt) return err(amt.error);
+  if (s.side === 'buy' && amt.amountKind === 'absolute' && solUsd != null) {
+    const usd = (Number(amt.amountRaw) / LAMPORTS_PER_SOL) * solUsd;
+    if (usd < HARD_MIN_BUY_USD) return err(belowMinBuy(usd));
+  }
   await repo.setScheduleAmount(id, amt.amountRaw, amt.amountKind);
   await audit(repo, {
     userId, action: 'schedule.amount', scheduleId: id, field: 'amount',
@@ -390,7 +427,7 @@ export async function dispatchTradeCommand(
   const a = (i: number): string => tokens[i] ?? '';
   switch (sub) {
     case 'new': return applyNew(repo, userId, contract, a(1), a(2), a(3), now, solUsd);
-    case 'amount': return applyAmount(repo, userId, Number(a(1)), a(2));
+    case 'amount': return applyAmount(repo, userId, Number(a(1)), a(2), solUsd);
     case 'interval': return applyInterval(repo, userId, Number(a(1)), a(2));
     case 'slippage': return applySlippage(repo, userId, Number(a(1)), a(2));
     case 'pause': return applyPause(repo, userId, Number(a(1)));
