@@ -193,6 +193,20 @@ async function main(): Promise<void> {
         // It never leaves this process. Without it the /site/tma-wallet route is not mounted.
         botToken: cfg.TELEGRAM_BOT_TOKEN,
         /**
+         * PHASE 9 — what the site needs to render the panel's own picture.
+         *
+         * `tradeLive` is THE SAME cfg the panel banners from and the executor spends from, threaded
+         * rather than re-derived: the website must be able to say 🔴 LIVE / 🟡 DRY RUN as loudly as
+         * Telegram does, and it can only be right about that if it is reading the same flag.
+         */
+        dashboard: {
+          tradeLive: cfg.TRADE_LIVE,
+          defaultMint: cfg.DEFAULT_MINT,
+          // The panel's symbol source, and a failure is a fallback (the mint's first four chars),
+          // never an error — a metadata miss must not take the dashboard down.
+          symbolOf: async (mint: string) => (await tokenMeta.get(mint as Mint).catch(() => null))?.symbol ?? null,
+        },
+        /**
          * PHASE 9 — the write surface. `repo` and `access` are THE SAME objects the Telegram panel
          * is registered with below, and the ceilings are the same env values, because a guard that
          * reads a different ceiling per surface is two guards. The panel's apply* functions do the

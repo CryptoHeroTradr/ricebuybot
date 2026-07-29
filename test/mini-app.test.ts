@@ -92,6 +92,7 @@ async function mount(opts: { botToken?: string | undefined } = {}): Promise<void
     secret: SECRET,
     log,
     now: () => clock,
+    dashboard: { tradeLive: false, defaultMint: 'So11111111111111111111111111111111111111112' },
     botToken: 'botToken' in opts ? opts.botToken : BOT_TOKEN,
   });
   route = r as unknown as (req: unknown, res: unknown) => boolean;
@@ -249,6 +250,8 @@ describe('the Mini App server path holds no key and cannot sign', () => {
     'src/site-bridge/messages.ts',
     'src/site-bridge/command.ts',
     'src/site-bridge/mutations.ts',
+    'src/site-bridge/dashboard.ts',
+    'src/site-bridge/dashboard-contract.ts',
     'src/telegram/dca-command.ts',
   ];
 
@@ -331,7 +334,14 @@ describe('the Mini App server path holds no key and cannot sign', () => {
     const ALLOWED_OUTBOUND = [
       '../trade/access.js', // the allowlist gate
       '../trade/base58.js', // pure encoding, to VERIFY a wallet signature — never to make one
-      '../telegram/trade-panel/commands.js', // PHASE 9: the shared command layer
+      '../telegram/trade-panel/commands.js', // PHASE 9 (write): the shared command layer
+      // PHASE 9 (read): the dashboard returns the panel's own picture, so it reads the panel's own
+      // words and the digest's own arithmetic rather than keeping second copies of either. Both are
+      // PURE — render.ts is (data -> text) with no I/O by construction, and digestFigures is an
+      // array in, numbers out. Neither can reach a key, and the most important warning in the
+      // product cannot be reworded on one surface only if it exists in exactly one place.
+      '../telegram/trade-panel/render.js',
+      '../telegram/trade-digest.js',
     ];
     const dirPath = join(root, 'src/site-bridge');
     for (const file of readdirSync(dirPath).filter((f) => f.endsWith('.ts'))) {

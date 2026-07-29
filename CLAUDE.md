@@ -194,6 +194,41 @@ parameter would make attribution a thing each author has to remember. Migration 
 pre-existing rows backfill to `telegram`, which is **derived and not assumed** — the bridge held a
 repo surface with no mutation method on it, so no other surface could have written one.
 
+#### The read returns the panel's whole picture — `src/site-bridge/dashboard-contract.ts`
+
+`POST /site/schedules` answers with a **`SiteDashboard`**: the banner, the contract, every schedule
+(with its caps, spend-so-far, halt reason and last execution), account-level caps and spend, the
+last 10 executions, the 24h digest figures, and — in wallet mode — the proven wallet and the DCA
+fills the bot observed for it. Same data the `/trade` panel renders, same per-user reads
+(`listSchedules(userId)`, `getCaps(userId, mint)`, `listExecutionsForUser(userId, …)`).
+
+**`dashboard-contract.ts` is the contract and has NO IMPORTS, deliberately** — it is the one file
+the website copies (or pins by git ref) into its own tree, and anything it depended on would have to
+travel with it. Types and constants only; there is no runtime behaviour to drift between the repos.
+A test asserts the file stays import-free.
+
+**Nothing is re-derived that already has an owner.** The LIVE/DRY and custody sentences are
+`render.ts`'s own exported constants, and the 24h numbers come from `digestFigures()`, the function
+the daily DM renders from (extracted for exactly this reason). Two implementations of the same
+number is how a user reads "$40 spent" in a DM and "$38 spent" on the site and trusts neither.
+
+**The banner is the field that matters most.** It carries a boolean *and* the bot's own sentence:
+the boolean is what the site styles on, the sentence is what it prints, so the most important
+warning in the product cannot be reworded on one surface only. It is returned even to an **unlinked**
+wallet — whether the bot is trading live is a fact about the bot, not about the caller — and
+`tradeLive` has **no default** in the deps, because a default would have to be `false` and a wiring
+mistake would then show 🟡 DRY RUN while the bot spent real money. A type error at the composition
+root beats a reassuring banner that is wrong.
+
+**Wallet mode returns a different dashboard**, not the custodial one with empty rows — the same
+choice the panel makes. A wallet-mode member's custodial schedules are never ticked, so listing them
+beside controls that would refuse would describe machinery that is not running.
+
+**What it deliberately does NOT return: the custodial pubkey, or any balance derived from it.** The
+panel shows both; this does not, and the bridge has no keystore access to get them with. An address
+the bot derives from a key it holds is a fact about that key. The only address that comes back is
+the caller's own, which they proved by signing — telling someone their own address discloses nothing.
+
 **`resume` is the one endpoint that clears state rather than restricting it**, and it carries
 INVARIANT 16's guard: it cannot lift an UNKNOWN-outcome halt, on this surface or in Telegram. That
 guard was written *because* of this channel — the panel had the same back door, held shut only by

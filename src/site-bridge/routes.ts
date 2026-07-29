@@ -2,14 +2,13 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import type { RouteHandler } from '../ops/health.js';
 import type { Logger } from '../ops/logger.js';
-import type { Mint } from '../core/types.js';
-import type { Caps, Schedule } from '../trade/scheduler.js';
 import type { PanelRepo } from '../telegram/trade-panel/commands.js';
 import type { AutotraderAccessRepo } from '../trade/access.js';
 import type { LinkCodeStore, NonceStore } from './store.js';
 import { verifyWalletSignature } from './verify.js';
 import { verifyInitData } from './init-data.js';
 import { challengeMessage, linkMessage, writeMessage } from './messages.js';
+import { buildDashboard, unlinkedDashboard, type DashboardDeps, type SiteDashboardRepo } from './dashboard.js';
 import {
   applyIntent,
   authorizeWrite,
@@ -50,8 +49,9 @@ import {
 
 const MAX_BODY_BYTES = 8 * 1024;
 
-/** The narrow repo surface the bridge may touch — reads + the one identity write, nothing else. */
-export interface SiteBridgeRepo {
+/** The narrow repo surface the bridge may touch — reads + the one identity write, nothing else.
+ *  It extends {@link SiteDashboardRepo}, which is likewise every-method-a-SELECT. */
+export interface SiteBridgeRepo extends SiteDashboardRepo {
   /** Write the (telegram_user_id <-> wallet) mapping. Re-link REPLACES; never mutates a schedule. */
   linkSite(userId: number, wallet: string): Promise<void>;
   userForWallet(wallet: string): Promise<number | null>;
@@ -59,10 +59,8 @@ export interface SiteBridgeRepo {
   walletForUser(userId: number): Promise<string | null>;
   /** PHASE 8: the user's custody mode, so the Mini App can say which half they are in. */
   traderMode(userId: number): Promise<'wallet' | 'key'>;
-  listSchedules(userId: number): Promise<readonly Schedule[]>;
-  getCaps(userId: number, mint: Mint): Promise<Caps | null>;
-  usdSpent24h(userId: number, mint: Mint, sinceMs: number): Promise<number>;
-  usdSpentLifetime(userId: number, mint: Mint): Promise<number>;
+  // The dashboard reads — listSchedules, getCaps, the spend and execution reads — come from
+  // SiteDashboardRepo above. They are declared once, there, where the contract they serve is.
 }
 
 /**
@@ -93,14 +91,25 @@ export interface SiteBridgeDeps {
    */
   readonly botToken?: string | undefined;
   /**
+   * PHASE 9 — what the dashboard needs beyond the repo.
+   *
+   * REQUIRED, and `tradeLive` deliberately has no default. A default would have to be `false`, and
+   * a wiring mistake would then render 🟡 DRY RUN at someone while the bot spent their money — the
+   * exact failure RULE A exists to prevent. Better a type error at the composition root than a
+   * reassuring banner that is wrong.
+   */
+  readonly dashboard: {
+    readonly tradeLive: boolean;
+    readonly defaultMint: string;
+    readonly symbolOf?: ((mint: string) => Promise<string | null>) | undefined;
+  };
+  /**
    * PHASE 9. Absent = the six mutation routes are NOT MOUNTED and the bridge is read-only, the same
    * way an absent bot token means the Mini App identity route does not exist. A surface that cannot
    * be gated properly should be missing, not degraded.
    */
   readonly write?: SiteBridgeWrite | undefined;
 }
-
-const DAY_MS = 86_400_000;
 
 function sendJson(res: ServerResponse, status: number, obj: unknown): void {
   if (res.headersSent) return;
@@ -156,32 +165,16 @@ function readJsonBody(
   });
 }
 
-async function scheduleDto(repo: SiteBridgeRepo, s: Schedule, now: () => number): Promise<unknown> {
-  const [caps, spentTodayUsd, spentLifetimeUsd] = await Promise.all([
-    repo.getCaps(s.userId, s.mint),
-    repo.usdSpent24h(s.userId, s.mint, now() - DAY_MS),
-    repo.usdSpentLifetime(s.userId, s.mint),
-  ]);
-  return {
-    id: s.id,
-    mint: s.mint,
-    side: s.side,
-    amountKind: s.amountKind,
-    amountRaw: s.amountRaw.toString(), // bigint -> string for JSON
-    intervalMinutes: s.intervalMinutes,
-    slippageBps: s.slippageBps,
-    state: s.state,
-    haltReason: s.haltReason,
-    nextRunAt: s.nextRunAt,
-    lastRunAt: s.lastRunAt,
-    caps: caps ? { perExecUsd: caps.maxPerExecUsd, perDayUsd: caps.maxPerDayUsd, lifetimeUsd: caps.maxLifetimeUsd } : null,
-    spentTodayUsd,
-    spentLifetimeUsd, // the lifetime spend-so-far from migration 017
-  };
-}
 
 export function createSiteBridgeRoute(deps: SiteBridgeDeps): RouteHandler {
   const now = deps.now ?? Date.now;
+  const dashboardDeps: DashboardDeps = {
+    repo: deps.repo,
+    tradeLive: deps.dashboard.tradeLive,
+    defaultMint: deps.dashboard.defaultMint,
+    symbolOf: deps.dashboard.symbolOf,
+    now,
+  };
 
   return (req: IncomingMessage, res: ServerResponse): boolean => {
     const path = (req.url ?? '').split('?')[0] ?? '';
@@ -247,14 +240,17 @@ export function createSiteBridgeRoute(deps: SiteBridgeDeps): RouteHandler {
         }
         const userId = await deps.repo.userForWallet(wallet);
         if (userId === null) {
-          // Proven wallet, but not linked to any Telegram user — the site shows only on-chain orders.
-          sendJson(res, 200, { ok: true, linked: false, schedules: [] });
+          // Proven wallet, but not linked to any Telegram user. Still a complete answer: the site
+          // gets the banner (whether the bot is trading live is a fact about the bot, not about the
+          // caller) and empty sections. 'wallet' is the accurate mode for someone the bot holds no
+          // key for — the same reading `AutotraderAccess.mode` gives a non-member.
+          sendJson(res, 200, unlinkedDashboard(dashboardDeps));
           return;
         }
-        // Per-user isolation is listSchedules(userId)'s existing guarantee: only THIS user's rows.
-        const schedules = await deps.repo.listSchedules(userId);
-        const dto = await Promise.all(schedules.map((s) => scheduleDto(deps.repo, s, now)));
-        sendJson(res, 200, { ok: true, linked: true, schedules: dto });
+        // Per-user isolation is these reads' existing guarantee: every one is keyed by THIS userId,
+        // which came from the wallet that just proved itself and from nothing in the request body.
+        const mode = await deps.repo.traderMode(userId);
+        sendJson(res, 200, await buildDashboard(dashboardDeps, userId, mode, wallet));
       });
       return true;
     }

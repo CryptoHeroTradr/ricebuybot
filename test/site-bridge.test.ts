@@ -72,7 +72,10 @@ beforeEach(async () => {
   await repo.addAutotraderUser(USER_B, 'b', 1);
   codes = new LinkCodeStore(10 * 60_000, () => clock);
   nonces = new NonceStore(5 * 60_000, () => clock);
-  const r = createSiteBridgeRoute({ repo, codes, nonces, secret: SECRET, log, now: () => clock });
+  const r = createSiteBridgeRoute({
+    repo, codes, nonces, secret: SECRET, log, now: () => clock,
+    dashboard: { tradeLive: false, defaultMint: MINT },
+  });
   route = r as unknown as (req: unknown, res: unknown) => boolean;
 });
 afterEach(async () => {
@@ -157,6 +160,9 @@ describe('site bridge — READ', () => {
     const wA = makeWallet();
     const codeA = codes.issue(USER_A);
     await call('POST', '/site/link', { body: { wallet: wA.address, code: codeA, signature: wA.sign(linkMessage(wA.address, codeA)) } });
+    // KEY mode: the half with custodial schedules. A new member is a wallet-mode member (migration
+    // 019), and wallet mode returns a DIFFERENT dashboard — see the Phase 9 read tests.
+    await repo.setAutotraderMode(USER_A, 'key');
     const aId = await seedSchedule(USER_A);
     await seedSchedule(USER_B); // another user's schedule must NEVER appear
     await repo.setCaps({ userId: USER_A, mint: MINT, maxPerExecUsd: 50, maxPerDayUsd: 200, maxLifetimeUsd: 500 });

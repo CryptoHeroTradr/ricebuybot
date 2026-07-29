@@ -31,34 +31,70 @@ export interface DigestData {
 }
 
 /**
+ * The 24h numbers, computed once.
+ *
+ * Extracted from {@link buildDigest} when the site bridge started returning the same figures for
+ * the website's dashboard (Phase 9). They are the same numbers under the same counting rules, so
+ * they are computed in ONE place and rendered in two — a second implementation is how a user ends
+ * up reading "$40 spent" in a DM and "$38 spent" on the site and trusting neither.
+ *
+ * PURE: an array in, numbers out. No clock, no I/O, no formatting.
+ */
+export interface DigestFigures {
+  readonly executions: number;
+  readonly confirmed: number;
+  readonly submitted: number;
+  readonly unknown: number;
+  readonly failed: number;
+  /** How many executions contributed to `spentUsd` — 0 means "nothing priced", not "$0 spent". */
+  readonly spendingCount: number;
+  readonly spentUsd: number;
+  readonly avgTradeUsd: number;
+  readonly avgFillPriceUsd: number | null;
+}
+
+export function digestFigures(executions: readonly ExecutionRecord[]): DigestFigures {
+  const count = (s: ExecutionState): number => executions.filter((e) => e.state === s).length;
+
+  // Spend counts CONFIRMED + UNKNOWN — the same rule as the daily cap, because an UNKNOWN may
+  // have spent (INVARIANT 16). These are DISPLAY dollars (usd_value is REAL); INVARIANT 6 governs
+  // raw token/lamport integers, never a rendered dollar figure, so summing here is correct.
+  const spending = executions.filter((e) => (e.state === 'confirmed' || e.state === 'UNKNOWN') && e.usdValue != null);
+  const spentUsd = spending.reduce((sum, e) => sum + (e.usdValue ?? 0), 0);
+  const priced = executions.filter((e) => e.priceUsd != null);
+
+  return {
+    executions: executions.length,
+    confirmed: count('confirmed'),
+    submitted: count('submitted'),
+    unknown: count('UNKNOWN'),
+    failed: count('failed'),
+    spendingCount: spending.length,
+    spentUsd,
+    avgTradeUsd: spending.length > 0 ? spentUsd / spending.length : 0,
+    avgFillPriceUsd: priced.length > 0 ? priced.reduce((s, e) => s + (e.priceUsd ?? 0), 0) / priced.length : null,
+  };
+}
+
+/**
  * Render the 24h digest, or null when there is nothing worth a DM (no executions, no halts, no
  * changes). PURE — testable with no bot, no DB, no clock.
  */
 export function buildDigest(d: DigestData): string | null {
   if (d.executions.length === 0 && d.halted.length === 0 && d.settingChanges === 0) return null;
 
-  const count = (s: ExecutionState): number => d.executions.filter((e) => e.state === s).length;
-
+  const f = digestFigures(d.executions);
   const lines: string[] = ['📊 Your autotrader — last 24h', ''];
 
-  if (d.executions.length > 0) {
-    const parts = [`${count('confirmed')} confirmed`];
-    if (count('submitted') > 0) parts.push(`${count('submitted')} pending`);
-    if (count('UNKNOWN') > 0) parts.push(`${count('UNKNOWN')} ⚠️ UNKNOWN`);
-    if (count('failed') > 0) parts.push(`${count('failed')} failed`);
-    lines.push(`${d.executions.length} execution(s): ${parts.join(', ')}`);
+  if (f.executions > 0) {
+    const parts = [`${f.confirmed} confirmed`];
+    if (f.submitted > 0) parts.push(`${f.submitted} pending`);
+    if (f.unknown > 0) parts.push(`${f.unknown} ⚠️ UNKNOWN`);
+    if (f.failed > 0) parts.push(`${f.failed} failed`);
+    lines.push(`${f.executions} execution(s): ${parts.join(', ')}`);
 
-    // Spend counts CONFIRMED + UNKNOWN — the same rule as the daily cap, because an UNKNOWN may
-    // have spent (INVARIANT 16). These are DISPLAY dollars (usd_value is REAL); INVARIANT 6 governs
-    // raw token/lamport integers, never a rendered dollar figure, so summing here is correct.
-    const spending = d.executions.filter((e) => (e.state === 'confirmed' || e.state === 'UNKNOWN') && e.usdValue != null);
-    const totalSpent = spending.reduce((sum, e) => sum + (e.usdValue ?? 0), 0);
-    const avgTrade = spending.length > 0 ? totalSpent / spending.length : 0;
-    const priced = d.executions.filter((e) => e.priceUsd != null);
-    const avgFill = priced.length > 0 ? priced.reduce((s, e) => s + (e.priceUsd ?? 0), 0) / priced.length : null;
-
-    const spendLine = spending.length > 0 ? `Spent ${usd(totalSpent)} · avg ${usd(avgTrade)}/trade` : 'Spent $0';
-    lines.push(avgFill != null ? `${spendLine} · avg fill $${avgFill.toPrecision(4)}` : spendLine);
+    const spendLine = f.spendingCount > 0 ? `Spent ${usd(f.spentUsd)} · avg ${usd(f.avgTradeUsd)}/trade` : 'Spent $0';
+    lines.push(f.avgFillPriceUsd != null ? `${spendLine} · avg fill $${f.avgFillPriceUsd.toPrecision(4)}` : spendLine);
   }
 
   if (d.solBalanceLamports != null) {

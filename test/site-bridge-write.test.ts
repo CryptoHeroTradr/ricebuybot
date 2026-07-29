@@ -116,6 +116,7 @@ beforeEach(async () => {
     secret: SECRET,
     log,
     now: () => clock,
+    dashboard: { tradeLive: false, defaultMint: MINT },
     write: {
       repo,
       access: repo,
