@@ -194,6 +194,12 @@ parameter would make attribution a thing each author has to remember. Migration 
 pre-existing rows backfill to `telegram`, which is **derived and not assumed** — the bridge held a
 repo surface with no mutation method on it, so no other surface could have written one.
 
+**`resume` is the one endpoint that clears state rather than restricting it**, and it carries
+INVARIANT 16's guard: it cannot lift an UNKNOWN-outcome halt, on this surface or in Telegram. That
+guard was written *because* of this channel — the panel had the same back door, held shut only by
+`quarantineUnresolvedOnBoot` re-halting at the next restart, and a signed `/site/resume` made it
+reachable without anyone opening the bot.
+
 **What this channel will never do: take custody of a key.** No import, no generate, no
 create-a-schedule-with-a-new-wallet. Those paths are refused **by name** with *"manage your wallet in
 the bot"* rather than 404'd, because "that route does not exist" and "that will never be offered
@@ -243,6 +249,17 @@ hold a key that can spend.
 15. A signing key never touches a log line, an error message, a Telegram message, or any table. Keystores are per-user and per-passphrase: one leak is one wallet, never all of them. There is no master key.
 
 16. A swap of uncertain outcome is NEVER retried. Mark it UNKNOWN, halt that user's schedules, require human resolution. An RPC timeout is not a failed transaction — it may still confirm, and a blind retry is a double-buy with real money.
+
+    **"Human resolution" means `/resolve`, and RESUME IS NOT A SECOND EXIT.** `applyResume` and
+    `applyResumeAll` refuse a schedule with an unresolved UNKNOWN execution and name the `/resolve`
+    to run, on **both** surfaces, because both call the same function. Ordinary halts — a cap
+    breach, a contract or wallet change, the kill switch, a manual pause — still resume normally.
+    The discriminator is `executions.state = 'UNKNOWN'`, never the halt reason's prose: it is a
+    CHECK-constrained enum, it is what `quarantineUnresolvedOnBoot` keys on, and it is exactly the
+    state `/resolve` accepts — so what resume refuses and what `/resolve` clears are the same set by
+    construction, and cannot drift into a schedule that can neither resume nor be resolved.
+    `unhaltSchedule` stays unconditional for the executor's own resolution paths, which all settle
+    the execution first; a test pins the set of files allowed to call it.
 
 17. Every autotrader action is capped twice, PER USER: per-execution and per-rolling-24h. A bug that fires the loop 1000x must lose one person's daily cap, not everyone's wallet.
 

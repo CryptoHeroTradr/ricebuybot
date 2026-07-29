@@ -21,6 +21,7 @@ import {
   applyCaps,
   applyInterval,
   applyPause,
+  applyResume,
   WALLET_MODE_REFUSAL,
 } from '../src/telegram/trade-panel/commands.js';
 import type { Mint } from '../src/core/types.js';
@@ -358,6 +359,57 @@ describe('site bridge WRITE — acts only on the signer’s own schedules', () =
     expect(r.status).toBe(403);
     expect(r.json.error).toBe(WALLET_MODE_REFUSAL);
     expect((await repo.getSchedule(id))!.state).toBe('active');
+  });
+});
+
+// ── 2b. THE UNKNOWN GUARD, FROM THE SURFACE THAT MADE IT REACHABLE ────────────────────────────
+
+/**
+ * INVARIANT 16 over the bridge. The write path is why this guard had to exist as more than a
+ * convention: `/site/resume` reaches the same `applyResume` the panel's ▶️ does, so an UNKNOWN
+ * halt was one signed request away from being cleared by someone who had not looked at the chain.
+ */
+describe('site bridge WRITE — resume is not an exit from an UNKNOWN outcome', () => {
+  async function unknownHalted(userId: number): Promise<{ scheduleId: number; executionId: number }> {
+    const scheduleId = await seedSchedule(userId);
+    const executionId = (await repo.claimExecution(scheduleId, userId, clock))!;
+    await repo.settleExecution(executionId, { state: 'UNKNOWN', signature: 'sig-ambiguous' });
+    await repo.haltSchedule(scheduleId, `UNKNOWN outcome for execution ${executionId} (sig-ambiguous)`, clock);
+    return { scheduleId, executionId };
+  }
+
+  it('a signed resume of an UNKNOWN-halted schedule is refused, pointing at /resolve in the bot', async () => {
+    const { scheduleId, executionId } = await unknownHalted(USER_A);
+
+    const r = await signedWrite(wallet, 'resume', { scheduleId });
+    expect(r.status).toBe(400);
+    expect(String(r.json.error)).toContain(`/resolve ${executionId} confirmed|failed`);
+    expect((await repo.getSchedule(scheduleId))!.state).toBe('halted');
+
+    // Word for word what a Telegram user is told — one guard, one sentence, two surfaces.
+    const panel = await applyResume(repo, USER_A, scheduleId);
+    expect(r.json.error).toBe(panel.message);
+  });
+
+  it('stop-all still works on it — pausing an ambiguous schedule is always safe', async () => {
+    const { scheduleId } = await unknownHalted(USER_A);
+    const other = await seedSchedule(USER_A);
+    expect((await signedWrite(wallet, 'stop-all')).status).toBe(200);
+    expect((await repo.getSchedule(other))!.state).toBe('paused');
+    expect((await repo.getSchedule(scheduleId))!.state).toBe('halted'); // never un-halted
+  });
+
+  it('an ordinary halt still resumes from the site', async () => {
+    const id = await seedSchedule(USER_A);
+    await repo.haltSchedule(id, 'daily cap $200 reached', clock);
+    expect((await signedWrite(wallet, 'resume', { scheduleId: id })).status).toBe(200);
+    expect((await repo.getSchedule(id))!.state).toBe('active');
+  });
+
+  it('no audit row is written for the refused resume', async () => {
+    const { scheduleId } = await unknownHalted(USER_A);
+    await signedWrite(wallet, 'resume', { scheduleId });
+    expect(await repo.listSettingChanges(USER_A, 10)).toHaveLength(0);
   });
 });
 
