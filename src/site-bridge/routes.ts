@@ -4,19 +4,48 @@ import type { RouteHandler } from '../ops/health.js';
 import type { Logger } from '../ops/logger.js';
 import type { Mint } from '../core/types.js';
 import type { Caps, Schedule } from '../trade/scheduler.js';
+import type { PanelRepo } from '../telegram/trade-panel/commands.js';
+import type { AutotraderAccessRepo } from '../trade/access.js';
 import type { LinkCodeStore, NonceStore } from './store.js';
 import { verifyWalletSignature } from './verify.js';
 import { verifyInitData } from './init-data.js';
-import { challengeMessage, linkMessage } from './messages.js';
+import { challengeMessage, linkMessage, writeMessage } from './messages.js';
+import {
+  applyIntent,
+  authorizeWrite,
+  parseIntent,
+  withAuditSource,
+  KEY_ONLY_PATHS,
+  KEY_REFUSAL,
+  NOT_LINKED,
+  SITE_WRITE_PATHS,
+  type ApplyIntentOptions,
+  type SiteIntent,
+} from './mutations.js';
 
 /**
  * The bot side of the site bridge, mounted on the EXISTING :3012 handler (like the webhook
- * ingestor) — no second listener. STRUCTURALLY read-only: this handler is given a repo surface
- * ({@link SiteBridgeRepo}) that has NO schedule-mutation method, so no /site/* route can pause,
- * edit, create, stop or delete a schedule. The only write it can do is the identity link itself.
+ * ingestor) — no second listener.
  *
- * Every request must carry the shared secret (site server -> bot). Every read must carry a fresh,
- * bot-minted nonce and a wallet signature over it — a replayed proof dies with its consumed nonce.
+ * READS are structurally read-only: they are given a repo surface ({@link SiteBridgeRepo}) with no
+ * schedule-mutation method on it at all, so no read route can pause, edit, create, stop or delete
+ * anything. That was the whole of this file until Phase 9.
+ *
+ * PHASE 9 ADDS A WRITE PATH, and it is deliberately a SEPARATE, OPTIONAL surface ({@link
+ * SiteBridgeWrite}) rather than a widening of the read repo. Absent, the six mutation routes are
+ * not mounted and this handler is exactly the read-only bridge it was before. Present, every one of
+ * them goes through the same gauntlet:
+ *
+ *   shared secret -> canonical intent -> wallet signature OVER THAT INTENT -> nonce consumed
+ *   -> wallet re-resolved to a Telegram user -> membership + custody mode re-checked
+ *   -> the Telegram panel's own apply* -> audited as source=site
+ *
+ * Every step is a refusal the panel also makes; none of them is implemented twice. What the bridge
+ * adds is proof of WHO is asking, which in Telegram is a property of the chat and here has to be
+ * established from a signature.
+ *
+ * The bot NEVER returns a key, a passphrase or any secret from any of these routes, and no route
+ * that would need the bot to take custody of key material exists at all ({@link KEY_ONLY_PATHS}).
  */
 
 const MAX_BODY_BYTES = 8 * 1024;
@@ -36,6 +65,19 @@ export interface SiteBridgeRepo {
   usdSpentLifetime(userId: number, mint: Mint): Promise<number>;
 }
 
+/**
+ * PHASE 9 — the write surface, supplied only when the site is allowed to change things.
+ *
+ * `repo` here is the panel's OWN repo interface, not a bridge-shaped subset of it, because the
+ * functions it is handed to are the panel's own. A narrower type would mean a second definition of
+ * what a schedule write needs, which is the thing this phase exists not to have.
+ */
+export interface SiteBridgeWrite extends ApplyIntentOptions {
+  readonly repo: PanelRepo;
+  /** The allowlist, re-read per request. Membership and custody mode are action-time facts. */
+  readonly access: AutotraderAccessRepo;
+}
+
 export interface SiteBridgeDeps {
   readonly repo: SiteBridgeRepo;
   readonly codes: LinkCodeStore;
@@ -50,6 +92,12 @@ export interface SiteBridgeDeps {
    * than fall back to trusting the caller.
    */
   readonly botToken?: string | undefined;
+  /**
+   * PHASE 9. Absent = the six mutation routes are NOT MOUNTED and the bridge is read-only, the same
+   * way an absent bot token means the Mini App identity route does not exist. A surface that cannot
+   * be gated properly should be missing, not degraded.
+   */
+  readonly write?: SiteBridgeWrite | undefined;
 }
 
 const DAY_MS = 86_400_000;
@@ -249,6 +297,121 @@ export function createSiteBridgeRoute(deps: SiteBridgeDeps): RouteHandler {
           deps.repo.traderMode(verdict.userId),
         ]);
         sendJson(res, 200, { ok: true, linked: wallet !== null, wallet, mode });
+      });
+      return true;
+    }
+
+    /**
+     * PHASE 9 — anything that would need the bot to take custody of key material. Refused by NAME,
+     * with the one sentence that says where it does happen. A 404 would be true (there is no such
+     * route) and useless: the person asking would go looking for the right spelling.
+     */
+    if (KEY_ONLY_PATHS.has(path)) {
+      sendJson(res, 403, { ok: false, error: KEY_REFUSAL });
+      return true;
+    }
+
+    // ── PHASE 9: the write surface ──────────────────────────────────────────────────────────────
+    const write = deps.write;
+
+    /**
+     * Mint the nonce for a specific INTENT and hand back the exact text to sign.
+     *
+     * The client never composes the message. Both this route and the write below build it from a
+     * parsed intent with {@link writeMessage}, so the string the user approves in their wallet and
+     * the string the bot verifies are the same function of the same value — and a body that
+     * changes between the two calls simply fails to verify.
+     *
+     * The nonce carries no memory of the intent, and does not need to: the signature is over the
+     * intent, so a nonce minted for "pause 12" is useless for "pause 13" — that would require a
+     * signature the user never produced.
+     */
+    if (req.method === 'POST' && path === '/site/action-challenge') {
+      if (write === undefined) {
+        sendJson(res, 404, { ok: false, error: 'not found' });
+        return true;
+      }
+      readJsonBody(req, res, deps.log, (body) => {
+        const action = SITE_WRITE_PATHS.get(`/site/${String(body.action ?? '')}`);
+        if (action === undefined) {
+          sendJson(res, 400, { ok: false, error: 'unknown action' });
+          return;
+        }
+        const parsed = parseIntent(action, body);
+        if ('error' in parsed) {
+          sendJson(res, 400, { ok: false, error: parsed.error });
+          return;
+        }
+        const { intent } = parsed;
+        const { nonce, expiresAt } = deps.nonces.issue();
+        sendJson(res, 200, {
+          ok: true,
+          nonce,
+          message: writeMessage(intent.action, intent.scheduleId, intent.args, nonce),
+          expiresAt,
+        });
+      });
+      return true;
+    }
+
+    const writeAction = SITE_WRITE_PATHS.get(path);
+    if (writeAction !== undefined && req.method === 'POST') {
+      if (write === undefined) {
+        sendJson(res, 404, { ok: false, error: 'not found' });
+        return true;
+      }
+      readJsonBody(req, res, deps.log, async (body) => {
+        const wallet = body.wallet;
+        const nonce = body.nonce;
+        const signature = body.signature;
+        if (typeof wallet !== 'string' || typeof nonce !== 'string' || typeof signature !== 'string') {
+          sendJson(res, 400, { ok: false, error: 'wallet, nonce and signature are required' });
+          return;
+        }
+        const parsed = parseIntent(writeAction, body);
+        if ('error' in parsed) {
+          sendJson(res, 400, { ok: false, error: parsed.error });
+          return;
+        }
+        const intent: SiteIntent = parsed.intent;
+
+        // The proof must be over THIS action, rebuilt here from this request's own body — never
+        // over a message the caller supplied, and never over the read challenge (see writeMessage).
+        if (!verifyWalletSignature(wallet, writeMessage(intent.action, intent.scheduleId, intent.args, nonce), signature)) {
+          sendJson(res, 401, { ok: false, error: 'signature does not prove this wallet' });
+          return;
+        }
+        // CONSUMED PER WRITE. Single-use in one shared store, so a nonce can back exactly one
+        // request of any kind: a read cannot lend its nonce to a write, and no two writes share one.
+        if (!deps.nonces.consume(nonce)) {
+          sendJson(res, 401, { ok: false, error: 'nonce is stale or already used' });
+          return;
+        }
+
+        // RE-RESOLVED AT ACTION TIME. The acting user is derived from the wallet that just proved
+        // itself — never from the request body, which would be a caller naming whose account to
+        // edit. A wallet unlinked since the nonce was minted acts as nobody.
+        const userId = await deps.repo.userForWallet(wallet);
+        if (userId === null) {
+          sendJson(res, NOT_LINKED.status, { ok: false, error: NOT_LINKED.error });
+          return;
+        }
+        const gate = await authorizeWrite(write.access, userId);
+        if (!('ok' in gate)) {
+          sendJson(res, gate.status, { ok: false, error: gate.error });
+          return;
+        }
+
+        // The panel's own command layer, through a repo that stamps source=site on every audit row
+        // it writes. Ownership of the named schedule is checked inside it — a write naming another
+        // user's schedule fails there, in the panel's words, not in a copy of them here.
+        const result = await applyIntent(withAuditSource(write.repo, 'site'), userId, intent, write);
+
+        // A guard refusal is a 400 carrying the panel's message VERBATIM. The site is not given a
+        // softer or a different sentence than the one Telegram shows for the same refusal.
+        sendJson(res, result.ok ? 200 : 400, result.ok
+          ? { ok: true, message: result.message }
+          : { ok: false, error: result.message });
       });
       return true;
     }

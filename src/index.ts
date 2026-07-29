@@ -177,8 +177,8 @@ async function main(): Promise<void> {
   const routes: RouteHandler[] =
     ingestor instanceof HeliusWebhookIngestor ? [ingestor.handle.bind(ingestor)] : [];
 
-  // Site bridge (READ-ONLY): mounted on the SAME :3012 handler, only when a secret is set and the
-  // autotrader is on. The link codes are shared with the /linksite command registered below.
+  // Site bridge: mounted on the SAME :3012 handler, only when a secret is set and the autotrader is
+  // on. The link codes are shared with the /linksite command registered below.
   const linkCodes = new LinkCodeStore();
   const readNonces = new NonceStore();
   if (cfg.AUTOTRADER && cfg.SITE_BRIDGE_SECRET) {
@@ -192,9 +192,24 @@ async function main(): Promise<void> {
         // PHASE 8: used ONLY to verify a Mini App's initData HMAC (see site-bridge/init-data.ts).
         // It never leaves this process. Without it the /site/tma-wallet route is not mounted.
         botToken: cfg.TELEGRAM_BOT_TOKEN,
+        /**
+         * PHASE 9 — the write surface. `repo` and `access` are THE SAME objects the Telegram panel
+         * is registered with below, and the ceilings are the same env values, because a guard that
+         * reads a different ceiling per surface is two guards. The panel's apply* functions do the
+         * work; this only hands them the same world.
+         */
+        write: {
+          repo,
+          access: repo,
+          defaultMint: cfg.DEFAULT_MINT,
+          maxPerDayUsdCeiling: cfg.MAX_PER_DAY_USD_CEILING,
+          maxLifetimeUsdCeiling: cfg.MAX_LIFETIME_USD_CEILING,
+        },
       }),
     );
-    log.info({}, 'site bridge (read-only) mounted on the health port');
+    // Say WHICH it is. The bridge stopped being read-only in Phase 9, and an operator reading a
+    // boot log should learn that from the log rather than from a surprise.
+    log.info({}, 'site bridge mounted on the health port (reads + gated writes)');
   }
 
   // --- delivery ----------------------------------------------------------------

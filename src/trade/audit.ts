@@ -11,6 +11,20 @@
  * a human-readable trail, not a ledger.
  */
 
+/**
+ * WHICH SURFACE issued a change. Phase 9 gave the website a write path into the same command layer
+ * the Telegram panel uses, so "who turned this knob" now has a second possible answer and the trail
+ * has to carry it — an audit row that cannot say where a change came from is not attributable.
+ *
+ * 'telegram' is the default because it is the surface the command layer was written for and the one
+ * every call site already had; a caller that says nothing is the panel. The site path does NOT rely
+ * on remembering to pass it — `withAuditSource` stamps it at the repo boundary, so every apply*,
+ * including ones added later, is tagged by construction.
+ */
+export type SettingSource = 'telegram' | 'site';
+
+export const DEFAULT_SETTING_SOURCE: SettingSource = 'telegram';
+
 /** A recorded setting change, as stored (with its row id and server-stamped time). */
 export interface SettingChange {
   readonly id: number;
@@ -29,7 +43,17 @@ export interface SettingChange {
   readonly fromValue: string | null;
   /** null for a deletion; both null for a bulk action carrying only a count. */
   readonly toValue: string | null;
+  /** The surface that issued the change. Never null in storage — see migration 020. */
+  readonly source: SettingSource;
 }
 
-/** What a caller supplies. `id` is assigned by the DB; `at` is stamped server-side at write time. */
-export type SettingChangeInput = Omit<SettingChange, 'id' | 'at'>;
+/**
+ * What a caller supplies. `id` is assigned by the DB; `at` is stamped server-side at write time.
+ *
+ * `source` is OPTIONAL and absent means {@link DEFAULT_SETTING_SOURCE}. That default is not a guess:
+ * the command layer's only caller was the Telegram panel until the site bridge grew a write path,
+ * and the site path stamps its own source at the repo boundary rather than at each call site.
+ */
+export type SettingChangeInput = Omit<SettingChange, 'id' | 'at' | 'source'> & {
+  readonly source?: SettingSource;
+};

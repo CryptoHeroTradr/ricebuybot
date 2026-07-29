@@ -248,6 +248,7 @@ describe('the Mini App server path holds no key and cannot sign', () => {
     'src/site-bridge/verify.ts',
     'src/site-bridge/messages.ts',
     'src/site-bridge/command.ts',
+    'src/site-bridge/mutations.ts',
     'src/telegram/dca-command.ts',
   ];
 
@@ -307,6 +308,42 @@ describe('the Mini App server path holds no key and cannot sign', () => {
         expect(
           spec.endsWith('trade/access.js') || spec.endsWith('trade/base58.js'),
           `${rel} imports ${spec} from src/trade/ as runtime code — only the allowlist gate and base58 belong here`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  /**
+   * PHASE 9 gave the bridge a write path, and it reaches the Telegram panel's command layer. That
+   * edge is the POINT of the phase — one command layer, two entry points — but it is also the only
+   * runtime edge out of `site-bridge/` into the rest of the bot, and an edge nobody declared is an
+   * edge nobody notices growing. So it is named here: a second one has to be argued for, not
+   * discovered later.
+   *
+   * Note what this does NOT claim. `trade-panel/commands.ts` itself imports `trade/executor.ts` for
+   * the $1 minimum-buy constant, so the module graph reachable from the bridge does now include
+   * trading code. That is not what keeps a key safe and never was: the bot has always loaded the
+   * signer, and what stops the bridge signing is that it holds no passphrase, unlocks nothing and
+   * calls nothing that could. The greps above stay pointed at the thing that would actually change
+   * — this path naming a signing primitive itself.
+   */
+  it('leaves src/site-bridge/ by exactly one declared runtime edge', () => {
+    const ALLOWED_OUTBOUND = [
+      '../trade/access.js', // the allowlist gate
+      '../trade/base58.js', // pure encoding, to VERIFY a wallet signature — never to make one
+      '../telegram/trade-panel/commands.js', // PHASE 9: the shared command layer
+    ];
+    const dirPath = join(root, 'src/site-bridge');
+    for (const file of readdirSync(dirPath).filter((f) => f.endsWith('.ts'))) {
+      const src = readFileSync(join(dirPath, file), 'utf8');
+      const valueImports = [...src.matchAll(/^import\s+(?!type\s)([\s\S]*?)from\s+'([^']+)';/gm)]
+        .filter((m) => !/^\s*\{\s*type\s/.test(m[1] as string))
+        .map((m) => m[2] as string)
+        .filter((spec) => spec.startsWith('../')); // './x.js' is inside the bridge
+      for (const spec of valueImports) {
+        expect(
+          ALLOWED_OUTBOUND.includes(spec),
+          `src/site-bridge/${file} imports ${spec} as runtime code — a NEW edge out of the bridge`,
         ).toBe(true);
       }
     }

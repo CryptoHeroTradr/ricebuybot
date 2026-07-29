@@ -16,6 +16,7 @@ import {
   applyCaps,
   applyNew,
   dispatchTradeCommand,
+  WALLET_MODE_REFUSAL,
   type ApplyResult,
   type PanelRepo,
 } from './commands.js';
@@ -110,9 +111,6 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
    * about, and it is ours, not theirs.
    */
   const CUSTODIAL_VERBS = new Set<PanelVerb>(['new', 'amount', 'interval', 'pause', 'resume', 'slippage', 'caps', 'stop', 'wallet']);
-  const WALLET_MODE_REFUSAL =
-    '🔐 You are in WALLET mode — I hold no key and run no schedule for you, so there is nothing here for me to change. ' +
-    'Your DCA lives in your own wallet: open the Mini App from /trade. To hand me a key instead: /mode key.';
 
   async function contractOf(userId: number): Promise<Mint> {
     return (await repo.getContract(userId)) ?? (deps.defaultMint as Mint);

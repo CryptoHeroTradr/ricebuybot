@@ -2036,8 +2036,8 @@ export class SqliteRepo implements Repo {
   async recordSettingChange(entry: import('../trade/audit.js').SettingChangeInput): Promise<void> {
     this.#db
       .prepare(
-        `INSERT INTO autotrader_settings_audit (user_id, at, action, schedule_id, field, from_value, to_value)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO autotrader_settings_audit (user_id, at, action, schedule_id, field, from_value, to_value, source)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         entry.userId,
@@ -2047,6 +2047,9 @@ export class SqliteRepo implements Repo {
         entry.field,
         entry.fromValue,
         entry.toValue,
+        // An absent source means the Telegram panel — see SettingChangeInput. The site path never
+        // relies on this: it stamps every entry at the repo boundary before the write gets here.
+        entry.source ?? 'telegram',
       );
   }
 
@@ -2226,11 +2229,16 @@ interface SettingAuditRow {
   field: string | null;
   from_value: string | null;
   to_value: string | null;
+  /** Migration 020. NOT NULL in the schema, so a row always names its surface. */
+  source: string;
 }
 
 function hydrateSettingChange(r: SettingAuditRow): import('../trade/audit.js').SettingChange {
   return {
     id: r.id, userId: r.user_id, at: r.at, action: r.action,
     scheduleId: r.schedule_id, field: r.field, fromValue: r.from_value, toValue: r.to_value,
+    // The column is constrained by the writers, not by the DB (same reasoning as `action`). Anything
+    // unrecognised reads as the default surface rather than widening the union with a cast.
+    source: r.source === 'site' ? 'site' : 'telegram',
   };
 }

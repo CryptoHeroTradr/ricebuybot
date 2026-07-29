@@ -46,6 +46,16 @@ export interface PanelRepo {
 
 export type ApplyResult = { readonly ok: boolean; readonly message: string };
 
+/**
+ * PHASE 7 — what a CUSTODIAL action is told when the caller is in wallet mode. It lives here, in
+ * the shared command layer, because both surfaces that can attempt one (the Telegram panel and the
+ * site bridge) have to refuse in the same words. A refusal that reads differently depending on
+ * where you tapped is a refusal the user will read as two different rules.
+ */
+export const WALLET_MODE_REFUSAL =
+  '🔐 You are in WALLET mode — I hold no key and run no schedule for you, so there is nothing here for me to change. ' +
+  'Your DCA lives in your own wallet: open the Mini App from /trade. To hand me a key instead: /mode key.';
+
 const ok = (message: string): ApplyResult => ({ ok: true, message });
 const err = (message: string): ApplyResult => ({ ok: false, message });
 

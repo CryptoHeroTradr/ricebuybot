@@ -122,6 +122,14 @@ primitives and for runtime imports out of `src/trade/`, and fails on either. **T
 phase brief names — a server-side signer added "to make Telegram smoother" — would be send-key
 custody wearing wallet mode's label, and that test is what stops it landing quietly.**
 
+Phase 9 added a third check there, because the bridge grew a write path and with it an edge into
+`telegram/trade-panel/commands.ts`: **every runtime edge out of `src/site-bridge/` is now declared by
+name**, so a second one has to be argued for rather than discovered later. Note what that does not
+claim — the command layer imports `trade/executor.ts` for the $1 floor, so trading code is reachable
+in the module graph. That was never the thing keeping a key safe: the bot has always loaded the
+signer, and what stops the bridge signing is that it holds no passphrase, unlocks nothing, and calls
+nothing that could.
+
 `web_app`, never a plain `url` button: only a `web_app` launch hands the page a signed `initData`,
 which is the only way it can prove to the bot which Telegram user is looking at it.
 
@@ -141,6 +149,60 @@ Three independent gates, all required: the shared secret (site server → bot), 
 and freshness (`auth_date` within 24h — a signature never expires, so a captured blob would
 otherwise be a permanent credential). Without a bot token the route **is not mounted at all** —
 identity that cannot be verified is absent, not degraded.
+
+### The site bridge can now WRITE (Phase 9)
+
+**The bridge stopped being read-only, and the doc that said otherwise is above this line, not
+missing.** `/site/*` now offers six mutations — pause, resume, stop-all, and edits to amount,
+interval and caps — and nothing else. They are the ONLY way the website can change custodial state,
+and they exist so that a person who manages their DCA on the site is not sent back to Telegram to
+press pause.
+
+**One command layer, two entry points.** Every one of the six calls the SAME `apply*` function in
+`telegram/trade-panel/commands.ts` that the Telegram panel calls. Not a copy with the same rules
+retyped — the same function. This is the whole design, and everything else follows from it: a guard
+that blocks the panel (the $1 minimum buy, the 1-minute interval floor, the per-day and lifetime cap
+ceilings, a cap below the per-trade cap, the SOL reserve) blocks the site *in the same words*,
+because there is only one place where the rule exists. `test/site-bridge-write.test.ts` asserts the
+refusals by running the panel's `apply*` on an identical twin user and comparing the message
+character for character — a test that merely checked "the site refuses too" would still pass on the
+day the two surfaces start refusing differently.
+
+**The gauntlet, in order, per request:**
+
+| Step | Refusal |
+| --- | --- |
+| shared secret (site server → bot) | 401 |
+| body → a canonical **intent** | 400 |
+| wallet signature over **that intent's** message | 401 |
+| **nonce consumed** — one nonce, one request, of any kind | 401 |
+| wallet re-resolved to a Telegram user via `site_links`, **at action time** | 403, same sentence as an unlinked wallet |
+| membership + custody mode re-read, **never cached** | 403 |
+| the panel's `apply*` — ownership of the named schedule checked inside it | 400, the panel's own words |
+
+**A write's signature names the write.** `writeMessage()` builds `action:pause / schedule:12 /
+value:… / nonce:…`, and the bot builds that string on both sides — once when it mints the nonce for
+an intent, again from the write's own body before verifying. Reusing the read challenge would have
+been enough for replay (the nonce dies either way) and still wrong: a wallet shows the user the text
+it is about to sign, so if "see my schedules" and "pause schedule 12" are the same string, a page can
+collect a signature for the first and spend it on the second. **You sign what you are about to do.**
+
+**`source=site` is stamped at the repo boundary, not at the call sites.** `withAuditSource()` wraps
+the repo the `apply*` are handed, so every settings-audit row a site write produces is attributable —
+including from an `apply*` written next year by someone who never read this section. A per-call-site
+parameter would make attribution a thing each author has to remember. Migration 020 adds the column;
+pre-existing rows backfill to `telegram`, which is **derived and not assumed** — the bridge held a
+repo surface with no mutation method on it, so no other surface could have written one.
+
+**What this channel will never do: take custody of a key.** No import, no generate, no
+create-a-schedule-with-a-new-wallet. Those paths are refused **by name** with *"manage your wallet in
+the bot"* rather than 404'd, because "that route does not exist" and "that will never be offered
+here" are different sentences and only the second one is true. The conversation where someone hands
+over a private key is the one with the Phase 12 custody warning in it, and that conversation happens
+in Telegram.
+
+**No `/site/*` response has ever carried a key, a passphrase or a secret**, and a test greps every
+response shape this surface can produce — happy, refusing and malformed — for a field named like one.
 
 #### Wallet connection in Telegram: the honest answer
 
