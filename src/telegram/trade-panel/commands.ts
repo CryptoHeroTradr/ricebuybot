@@ -34,6 +34,11 @@ export interface PanelRepo {
   deleteScheduleById(id: number): Promise<void>;
   pauseUserSchedules(userId: number): Promise<number>;
   resumeUserSchedules(userId: number): Promise<number>;
+  /**
+   * INVARIANT 16 — this user's schedules held out of service by an execution whose outcome is
+   * UNKNOWN, each with the oldest such execution. Read before any resume; see {@link applyResume}.
+   */
+  unresolvedUnknownExecutions(userId: number): Promise<readonly { readonly scheduleId: number; readonly executionId: number }[]>;
   haltUserSchedules(userId: number, reason: string): Promise<number>;
   getCaps(userId: number, mint: Mint): Promise<Caps | null>;
   setCaps(input: { userId: number; mint: Mint; maxPerExecUsd: number; maxPerDayUsd: number; maxLifetimeUsd?: number | null; minSolReserveLamports?: bigint }): Promise<void>;
@@ -45,6 +50,16 @@ export interface PanelRepo {
 }
 
 export type ApplyResult = { readonly ok: boolean; readonly message: string };
+
+/**
+ * PHASE 7 — what a CUSTODIAL action is told when the caller is in wallet mode. It lives here, in
+ * the shared command layer, because both surfaces that can attempt one (the Telegram panel and the
+ * site bridge) have to refuse in the same words. A refusal that reads differently depending on
+ * where you tapped is a refusal the user will read as two different rules.
+ */
+export const WALLET_MODE_REFUSAL =
+  '🔐 You are in WALLET mode — I hold no key and run no schedule for you, so there is nothing here for me to change. ' +
+  'Your DCA lives in your own wallet: open the Mini App from /trade. To hand me a key instead: /mode key.';
 
 const ok = (message: string): ApplyResult => ({ ok: true, message });
 const err = (message: string): ApplyResult => ({ ok: false, message });
@@ -60,6 +75,12 @@ async function audit(repo: PanelRepo, entry: SettingChangeInput): Promise<void> 
   } catch {
     /* the change already happened; a lost audit row is not worth failing it */
   }
+}
+
+/** The one sentence for a sub-minimum buy, so creating one and editing into one read alike — and
+ *  so the two surfaces cannot drift, since both reach it through the same apply*. */
+function belowMinBuy(usd: number): string {
+  return `that buy is about $${usd.toFixed(2)} — below the $${HARD_MIN_BUY_USD} minimum buy. Increase the amount.`;
 }
 
 /** Human-readable rendering of a schedule amount, for the audit trail (never for arithmetic). */
@@ -136,7 +157,7 @@ export async function applyNew(
   // is the backstop.
   if (side === 'buy' && amt.amountKind === 'absolute' && solUsd != null) {
     const usd = (Number(amt.amountRaw) / LAMPORTS_PER_SOL) * solUsd;
-    if (usd < HARD_MIN_BUY_USD) return err(`that buy is about $${usd.toFixed(2)} — below the $${HARD_MIN_BUY_USD} minimum buy. Increase the amount.`);
+    if (usd < HARD_MIN_BUY_USD) return err(belowMinBuy(usd));
   }
   const id = await repo.createSchedule({
     userId, mint: contract, side, amountRaw: amt.amountRaw, amountKind: amt.amountKind,
@@ -151,11 +172,42 @@ export async function applyNew(
   return ok(`Created schedule #${id}: ${side} every ${iv} min${capNote}.`);
 }
 
-export async function applyAmount(repo: PanelRepo, userId: number, id: number, amountRaw: string): Promise<ApplyResult> {
+/**
+ * THE MINIMUM BUY APPLIES TO AN EDIT, NOT ONLY TO A CREATION.
+ *
+ * It used to be checked in `applyNew` and again at execution, and nowhere in between — so create at
+ * $2, edit to $0.50, and the floor was gone. From the panel, and (once the site could write) over
+ * the bridge, since both reach this one function.
+ *
+ * The execution-time skip is not a substitute for refusing here. It advances the slot and logs a
+ * reason, so the schedule sits there looking active and silently never trades, and the person who
+ * set it is told nothing. A clean refusal at the moment they typed the number is the whole
+ * difference between "that is below the $1 minimum" and a DCA that mysteriously does nothing.
+ *
+ * `solUsd` HAS NO DEFAULT, unlike `applyNew`'s trailing one. A default would be `null`, and a call
+ * site that forgot to thread it would silently disable the floor again — which is precisely the bug
+ * being closed. Making it required means the compiler names every caller that has to care.
+ *
+ * The two cases it does NOT block are `applyNew`'s, matched deliberately rather than reinvented:
+ * a PERCENT-OF-BALANCE amount is not priceable until execution (the scheduler skips it there), and
+ * a NULL solUsd means the price feed is down — a transient outage must not block an edit, and the
+ * execution-time skip is the backstop for both.
+ */
+export async function applyAmount(
+  repo: PanelRepo,
+  userId: number,
+  id: number,
+  amountRaw: string,
+  solUsd: number | null,
+): Promise<ApplyResult> {
   const s = await ownedSchedule(repo, userId, id);
   if (isErr(s)) return s;
   const amt = parseAmount(amountRaw, s.side);
   if ('error' in amt) return err(amt.error);
+  if (s.side === 'buy' && amt.amountKind === 'absolute' && solUsd != null) {
+    const usd = (Number(amt.amountRaw) / LAMPORTS_PER_SOL) * solUsd;
+    if (usd < HARD_MIN_BUY_USD) return err(belowMinBuy(usd));
+  }
   await repo.setScheduleAmount(id, amt.amountRaw, amt.amountKind);
   await audit(repo, {
     userId, action: 'schedule.amount', scheduleId: id, field: 'amount',
@@ -199,12 +251,52 @@ export async function applyPause(repo: PanelRepo, userId: number, id: number): P
   return ok(`Schedule #${id} paused.`);
 }
 
+/**
+ * RESUME IS NOT AN EXIT FROM AMBIGUITY (INVARIANT 16).
+ *
+ * An UNKNOWN outcome means a swap MAY have landed and may not have. The schedule is halted so it
+ * cannot fire again on top of a trade nobody has confirmed, and `/resolve` is the only way out
+ * precisely because it makes a human look at the chain and state the verdict. `unhaltSchedule`
+ * clears any halt reason unconditionally — that is correct for its callers, which are the
+ * executor's own resolution paths, and every one of them SETTLES THE EXECUTION FIRST. Resume does
+ * not settle anything, so if it could unhalt an UNKNOWN it would be a back door around the whole
+ * mechanism: the schedule would start trading again with the earlier trade still undetermined, and
+ * the caps would still be counting a spend nobody has verified.
+ *
+ * That back door was real and open, on the panel, and reachable from the site the moment the write
+ * bridge existed. The only thing that limited the damage was `quarantineUnresolvedOnBoot`, which
+ * re-halts these schedules — but only at the NEXT RESTART, which may be days away. See the test
+ * "an UNKNOWN execution keeps its schedule halted across a restart", whose own comment names the
+ * hole ("e.g. a manual resume left the UNKNOWN unresolved").
+ *
+ * The discriminator is the execution's own `state`, not the halt's prose. The halt reason is
+ * free text written for a human ("UNKNOWN outcome for execution 42 (sig…)"), and a guard that
+ * pattern-matches English stops working the day someone rewords a sentence. `state = 'UNKNOWN'` is
+ * a CHECK-constrained enum, it is indexed, it is what `quarantineUnresolvedOnBoot` keys on, and it
+ * is EXACTLY the state `/resolve` accepts — so the thing this refuses and the thing that exit
+ * clears are the same set by construction, and cannot drift into a deadlock where a schedule can
+ * neither resume nor be resolved.
+ *
+ * Ordinary halts — a cap breach, a contract or wallet change, the dead-man kill switch, a manual
+ * pause — carry no unresolved execution and still resume normally.
+ */
 export async function applyResume(repo: PanelRepo, userId: number, id: number): Promise<ApplyResult> {
   const s = await ownedSchedule(repo, userId, id);
   if (isErr(s)) return s;
-  await repo.unhaltSchedule(id); // active + clears any halt reason
+  const blocked = (await repo.unresolvedUnknownExecutions(userId)).find((b) => b.scheduleId === id);
+  if (blocked) return err(unknownRefusal(id, blocked.executionId));
+  await repo.unhaltSchedule(id); // active + clears any ORDINARY halt reason
   await audit(repo, { userId, action: 'schedule.resume', scheduleId: id, field: null, fromValue: s.state, toValue: 'active' });
   return ok(`Schedule #${id} resumed.`);
+}
+
+/** The one refusal, so the panel and the site say the same thing and both name the exit. */
+function unknownRefusal(scheduleId: number, executionId: number): string {
+  return (
+    `⚠️ Schedule #${scheduleId} is halted on an UNKNOWN outcome — execution ${executionId} may or may not have landed on-chain. ` +
+    `Resume cannot clear that: check the transaction, then run /resolve ${executionId} confirmed|failed in the bot. ` +
+    `That is the only exit, and it is the only way the schedule starts trading again.`
+  );
 }
 
 export async function applyDelete(repo: PanelRepo, userId: number, id: number): Promise<ApplyResult> {
@@ -227,12 +319,26 @@ export async function applyStopAll(repo: PanelRepo, userId: number): Promise<App
   return ok(n === 0 ? 'Nothing was running.' : `Stopped ${n} schedule(s). ▶️ Resume when ready.`);
 }
 
-/** ▶️ Resume all — bring every paused/halted schedule of this user back. The explicit resume a
- *  contract/wallet change requires. */
+/**
+ * ▶️ Resume all — bring every paused/halted schedule of this user back. The explicit resume a
+ * contract/wallet change requires.
+ *
+ * IT HAS THE SAME UNKNOWN GUARD AS {@link applyResume}, and it needs it more, not less: "resume
+ * everything" is the shape of request that quietly sweeps up the one schedule that must not move.
+ * A blocked schedule is REPORTED, not silently skipped — a bulk action that says "Resumed 3" while
+ * leaving a fourth halted teaches the user their kill switch is flaky. The others still resume:
+ * one undetermined trade is not a reason to keep the rest of an account frozen.
+ */
 export async function applyResumeAll(repo: PanelRepo, userId: number): Promise<ApplyResult> {
-  const n = await repo.resumeUserSchedules(userId);
+  const blocked = await repo.unresolvedUnknownExecutions(userId);
+  const n = await repo.resumeUserSchedules(userId); // the SQL excludes them too — see the repo
   if (n > 0) await audit(repo, { userId, action: 'resume_all', scheduleId: null, field: null, fromValue: null, toValue: `${n} resumed` });
-  return ok(n === 0 ? 'Nothing to resume.' : `Resumed ${n} schedule(s).`);
+  if (blocked.length === 0) return ok(n === 0 ? 'Nothing to resume.' : `Resumed ${n} schedule(s).`);
+  const held = blocked
+    .map((b) => `#${b.scheduleId} (/resolve ${b.executionId} confirmed|failed)`)
+    .join(', ');
+  const resumed = n === 0 ? 'Nothing else to resume.' : `Resumed ${n} schedule(s).`;
+  return ok(`${resumed}\n\n⚠️ Still halted on an UNKNOWN outcome, and resume cannot clear it: ${held}.`);
 }
 
 export async function applyCaps(
@@ -321,7 +427,7 @@ export async function dispatchTradeCommand(
   const a = (i: number): string => tokens[i] ?? '';
   switch (sub) {
     case 'new': return applyNew(repo, userId, contract, a(1), a(2), a(3), now, solUsd);
-    case 'amount': return applyAmount(repo, userId, Number(a(1)), a(2));
+    case 'amount': return applyAmount(repo, userId, Number(a(1)), a(2), solUsd);
     case 'interval': return applyInterval(repo, userId, Number(a(1)), a(2));
     case 'slippage': return applySlippage(repo, userId, Number(a(1)), a(2));
     case 'pause': return applyPause(repo, userId, Number(a(1)));

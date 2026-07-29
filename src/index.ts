@@ -177,8 +177,8 @@ async function main(): Promise<void> {
   const routes: RouteHandler[] =
     ingestor instanceof HeliusWebhookIngestor ? [ingestor.handle.bind(ingestor)] : [];
 
-  // Site bridge (READ-ONLY): mounted on the SAME :3012 handler, only when a secret is set and the
-  // autotrader is on. The link codes are shared with the /linksite command registered below.
+  // Site bridge: mounted on the SAME :3012 handler, only when a secret is set and the autotrader is
+  // on. The link codes are shared with the /linksite command registered below.
   const linkCodes = new LinkCodeStore();
   const readNonces = new NonceStore();
   if (cfg.AUTOTRADER && cfg.SITE_BRIDGE_SECRET) {
@@ -192,9 +192,54 @@ async function main(): Promise<void> {
         // PHASE 8: used ONLY to verify a Mini App's initData HMAC (see site-bridge/init-data.ts).
         // It never leaves this process. Without it the /site/tma-wallet route is not mounted.
         botToken: cfg.TELEGRAM_BOT_TOKEN,
+        /**
+         * PHASE 9 — what the site needs to render the panel's own picture.
+         *
+         * `tradeLive` is THE SAME cfg the panel banners from and the executor spends from, threaded
+         * rather than re-derived: the website must be able to say 🔴 LIVE / 🟡 DRY RUN as loudly as
+         * Telegram does, and it can only be right about that if it is reading the same flag.
+         */
+        dashboard: {
+          tradeLive: cfg.TRADE_LIVE,
+          defaultMint: cfg.DEFAULT_MINT,
+          // The panel's symbol source, and a failure is a fallback (the mint's first four chars),
+          // never an error — a metadata miss must not take the dashboard down.
+          symbolOf: async (mint: string) => (await tokenMeta.get(mint as Mint).catch(() => null))?.symbol ?? null,
+        },
+        /**
+         * PHASE 9 — the write surface, and it is OPT-IN (SITE_BRIDGE_WRITES, default false).
+         *
+         * Undefined here means the six mutation routes are never mounted and 404 exactly as they
+         * did before the write path existed — the factory's own supported state, not a flag checked
+         * inside each handler. Whether this bot may be mutated from a website is a deployment
+         * decision, and an upgrade must not make it on the operator's behalf.
+         *
+         * When it IS on: `repo` and `access` are THE SAME objects the Telegram panel is registered
+         * with below, and the ceilings and the price feed are the same values, because a guard that
+         * reads a different ceiling — or a different SOL price — per surface is two guards. The
+         * panel's apply* functions do the work; this only hands them the same world.
+         */
+        write: cfg.SITE_BRIDGE_WRITES
+          ? {
+              repo,
+              access: repo,
+              defaultMint: cfg.DEFAULT_MINT,
+              maxPerDayUsdCeiling: cfg.MAX_PER_DAY_USD_CEILING,
+              maxLifetimeUsdCeiling: cfg.MAX_LIFETIME_USD_CEILING,
+              solUsd: () => feed.solUsd(),
+            }
+          : undefined,
       }),
     );
-    log.info({}, 'site bridge (read-only) mounted on the health port');
+    // Say WHICH SURFACES ARE UP, separately and by name. "The bridge is mounted" is the sentence an
+    // operator would have to interpret; whether a website can currently pause their schedules is
+    // the thing they actually came to the boot log to find out.
+    log.info(
+      { reads: true, writes: cfg.SITE_BRIDGE_WRITES },
+      cfg.SITE_BRIDGE_WRITES
+        ? 'site bridge mounted on the health port — reads ON, writes ON (SITE_BRIDGE_WRITES=true)'
+        : 'site bridge mounted on the health port — reads ON, writes OFF (set SITE_BRIDGE_WRITES=true to enable)',
+    );
   }
 
   // --- delivery ----------------------------------------------------------------

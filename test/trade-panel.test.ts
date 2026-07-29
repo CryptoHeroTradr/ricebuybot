@@ -1,6 +1,6 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
@@ -23,7 +23,9 @@ import {
   applySetContract,
   applyInterval,
   applyAmount,
+  applyNew,
   applyPause,
+  applyResume,
   applyResumeAll,
   applyCaps,
   applySlippage,
@@ -42,6 +44,8 @@ const MINT2 = 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263' as Mint;
 const A = 111;
 const B = 222;
 const SOL = 1_000_000_000n;
+/** Live SOL/USD. At $200/SOL the $1 minimum buy is exactly 0.005 SOL, and 0.004 SOL is $0.80. */
+const SOL_USD = 200;
 
 let dir: string;
 let repo: SqliteRepo;
@@ -265,6 +269,217 @@ describe('stop / contract / wallet', () => {
 });
 
 // ===========================================================================================
+// THE $1 MINIMUM BUY APPLIES TO AN EDIT, NOT ONLY TO A CREATION
+// ===========================================================================================
+
+/**
+ * The floor used to be checked in `applyNew` and again at execution, and nowhere in between — so
+ * create at $2, edit to $0.50, and it was gone. From the panel, and over the site's write bridge,
+ * since both reach `applyAmount`.
+ *
+ * The execution-time skip did not make that acceptable. It advances the slot and logs a reason, so
+ * the schedule sits there looking active and silently never trades, and nobody is told. Refusing
+ * the edit is the difference between "that is below the $1 minimum" and a DCA that does nothing.
+ */
+describe('applyAmount enforces the minimum buy', () => {
+  it('refuses an edit that would put the buy below $1, in applyNew’s exact words', async () => {
+    const id = await seed(A);
+    const before = (await repo.getSchedule(id))!.amountRaw;
+
+    const r = await applyAmount(repo, A, id, '0.004', SOL_USD); // $0.80
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain('below the $1 minimum buy');
+    expect((await repo.getSchedule(id))!.amountRaw).toBe(before); // nothing written
+
+    // The same sentence a creation gets, because it is the same sentence.
+    const created = await applyNew(repo, A, MINT, 'buy', '0.004', '15', 1_000_000, SOL_USD);
+    expect(r.message).toBe(created.message);
+  });
+
+  it('closes the create-at-$2-then-edit-to-$0.50 hole end to end', async () => {
+    const created = await applyNew(repo, A, MINT, 'buy', '0.01', '15', 1_000_000, SOL_USD); // $2 — fine
+    expect(created.ok).toBe(true);
+    const id = (await repo.listSchedules(A))[0]!.id;
+
+    const edited = await applyAmount(repo, A, id, '0.0025', SOL_USD); // $0.50 — the old way through
+    expect(edited.ok).toBe(false);
+    expect((await repo.getSchedule(id))!.amountRaw).toBe(10_000_000n); // still the $2 amount
+  });
+
+  it('allows the boundary and anything above it — the floor is `<`, not `<=`', async () => {
+    const id = await seed(A);
+    expect((await applyAmount(repo, A, id, '0.005', SOL_USD)).ok).toBe(true); // exactly $1.00
+    expect((await repo.getSchedule(id))!.amountRaw).toBe(5_000_000n);
+    expect((await applyAmount(repo, A, id, '0.5', SOL_USD)).ok).toBe(true);
+  });
+
+  it('does NOT block what applyNew does not block: a percent sell, or a dead price feed', async () => {
+    // A percent-of-balance amount is not priceable until execution — applyNew skips the check for
+    // it, so this does too. Inventing a stricter rule here is how two surfaces start disagreeing.
+    const sell = await seed(A, { side: 'sell' });
+    expect((await applyAmount(repo, A, sell, '10%', SOL_USD)).ok).toBe(true);
+
+    // solUsd === null is the feed being down. A transient outage must not block an edit; the
+    // execution-time skip is the backstop, exactly as at creation.
+    const buy = await seed(A);
+    expect((await applyAmount(repo, A, buy, '0.004', null)).ok).toBe(true);
+  });
+
+  it('the typed command and the button prompt both price the edit', async () => {
+    const id = await seed(A);
+
+    // /trade amount <id> <amt>
+    const typed = await dispatchTradeCommand(repo, A, MINT, ['amount', String(id), '0.004'], 1_000_000, Infinity, Infinity, SOL_USD);
+    expect(typed.ok).toBe(false);
+    expect(typed.message).toContain('minimum buy');
+
+    // 💰 Amount button -> prompt -> reply. Single schedule, so the bare value form applies.
+    const prompted = await completePrompt(repo, A, 'amount', '0.004', MINT, 1_000_000, Infinity, Infinity, SOL_USD);
+    expect(prompted.ok).toBe(false);
+    expect(prompted.message).toContain('minimum buy');
+    expect((await repo.getSchedule(id))!.amountRaw).toBe(SOL / 20n);
+  });
+});
+
+// ===========================================================================================
+// INVARIANT 16 — RESUME IS NOT AN EXIT FROM AMBIGUITY
+// ===========================================================================================
+
+/**
+ * An UNKNOWN outcome means a swap may or may not have landed. `/resolve` is the only exit because
+ * it makes a human check the chain first; resume must not be a back door around it, on ANY surface.
+ *
+ * Until this was fixed, `applyResume` -> `unhaltSchedule` cleared the halt unconditionally, and the
+ * only thing catching it was `quarantineUnresolvedOnBoot` re-halting the schedule at the NEXT
+ * RESTART — which could be days later, with the schedule trading in between on top of a trade
+ * nobody had confirmed.
+ */
+describe('resume cannot clear an UNKNOWN-outcome halt', () => {
+  /** Put a schedule in the state the executor leaves behind on an ambiguous swap. */
+  async function unknownHalted(userId: number): Promise<{ scheduleId: number; executionId: number }> {
+    const scheduleId = await seed(userId);
+    const executionId = (await repo.claimExecution(scheduleId, userId, 1_000))!;
+    await repo.settleExecution(executionId, { state: 'UNKNOWN', signature: 'sig-ambiguous' });
+    await repo.haltSchedule(scheduleId, `UNKNOWN outcome for execution ${executionId} (sig-ambiguous)`, 1_000);
+    return { scheduleId, executionId };
+  }
+
+  it('refuses, names the execution, and points at /resolve', async () => {
+    const { scheduleId, executionId } = await unknownHalted(A);
+
+    const r = await applyResume(repo, A, scheduleId);
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain('UNKNOWN');
+    expect(r.message).toContain(`/resolve ${executionId} confirmed|failed`);
+    expect((await repo.getSchedule(scheduleId))!.state).toBe('halted');
+    // The halt reason survives too — a refused resume must not half-clear the state it refused.
+    expect((await repo.getSchedule(scheduleId))!.haltReason).toContain('UNKNOWN');
+  });
+
+  it('writes NO audit row for a resume it refused — the trail records changes, not attempts', async () => {
+    const { scheduleId } = await unknownHalted(A);
+    await applyResume(repo, A, scheduleId);
+    expect(await repo.listSettingChanges(A, 10)).toHaveLength(0);
+  });
+
+  it('still resumes an ORDINARY halt — a cap breach, a contract change, a manual pause', async () => {
+    // A cap/dead-man style halt: halted, but with no unresolved execution behind it.
+    const capHalted = await seed(A);
+    await repo.haltSchedule(capHalted, 'daily cap $200 reached', 1_000);
+    expect((await applyResume(repo, A, capHalted)).ok).toBe(true);
+    expect((await repo.getSchedule(capHalted))!.state).toBe('active');
+
+    const contractHalted = await seed(A);
+    await applySetContract(repo, A, MINT2); // halts every schedule of A's
+    expect((await applyResume(repo, A, contractHalted)).ok).toBe(true);
+    expect((await repo.getSchedule(contractHalted))!.state).toBe('active');
+
+    const paused = await seed(A);
+    await applyPause(repo, A, paused);
+    expect((await applyResume(repo, A, paused)).ok).toBe(true);
+    expect((await repo.getSchedule(paused))!.state).toBe('active');
+  });
+
+  it('a CONFIRMED or FAILED execution does not block anything — only an unresolved one does', async () => {
+    const scheduleId = await seed(A);
+    const execId = (await repo.claimExecution(scheduleId, A, 1_000))!;
+    await repo.settleExecution(execId, { state: 'confirmed', signature: 'sig-ok' });
+    await repo.haltSchedule(scheduleId, 'daily cap reached', 1_000);
+    expect((await applyResume(repo, A, scheduleId)).ok).toBe(true);
+  });
+
+  it('RESUME ALL resumes the rest and reports the one it cannot, with its /resolve', async () => {
+    const { scheduleId: blocked, executionId } = await unknownHalted(A);
+    const ordinary = await seed(A);
+    await repo.haltSchedule(ordinary, 'wallet changed', 1_000);
+
+    const r = await applyResumeAll(repo, A);
+    expect(r.ok).toBe(true);
+    expect((await repo.getSchedule(ordinary))!.state).toBe('active'); // the rest still resume
+    expect((await repo.getSchedule(blocked))!.state).toBe('halted'); // the one that must not
+    expect(r.message).toContain(`#${blocked}`);
+    expect(r.message).toContain(`/resolve ${executionId}`);
+  });
+
+  it('the bulk SQL is the backstop: resumeUserSchedules ITSELF cannot clear an UNKNOWN halt', async () => {
+    // Not routed through the command layer at all — this is the raw repo call a future caller
+    // might reach for. A bulk UPDATE is exactly the shape of thing that quietly clears a row
+    // nobody meant to clear, so the exclusion lives in the statement as well as above it.
+    const { scheduleId } = await unknownHalted(A);
+    const ordinary = await seed(A);
+    await repo.haltSchedule(ordinary, 'wallet changed', 1_000);
+
+    const resumed = await repo.resumeUserSchedules(A);
+    expect(resumed).toBe(1); // the ordinary one only
+    expect((await repo.getSchedule(scheduleId))!.state).toBe('halted');
+  });
+
+  it('is scoped per user — B’s unresolved execution does not freeze A’s schedule', async () => {
+    await unknownHalted(B);
+    const mine = await seed(A);
+    await repo.haltSchedule(mine, 'wallet changed', 1_000);
+    expect((await applyResume(repo, A, mine)).ok).toBe(true);
+    expect((await repo.getSchedule(mine))!.state).toBe('active');
+  });
+
+  /**
+   * `unhaltSchedule` stays UNCONDITIONAL on purpose: its other callers are the executor's own
+   * resolution paths, and every one of them settles the execution out of UNKNOWN first, so a guard
+   * there would be dead code at best and a schedule that can never come back at worst. The cost of
+   * that choice is that the primitive is still sharp — so the set of things allowed to hold it is
+   * pinned here. A new user-facing resume path calling it directly would reopen exactly the hole
+   * this section closes, and would fail this test on the way in.
+   */
+  it('only the executor and applyResume may call unhaltSchedule directly', () => {
+    const src = join(import.meta.dirname, '..', 'src');
+    const callers = readdirSync(src, { recursive: true, encoding: 'utf8' })
+      .filter((f) => f.endsWith('.ts'))
+      .filter((f) => readFileSync(join(src, f), 'utf8').includes('unhaltSchedule'))
+      .map((f) => f.split(sep).join('/'))
+      // The repo IMPLEMENTS the method; implementing it is not calling it.
+      .filter((f) => f !== 'db/sqlite.ts')
+      .sort();
+    expect(callers, 'a new caller of unhaltSchedule — does it settle the execution first?').toEqual([
+      'telegram/trade-panel/commands.ts',
+      'trade/executor.ts',
+    ]);
+  });
+
+  it('once the execution is resolved, the schedule resumes normally', async () => {
+    const { scheduleId, executionId } = await unknownHalted(A);
+    expect((await applyResume(repo, A, scheduleId)).ok).toBe(false);
+
+    // What /resolve does: settle the execution out of UNKNOWN. (The real command also unhalts —
+    // asserted end-to-end against the live Executor in test/executor.test.ts.)
+    await repo.settleExecution(executionId, { state: 'confirmed', signature: 'sig-ambiguous' });
+
+    const r = await applyResume(repo, A, scheduleId);
+    expect(r.ok).toBe(true);
+    expect((await repo.getSchedule(scheduleId))!.state).toBe('active');
+  });
+});
+
+// ===========================================================================================
 // VALIDATE-BEFORE-WRITE (RULE B) + USER ISOLATION
 // ===========================================================================================
 
@@ -280,7 +495,7 @@ describe('validate-before-write and user isolation', () => {
     // Alice tries to change Bob's schedule by id.
     for (const attempt of [
       () => applyInterval(repo, A, bId, '99'),
-      () => applyAmount(repo, A, bId, '0.5'),
+      () => applyAmount(repo, A, bId, '0.5', SOL_USD),
       () => applyPause(repo, A, bId),
     ]) {
       const r = await attempt();

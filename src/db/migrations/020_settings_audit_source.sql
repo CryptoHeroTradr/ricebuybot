@@ -1,0 +1,24 @@
+-- Phase 9: WHICH SURFACE issued a settings change.
+--
+-- The site bridge gained a write path into the same command layer the Telegram panel calls, so
+-- "who turned this knob" has a second possible answer. An audit trail that records what changed
+-- but not where the change came from cannot answer the first question anyone asks after an
+-- unexpected pause — "did I do that from the site, or did something else?" — so the surface is
+-- recorded per row, at write time, by the entry point itself.
+--
+-- ON BACKFILLING PRE-EXISTING ROWS TO 'telegram'.
+--
+-- The abstention principle says a migration must never apply a new claim to rows classified
+-- before the distinction existed. It applies here and is SATISFIED, not waived: this claim is
+-- DERIVABLE for every existing row rather than assumed. Until this phase the bridge was given a
+-- repo surface with no schedule-mutation method on it at all — there was no second writer that
+-- could have produced one of these rows. Every row already in this table came from the Telegram
+-- surface because no other surface could reach the command layer. Same shape as migration 019's
+-- backfill to 'key': the evidence is in what the code could do at the time, not in the row.
+--
+-- The DEFAULT is what performs that backfill (SQLite fills existing rows with it). Live inserts
+-- always pass a source explicitly, so the default never decides anything after this migration.
+ALTER TABLE autotrader_settings_audit ADD COLUMN source TEXT NOT NULL DEFAULT 'telegram';
+
+-- The digest and any "what changed today" read are per-user and time-ordered; source is a filter
+-- on top of that, not a lead column, so the existing (user_id, at) index still carries the query.

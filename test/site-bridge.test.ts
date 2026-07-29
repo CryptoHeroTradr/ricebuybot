@@ -72,7 +72,10 @@ beforeEach(async () => {
   await repo.addAutotraderUser(USER_B, 'b', 1);
   codes = new LinkCodeStore(10 * 60_000, () => clock);
   nonces = new NonceStore(5 * 60_000, () => clock);
-  const r = createSiteBridgeRoute({ repo, codes, nonces, secret: SECRET, log, now: () => clock });
+  const r = createSiteBridgeRoute({
+    repo, codes, nonces, secret: SECRET, log, now: () => clock,
+    dashboard: { tradeLive: false, defaultMint: MINT },
+  });
   route = r as unknown as (req: unknown, res: unknown) => boolean;
 });
 afterEach(async () => {
@@ -157,6 +160,9 @@ describe('site bridge — READ', () => {
     const wA = makeWallet();
     const codeA = codes.issue(USER_A);
     await call('POST', '/site/link', { body: { wallet: wA.address, code: codeA, signature: wA.sign(linkMessage(wA.address, codeA)) } });
+    // KEY mode: the half with custodial schedules. A new member is a wallet-mode member (migration
+    // 019), and wallet mode returns a DIFFERENT dashboard — see the Phase 9 read tests.
+    await repo.setAutotraderMode(USER_A, 'key');
     const aId = await seedSchedule(USER_A);
     await seedSchedule(USER_B); // another user's schedule must NEVER appear
     await repo.setCaps({ userId: USER_A, mint: MINT, maxPerExecUsd: 50, maxPerDayUsd: 200, maxLifetimeUsd: 500 });
@@ -232,8 +238,21 @@ describe('site bridge — SECRET gate', () => {
   });
 });
 
-describe('site bridge — NO mutation over this channel', () => {
-  it('no /site/* route changes a schedule (structurally read-only)', async () => {
+/**
+ * PHASE 9 CHANGED WHAT THIS BLOCK CAN CLAIM, and the honest version is narrower.
+ *
+ * It used to say: no /site/* route can change a schedule, because the handler was given a repo
+ * with no mutation method on it. That is no longer true — the bridge has a write surface — so the
+ * test is rewritten rather than left to pass for a reason that has expired. A test whose NAME still
+ * asserts a retired guarantee is worse than no test: it reports a property nobody is checking.
+ *
+ * What survives, and is checked here, is that the READ surface is still only a read surface, and
+ * that an unproven request changes nothing. The write path's own guarantees live in
+ * site-bridge-write.test.ts, and this suite mounts the bridge WITHOUT a write surface — which is
+ * itself the first of them: absent `write`, the mutation routes do not exist.
+ */
+describe('site bridge — the READ surface mutates nothing', () => {
+  it('no read route changes a schedule, and no write route exists without a write surface', async () => {
     const wA = makeWallet();
     const codeA = codes.issue(USER_A);
     await call('POST', '/site/link', { body: { wallet: wA.address, code: codeA, signature: wA.sign(linkMessage(wA.address, codeA)) } });
@@ -247,6 +266,14 @@ describe('site bridge — NO mutation over this channel', () => {
     await call('POST', '/site/link', { body: { wallet: wA.address, code: reCode, signature: wA.sign(linkMessage(wA.address, reCode)) } });
     await call('POST', '/site/schedules/pause', { body: { id } }); // no such route
     await call('DELETE', `/site/schedules`, { body: { id } });
+
+    // The Phase 9 mutation paths, on a bridge mounted with NO write surface: not mounted, not
+    // "mounted and refusing" — the route is absent, which is why the body is irrelevant here.
+    for (const p of ['/site/pause', '/site/resume', '/site/stop-all', '/site/amount', '/site/interval', '/site/caps']) {
+      const r = await call('POST', p, { body: { wallet: wA.address, scheduleId: id } });
+      expect(r.status, `${p} must not exist without a write surface`).toBe(404);
+    }
+    expect((await call('POST', '/site/action-challenge', { body: { action: 'pause', scheduleId: id } })).status).toBe(404);
 
     const after = await repo.getSchedule(id);
     expect(after).toEqual(before); // the schedule is byte-for-byte unchanged

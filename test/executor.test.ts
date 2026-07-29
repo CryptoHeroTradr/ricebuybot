@@ -14,6 +14,7 @@ import {
   type JupiterQuote,
   type SignatureStatus,
 } from '../src/trade/executor.ts';
+import { applyResume, applyResumeAll } from '../src/telegram/trade-panel/commands.ts';
 import type { PlannedTrade, Schedule, Side, AmountKind } from '../src/trade/scheduler.ts';
 import type { Mint } from '../src/core/types.ts';
 
@@ -227,6 +228,41 @@ describe('the UNKNOWN path', () => {
 
     // /resolve is idempotent-safe: re-resolving a now-confirmed execution is refused.
     expect((await executor.resolve(plan.executionId, 'failed')).ok).toBe(false);
+  });
+
+  /**
+   * The other half of "only exit": not just that /resolve works, but that RESUME DOES NOT.
+   *
+   * The panel's ▶️ resume — and, since the site bridge grew a write path, the website's — used to
+   * call `unhaltSchedule`, which clears any halt reason unconditionally. That made resume a back
+   * door around this entire mechanism: the schedule would trade again with the earlier swap still
+   * undetermined. This runs against the REAL executor, so the UNKNOWN state under test is the one
+   * the executor actually produces, not a hand-written imitation of it.
+   */
+  it('and RESUME is not a second exit — the panel and the site cannot clear an UNKNOWN', async () => {
+    const { executor } = mkExecutor({ signatureStatus: async () => ({ confirmationStatus: 'processed', err: null, slot: 1 }) });
+    const schedule = await seedSchedule();
+    const plan = await claimedPlan(schedule);
+    await repo.settleExecution(plan.executionId, await executor.execute(plan));
+    await executor.lastPassiveResolution;
+    expect(await schedState(schedule.id)).toBe('halted');
+    expect(stateOf(plan.executionId)).toBe('UNKNOWN');
+
+    // Both command-layer entry points, which is both surfaces: the Telegram panel calls these, and
+    // so does /site/resume via the bridge. One refusal, because there is one implementation.
+    const single = await applyResume(repo, USER, schedule.id);
+    expect(single.ok).toBe(false);
+    expect(single.message).toContain(`/resolve ${plan.executionId}`);
+
+    const all = await applyResumeAll(repo, USER);
+    expect(all.message).toContain(`/resolve ${plan.executionId}`);
+    expect(await schedState(schedule.id)).toBe('halted');
+    expect(stateOf(plan.executionId)).toBe('UNKNOWN'); // still the human's call
+
+    // And the real exit still is one: resolve, and the schedule comes back.
+    expect((await executor.resolve(plan.executionId, 'confirmed')).ok).toBe(true);
+    expect(await schedState(schedule.id)).toBe('active');
+    expect((await applyResume(repo, USER, schedule.id)).ok).toBe(true);
   });
 
   it('a dropped signature (absent from status AND getTransaction) resolves to failed and unhalts', async () => {

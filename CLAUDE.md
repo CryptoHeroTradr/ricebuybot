@@ -122,6 +122,14 @@ primitives and for runtime imports out of `src/trade/`, and fails on either. **T
 phase brief names — a server-side signer added "to make Telegram smoother" — would be send-key
 custody wearing wallet mode's label, and that test is what stops it landing quietly.**
 
+Phase 9 added a third check there, because the bridge grew a write path and with it an edge into
+`telegram/trade-panel/commands.ts`: **every runtime edge out of `src/site-bridge/` is now declared by
+name**, so a second one has to be argued for rather than discovered later. Note what that does not
+claim — the command layer imports `trade/executor.ts` for the $1 floor, so trading code is reachable
+in the module graph. That was never the thing keeping a key safe: the bot has always loaded the
+signer, and what stops the bridge signing is that it holds no passphrase, unlocks nothing, and calls
+nothing that could.
+
 `web_app`, never a plain `url` button: only a `web_app` launch hands the page a signed `initData`,
 which is the only way it can prove to the bot which Telegram user is looking at it.
 
@@ -141,6 +149,118 @@ Three independent gates, all required: the shared secret (site server → bot), 
 and freshness (`auth_date` within 24h — a signature never expires, so a captured blob would
 otherwise be a permanent credential). Without a bot token the route **is not mounted at all** —
 identity that cannot be verified is absent, not degraded.
+
+### The site bridge can now WRITE (Phase 9)
+
+**The bridge stopped being read-only, and the doc that said otherwise is above this line, not
+missing.** `/site/*` now offers six mutations — pause, resume, stop-all, and edits to amount,
+interval and caps — and nothing else. They are the ONLY way the website can change custodial state,
+and they exist so that a person who manages their DCA on the site is not sent back to Telegram to
+press pause.
+
+**Writes are OPT-IN: `SITE_BRIDGE_WRITES`, default false.** Reads mount on `SITE_BRIDGE_SECRET`
+alone and are unaffected by it. Off, the six routes are not mounted and 404 — the composition root
+simply does not supply the write surface, so the gate is the absence of a route rather than a
+boolean each handler has to remember to check. Every other gate on this path proves *who* is
+asking; none of them answers whether the operator meant this bot to be mutable from a website at
+all, and an upgrade must not decide that for them. The boot log names reads and writes separately.
+
+**One command layer, two entry points.** Every one of the six calls the SAME `apply*` function in
+`telegram/trade-panel/commands.ts` that the Telegram panel calls. Not a copy with the same rules
+retyped — the same function. This is the whole design, and everything else follows from it: a guard
+that blocks the panel (the $1 minimum buy, the 1-minute interval floor, the per-day and lifetime cap
+ceilings, a cap below the per-trade cap, the SOL reserve) blocks the site *in the same words*,
+because there is only one place where the rule exists. `test/site-bridge-write.test.ts` asserts the
+refusals by running the panel's `apply*` on an identical twin user and comparing the message
+character for character — a test that merely checked "the site refuses too" would still pass on the
+day the two surfaces start refusing differently.
+
+**The $1 minimum buy applies to an EDIT, not only to a creation.** It used to be checked in
+`applyNew` and again at execution and nowhere in between, so create at $2, edit to $0.50, and it was
+gone — from the panel, and over this bridge the moment it could write. `applyAmount` now prices the
+new amount against the same live SOL/USD feed the panel uses and refuses below the floor in
+`applyNew`'s exact words. The execution-time skip was never a substitute: it advances the slot and
+logs a reason, so the schedule sits there looking active and silently never trades, which is a worse
+answer than a refusal at the moment someone typed the number. The two cases it does not block are
+`applyNew`'s own, matched rather than reinvented — a percent-of-balance amount is not priceable
+until execution, and a null price feed is a transient outage that must not block an edit.
+
+**The gauntlet, in order, per request:**
+
+| Step | Refusal |
+| --- | --- |
+| shared secret (site server → bot) | 401 |
+| body → a canonical **intent** | 400 |
+| wallet signature over **that intent's** message | 401 |
+| **nonce consumed** — one nonce, one request, of any kind | 401 |
+| wallet re-resolved to a Telegram user via `site_links`, **at action time** | 403, same sentence as an unlinked wallet |
+| membership + custody mode re-read, **never cached** | 403 |
+| the panel's `apply*` — ownership of the named schedule checked inside it | 400, the panel's own words |
+
+**A write's signature names the write.** `writeMessage()` builds `action:pause / schedule:12 /
+value:… / nonce:…`, and the bot builds that string on both sides — once when it mints the nonce for
+an intent, again from the write's own body before verifying. Reusing the read challenge would have
+been enough for replay (the nonce dies either way) and still wrong: a wallet shows the user the text
+it is about to sign, so if "see my schedules" and "pause schedule 12" are the same string, a page can
+collect a signature for the first and spend it on the second. **You sign what you are about to do.**
+
+**`source=site` is stamped at the repo boundary, not at the call sites.** `withAuditSource()` wraps
+the repo the `apply*` are handed, so every settings-audit row a site write produces is attributable —
+including from an `apply*` written next year by someone who never read this section. A per-call-site
+parameter would make attribution a thing each author has to remember. Migration 020 adds the column;
+pre-existing rows backfill to `telegram`, which is **derived and not assumed** — the bridge held a
+repo surface with no mutation method on it, so no other surface could have written one.
+
+#### The read returns the panel's whole picture — `src/site-bridge/dashboard-contract.ts`
+
+`POST /site/schedules` answers with a **`SiteDashboard`**: the banner, the contract, every schedule
+(with its caps, spend-so-far, halt reason and last execution), account-level caps and spend, the
+last 10 executions, the 24h digest figures, and — in wallet mode — the proven wallet and the DCA
+fills the bot observed for it. Same data the `/trade` panel renders, same per-user reads
+(`listSchedules(userId)`, `getCaps(userId, mint)`, `listExecutionsForUser(userId, …)`).
+
+**`dashboard-contract.ts` is the contract and has NO IMPORTS, deliberately** — it is the one file
+the website copies (or pins by git ref) into its own tree, and anything it depended on would have to
+travel with it. Types and constants only; there is no runtime behaviour to drift between the repos.
+A test asserts the file stays import-free.
+
+**Nothing is re-derived that already has an owner.** The LIVE/DRY and custody sentences are
+`render.ts`'s own exported constants, and the 24h numbers come from `digestFigures()`, the function
+the daily DM renders from (extracted for exactly this reason). Two implementations of the same
+number is how a user reads "$40 spent" in a DM and "$38 spent" on the site and trusts neither.
+
+**The banner is the field that matters most.** It carries a boolean *and* the bot's own sentence:
+the boolean is what the site styles on, the sentence is what it prints, so the most important
+warning in the product cannot be reworded on one surface only. It is returned even to an **unlinked**
+wallet — whether the bot is trading live is a fact about the bot, not about the caller — and
+`tradeLive` has **no default** in the deps, because a default would have to be `false` and a wiring
+mistake would then show 🟡 DRY RUN while the bot spent real money. A type error at the composition
+root beats a reassuring banner that is wrong.
+
+**Wallet mode returns a different dashboard**, not the custodial one with empty rows — the same
+choice the panel makes. A wallet-mode member's custodial schedules are never ticked, so listing them
+beside controls that would refuse would describe machinery that is not running.
+
+**What it deliberately does NOT return: the custodial pubkey, or any balance derived from it.** The
+panel shows both; this does not, and the bridge has no keystore access to get them with. An address
+the bot derives from a key it holds is a fact about that key. The only address that comes back is
+the caller's own, which they proved by signing — telling someone their own address discloses nothing.
+
+**`resume` is the one endpoint that clears state rather than restricting it**, and it carries
+INVARIANT 16's guard: it cannot lift an UNKNOWN-outcome halt, on this surface or in Telegram. That
+guard was written *because* of this channel — the panel had the same back door, held shut only by
+`quarantineUnresolvedOnBoot` re-halting at the next restart, and a signed `/site/resume` made it
+reachable without anyone opening the bot.
+
+**What this channel will never do: take custody of a key.** No import, no generate, no
+create-a-schedule-with-a-new-wallet. Those paths are refused **by name** with *"manage your wallet in
+the bot"* rather than 404'd, because "that route does not exist" and "that will never be offered
+here" are different sentences and only the second one is true. The conversation where someone hands
+over a private key is the one with the Phase 12 custody warning in it, and that conversation happens
+in Telegram.
+
+**No `/site/*` response has ever carried a key, a passphrase or a secret**, and a test greps every
+response shape this surface can produce — happy, refusing and malformed — for a field named like one.
 
 #### Wallet connection in Telegram: the honest answer
 
@@ -181,6 +301,17 @@ hold a key that can spend.
 15. A signing key never touches a log line, an error message, a Telegram message, or any table. Keystores are per-user and per-passphrase: one leak is one wallet, never all of them. There is no master key.
 
 16. A swap of uncertain outcome is NEVER retried. Mark it UNKNOWN, halt that user's schedules, require human resolution. An RPC timeout is not a failed transaction — it may still confirm, and a blind retry is a double-buy with real money.
+
+    **"Human resolution" means `/resolve`, and RESUME IS NOT A SECOND EXIT.** `applyResume` and
+    `applyResumeAll` refuse a schedule with an unresolved UNKNOWN execution and name the `/resolve`
+    to run, on **both** surfaces, because both call the same function. Ordinary halts — a cap
+    breach, a contract or wallet change, the kill switch, a manual pause — still resume normally.
+    The discriminator is `executions.state = 'UNKNOWN'`, never the halt reason's prose: it is a
+    CHECK-constrained enum, it is what `quarantineUnresolvedOnBoot` keys on, and it is exactly the
+    state `/resolve` accepts — so what resume refuses and what `/resolve` clears are the same set by
+    construction, and cannot drift into a schedule that can neither resume nor be resolved.
+    `unhaltSchedule` stays unconditional for the executor's own resolution paths, which all settle
+    the execution first; a test pins the set of files allowed to call it.
 
 17. Every autotrader action is capped twice, PER USER: per-execution and per-rolling-24h. A bug that fires the loop 1000x must lose one person's daily cap, not everyone's wallet.
 

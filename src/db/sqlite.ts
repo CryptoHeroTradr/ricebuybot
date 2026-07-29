@@ -1967,11 +1967,42 @@ export class SqliteRepo implements Repo {
     })();
   }
 
-  /** Resume all of ONE user's paused/halted schedules -> active, clearing any halt reason. The
-   *  explicit resume a contract/wallet change requires. Scoped by user_id. Returns how many resumed. */
+  /**
+   * THE UNKNOWN BLOCK LIST — this user's schedules that must not resume, and the execution that has
+   * to be resolved first. One row per schedule, carrying the OLDEST unresolved execution: resolve
+   * them in the order they happened, and that is the one to name in the refusal.
+   *
+   * The predicate is deliberately identical to the one `quarantineUnresolvedOnBoot` uses. If the
+   * two ever disagreed, a resume could succeed and then be silently undone at the next restart —
+   * which is exactly the confusing behaviour this pair of queries exists to prevent.
+   */
+  async unresolvedUnknownExecutions(userId: number): Promise<readonly { readonly scheduleId: number; readonly executionId: number }[]> {
+    return this.#db
+      .prepare<[number], { scheduleId: number; executionId: number }>(
+        `SELECT schedule_id AS scheduleId, MIN(id) AS executionId
+           FROM executions WHERE user_id = ? AND state = 'UNKNOWN' GROUP BY schedule_id`,
+      )
+      .all(userId)
+      .map((r) => ({ scheduleId: r.scheduleId, executionId: r.executionId }));
+  }
+
+  /**
+   * Resume all of ONE user's paused/halted schedules -> active, clearing any halt reason. The
+   * explicit resume a contract/wallet change requires. Scoped by user_id. Returns how many resumed.
+   *
+   * A SCHEDULE WITH AN UNRESOLVED UNKNOWN EXECUTION IS EXCLUDED IN THE SQL (INVARIANT 16). The
+   * command layer refuses those before getting here and says which execution to /resolve, so this
+   * clause is the backstop rather than the user-facing guard: a bulk UPDATE is precisely the shape
+   * of thing that quietly clears a row nobody meant to clear, and it must not be able to, whichever
+   * caller reaches it.
+   */
   async resumeUserSchedules(userId: number): Promise<number> {
     return this.#db
-      .prepare(`UPDATE schedules SET state = 'active', halt_reason = NULL, updated_at = ? WHERE user_id = ? AND state IN ('paused','halted')`)
+      .prepare(
+        `UPDATE schedules SET state = 'active', halt_reason = NULL, updated_at = ?
+          WHERE user_id = ? AND state IN ('paused','halted')
+            AND id NOT IN (SELECT DISTINCT schedule_id FROM executions WHERE state = 'UNKNOWN')`,
+      )
       .run(Date.now(), userId).changes;
   }
 
@@ -2036,8 +2067,8 @@ export class SqliteRepo implements Repo {
   async recordSettingChange(entry: import('../trade/audit.js').SettingChangeInput): Promise<void> {
     this.#db
       .prepare(
-        `INSERT INTO autotrader_settings_audit (user_id, at, action, schedule_id, field, from_value, to_value)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO autotrader_settings_audit (user_id, at, action, schedule_id, field, from_value, to_value, source)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         entry.userId,
@@ -2047,6 +2078,9 @@ export class SqliteRepo implements Repo {
         entry.field,
         entry.fromValue,
         entry.toValue,
+        // An absent source means the Telegram panel — see SettingChangeInput. The site path never
+        // relies on this: it stamps every entry at the repo boundary before the write gets here.
+        entry.source ?? 'telegram',
       );
   }
 
@@ -2226,11 +2260,16 @@ interface SettingAuditRow {
   field: string | null;
   from_value: string | null;
   to_value: string | null;
+  /** Migration 020. NOT NULL in the schema, so a row always names its surface. */
+  source: string;
 }
 
 function hydrateSettingChange(r: SettingAuditRow): import('../trade/audit.js').SettingChange {
   return {
     id: r.id, userId: r.user_id, at: r.at, action: r.action,
     scheduleId: r.schedule_id, field: r.field, fromValue: r.from_value, toValue: r.to_value,
+    // The column is constrained by the writers, not by the DB (same reasoning as `action`). Anything
+    // unrecognised reads as the default surface rather than widening the union with a cast.
+    source: r.source === 'site' ? 'site' : 'telegram',
   };
 }
