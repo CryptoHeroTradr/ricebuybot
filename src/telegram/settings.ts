@@ -3,6 +3,10 @@ import { TIERS, type TierFolder, type TierName } from '../core/tiers.js';
 import type { PoolHealth } from '../media/index.js';
 import { capabilities, UPSELL, type Plan } from '../core/plans.js';
 import { usd } from '../render/format.js';
+// PHASE 9: the panel's own banner strings and mode vocabulary. Imported rather than restated so
+// /settings and /trade cannot word the money-at-stake line differently — see dcaSectionMessage.
+import { DRY_BANNER, LIVE_BANNER, modeBanner } from './trade-panel/render.js';
+import type { TraderMode } from '../trade/mode.js';
 
 /**
  * Human copy. PURE, so every sentence a group ever sees is testable without a bot.
@@ -145,6 +149,12 @@ export function settingsMessage(ct: ChatToken, symbol: string, paused: boolean, 
   const planLine = plan === 'paid' ? '⭐ paid' : `free${caps.postDelayMs > 0 ? ' — posts arrive 5s after the buy' : ''}`;
 
   return [
+    // PHASE 9 — the section header. /settings now answers for two products (this one and the
+    // per-user autotrader), and an unlabelled wall of commands is how a reader ends up trying
+    // `/setmin` on their DCA. The CONTENT below is unchanged, deliberately: this is a heading, not
+    // a rewrite, and a test pins the body byte for byte.
+    '🍚 *BUY BOT* — what this group posts',
+    '',
     `⚙️ *Settings for $${symbol}*${paused ? '  —  ⏸ *PAUSED*' : ''}`,
     `*Plan:* ${planLine}`,
     '',
@@ -173,4 +183,85 @@ export function settingsMessage(ct: ChatToken, symbol: string, paused: boolean, 
     '`/preview 20 50000` — see a whale card without waiting for a whale',
     '`/pause` · `/resume` · `/reset`',
   ].join('\n');
+}
+
+/**
+ * PHASE 9 — the DCA BOT section of `/settings`.
+ *
+ * WHY IT EXISTS. The autotrader's commands were undiscoverable: every one of them is DM-only and
+ * member-gated, and a member had no list to read. `/settings` was already the place people look for
+ * "what can I type", so the two products are shown there together — labelled, because they have
+ * different audiences and one of them spends money.
+ *
+ * WHO SEES IT IS NOT DECIDED HERE. This function renders; the caller decides whether to call it at
+ * all, and calls it ONLY for a DM from an allowlisted member. That split matters: a section that
+ * rendered itself with a "you may not use this" line would be exactly the oracle INVARIANT 14's
+ * silence discipline exists to prevent — the absence of these lines is the refusal.
+ *
+ * IT LEADS WITH THE BANNERS, for the same reason the panel does (RULE A). Someone reading a command
+ * list is about to type one of them; whether real money is at stake, and whether the bot is holding
+ * a key that can spend it, are facts they need BEFORE the list, not after. Both strings are the
+ * panel's own exports, so the two surfaces cannot word them differently.
+ *
+ * EVERY COMMAND HERE IS REGISTERED. Nothing is aspirational and nothing is renamed; the list is
+ * pinned against the real handlers by test.
+ */
+export interface DcaSectionInput {
+  /** TRADE_LIVE — whether a schedule firing spends real money. */
+  readonly tradeLive: boolean;
+  /** This user's custody mode: whether the bot holds a key for them. */
+  readonly mode: TraderMode;
+  /** Owner-only administration is listed, and labelled, only for the owner. */
+  readonly isOwner: boolean;
+}
+
+export function dcaSectionMessage(input: DcaSectionInput): string {
+  const lines: string[] = [
+    '🤖 *DCA BOT* — your own autotrader, in this DM',
+    input.tradeLive ? LIVE_BANNER : DRY_BANNER,
+    modeBanner(input.mode),
+    '',
+  ];
+
+  // WALLET MODE HAS NO KEY AND NO SCHEDULE OF OURS, so listing the custodial controls would be
+  // listing things that will refuse. The panel makes the same split — a different panel, not the
+  // custodial one with its buttons greyed out.
+  if (input.mode === 'wallet') {
+    lines.push(
+      '*Your DCA runs in your own wallet.* I hold no key and schedule nothing for you.',
+      '`/dca` — open the Mini App to create or cancel a recurring buy',
+      '`/trade` — what I have seen your wallet do',
+      '`/linksite` — one-time code to link this wallet to the website',
+      '`/mode` — switch to key custody (I would then hold a key that can spend)',
+    );
+  } else {
+    lines.push(
+      '*Wallet*',
+      '`/wallet` — show it  ·  `import` · `generate` · `export` · `lock`',
+      '`/unlock` — unlock the key for this session',
+      '`/mode` — who holds the key: your wallet, or mine',
+      '',
+      '*Schedules*',
+      '`/trade` — the control panel (buttons for everything below)',
+      '`/trade new buy 0.05 15` — buy 0.05 SOL every 15 min',
+      '`/trade amount <id> 0.1`  ·  `/trade interval <id> 30`  ·  `/trade slippage <id> 100`',
+      '`/trade caps 50 200` — per-trade and per-day dollar limits',
+      '`/trade pause <id>`  ·  `/trade resume <id>`  ·  `/trade delete <id>`',
+      '`/trade stop` — pause everything, now',
+      '',
+      '*After a trade*',
+      '`/history` — recent executions  ·  `/history settings` — what you changed',
+      '`/resolve <id> confirmed|failed` — the only exit from an UNKNOWN outcome',
+      '',
+      '*Elsewhere*',
+      '`/dca` — open the Mini App',
+      '`/linksite` — one-time code to link a wallet to the website',
+    );
+  }
+
+  if (input.isOwner) {
+    lines.push('', '`/trader add|remove|list|purge` — membership (owner only)');
+  }
+
+  return lines.join('\n');
 }

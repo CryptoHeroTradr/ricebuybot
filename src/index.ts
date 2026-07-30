@@ -655,6 +655,14 @@ async function main(): Promise<void> {
       unsubscribe: (mint) => ingestor.unsubscribe(mint),
       currentMints: () => ingestor.mints,
       arbiter: inputArbiter,
+      /**
+       * PHASE 9 — the DCA section of /settings, supplied only when the autotrader is actually on.
+       *
+       * With AUTOTRADER off the commands are never registered, so listing them would be listing
+       * things that do not answer. `access` is `repo` — the same allowlist /trade and /wallet gate
+       * on — and `tradeLive` is the same flag the panel banners from and the executor spends from.
+       */
+      ...(cfg.AUTOTRADER ? { autotrader: { access: repo, tradeLive: cfg.TRADE_LIVE } } : {}),
     });
     // Phase 8.5: DM meme curation. Registered BEFORE bot.start(), and only when there is a
     // real bot — DRY_RUN has nothing to curate into and nothing to send.

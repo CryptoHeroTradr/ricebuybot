@@ -12,7 +12,10 @@ import { capsOf, gate as capGate, gateMints, planOf } from './plan-gate.js';
 import { capabilities, isPlan, UPSELL } from '../core/plans.js';
 import { effective } from './plan-gate.js';
 import { DEFAULT_LINKS } from '../core/links.js';
-import { mediaStatsMessage, settingsMessage, floorsSentence, whaleSentence } from './settings.js';
+import { dcaSectionMessage, mediaStatsMessage, settingsMessage, floorsSentence, whaleSentence } from './settings.js';
+// PHASE 9: the allowlist gate itself, not a copy of it — /settings must refuse exactly where
+// /trade and /wallet refuse, and `isOwner` labels the one owner-only line.
+import { checkMember, isOwner } from '../trade/access.js';
 import { PROMPTS, Wizards, type WizardState } from './wizard.js';
 import type { Sender } from './sender.js';
 import {
@@ -41,6 +44,18 @@ export interface CommandDeps {
   /** The shared DM input arbiter. /cancel lives THERE (one implementation of the word); this
    *  surface registers the wizard/media capture as a fallback it can also drop. */
   readonly arbiter?: import('./input-arbiter.js').InputArbiter;
+  /**
+   * PHASE 9 — what `/settings` needs to render its DCA section, and nothing more.
+   *
+   * ABSENT MEANS THE SECTION DOES NOT EXIST. It is supplied only when AUTOTRADER is on, so a
+   * deployment without the autotrader cannot show a list of commands that are not registered.
+   * `access` is the SAME allowlist `/trade` and `/wallet` gate on — not a copy of the rule, the
+   * rule itself — because a second membership check is a second thing to get wrong.
+   */
+  readonly autotrader?: {
+    readonly access: import('../trade/access.js').AutotraderAccessRepo;
+    readonly tradeLive: boolean;
+  } | undefined;
 }
 
 /** The keyboard labels a group may set, and what they are called on the card. */
@@ -152,18 +167,24 @@ export function registerCommands(bot: Bot, deps: CommandDeps): void {
   }
 
   /** The token this chat is configured for. Null (with a nudge) when there isn't one. */
-  async function currentToken(ctx: Context): Promise<ChatToken | null> {
+  /** The two things this bot says when a DM has no group to act on. Named because `/settings`
+   *  renders them INSIDE its buy-bot section rather than replying them on their own — an
+   *  autotrader member with no group selected must still get their DCA section. Same words. */
+  const NO_GROUP_PICKED = 'Which group? Send /use to pick one.';
+  const NO_TOKEN_THERE = "I'm not tracking a token there yet. Run /setup in the group, or /setca <mint>.";
+
+  /** Resolve the chat token WITHOUT replying — the caller decides what to say. */
+  async function resolveToken(ctx: Context): Promise<{ ct: ChatToken | null; why: string | null }> {
     await ensureChat(ctx);
-
     const target = targetOf(ctx);
-    if (target === null) {
-      await ctx.reply('Which group? Send /use to pick one.');
-      return null;
-    }
+    if (target === null) return { ct: null, why: NO_GROUP_PICKED };
+    const ct = (await repo.listChatTokens(target))[0] ?? null;
+    return { ct, why: ct ? null : NO_TOKEN_THERE };
+  }
 
-    const tokens = await repo.listChatTokens(target);
-    const ct = tokens[0] ?? null;
-    if (!ct) await ctx.reply("I'm not tracking a token there yet. Run /setup in the group, or /setca <mint>.");
+  async function currentToken(ctx: Context): Promise<ChatToken | null> {
+    const { ct, why } = await resolveToken(ctx);
+    if (why !== null) await ctx.reply(why);
     return ct;
   }
 
@@ -808,14 +829,54 @@ export function registerCommands(bot: Bot, deps: CommandDeps): void {
     await apply(ctx, ct, { links }, `✅ **${label}** button set.`);
   });
 
+  /**
+   * PHASE 9 — the DCA section, or null.
+   *
+   * NULL IS THE REFUSAL, and it is the whole point of this function. The autotrader is DM-only and
+   * allowlist-only, and a non-member is answered with SILENCE everywhere else (INVARIANT 14) —
+   * because a refusal is an oracle: send a command, get "you are not authorised", and you have
+   * learned the autotrader exists and that there is a list to be on. A `/settings` that printed
+   * "DCA (you don't have access)" would reintroduce exactly that oracle in the one place everybody
+   * looks. So the section is ABSENT for a group, absent for a non-member, and absent when the
+   * autotrader is not deployed at all.
+   *
+   * The membership check is the SAME `checkMember` the panel gates on, at action time, uncached — a
+   * revoked member's next `/settings` no longer lists the controls.
+   */
+  async function dcaSection(ctx: Context): Promise<string | null> {
+    const at = deps.autotrader;
+    if (!at) return null; // AUTOTRADER off: the commands are not registered, so they are not listed
+    if (isGroup(ctx)) return null; // DM-only surface, DM-only documentation
+    const userId = userIdOf(ctx);
+    const verdict = await checkMember(at.access, userId);
+    if (!verdict.allowed) return null; // not a member, or revoked — silence, as everywhere else
+
+    return dcaSectionMessage({
+      tradeLive: at.tradeLive,
+      // The member row we just read, rather than a second lookup: same instant, same answer.
+      mode: verdict.member.mode,
+      isOwner: isOwner(deps.ownerUserId, userId),
+    });
+  }
+
   bot.command('settings', async (ctx) => {
-    const ct = await currentToken(ctx);
-    if (!ct) return;
-    const chat = await repo.getChat(ct.chatId);
-    await ctx.reply(
-      settingsMessage(ct, await symbolOf(ct.mint), chat?.paused ?? false, await planOf(repo, ct.chatId)),
-      { parse_mode: 'Markdown' },
-    );
+    // Resolved FIRST, and independently of the buy-bot half: an autotrader member who has never
+    // run /use has no group to show settings for, and used to get "Which group?" and nothing else.
+    // Their DCA commands do not depend on a group, so neither does their ability to read them.
+    const dca = await dcaSection(ctx);
+    const { ct, why } = await resolveToken(ctx);
+
+    const buySection =
+      ct === null
+        ? (why as string) // the same sentence as before, now as a section rather than the reply
+        : settingsMessage(ct, await symbolOf(ct.mint), (await repo.getChat(ct.chatId))?.paused ?? false, await planOf(repo, ct.chatId));
+
+    // Nothing to add and nothing to show: reply exactly what this command always replied.
+    if (dca === null) {
+      await ctx.reply(buySection, { parse_mode: 'Markdown' });
+      return;
+    }
+    await ctx.reply(`${buySection}\n\n${dca}`, { parse_mode: 'Markdown' });
   });
 
   bot.command('pause', async (ctx) => {
