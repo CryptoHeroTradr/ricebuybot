@@ -125,7 +125,7 @@ custody wearing wallet mode's label, and that test is what stops it landing quie
 Phase 9 added a third check there, because the bridge grew a write path and with it an edge into
 `telegram/trade-panel/commands.ts`: **every runtime edge out of `src/site-bridge/` is now declared by
 name**, so a second one has to be argued for rather than discovered later. Note what that does not
-claim — the command layer imports `trade/executor.ts` for the $1 floor, so trading code is reachable
+claim — the command layer imports `trade/executor.ts` for the minimum-buy floor, so trading code is reachable
 in the module graph. That was never the thing keeping a key safe: the bot has always loaded the
 signer, and what stops the bridge signing is that it holds no passphrase, unlocks nothing, and calls
 nothing that could.
@@ -168,22 +168,30 @@ all, and an upgrade must not decide that for them. The boot log names reads and 
 **One command layer, two entry points.** Every one of the six calls the SAME `apply*` function in
 `telegram/trade-panel/commands.ts` that the Telegram panel calls. Not a copy with the same rules
 retyped — the same function. This is the whole design, and everything else follows from it: a guard
-that blocks the panel (the $1 minimum buy, the 1-minute interval floor, the per-day and lifetime cap
+that blocks the panel (the 0.001 SOL minimum buy, the 1-minute interval floor, the per-day and lifetime cap
 ceilings, a cap below the per-trade cap, the SOL reserve) blocks the site *in the same words*,
 because there is only one place where the rule exists. `test/site-bridge-write.test.ts` asserts the
 refusals by running the panel's `apply*` on an identical twin user and comparing the message
 character for character — a test that merely checked "the site refuses too" would still pass on the
 day the two surfaces start refusing differently.
 
-**The $1 minimum buy applies to an EDIT, not only to a creation.** It used to be checked in
-`applyNew` and again at execution and nowhere in between, so create at $2, edit to $0.50, and it was
-gone — from the panel, and over this bridge the moment it could write. `applyAmount` now prices the
-new amount against the same live SOL/USD feed the panel uses and refuses below the floor in
-`applyNew`'s exact words. The execution-time skip was never a substitute: it advances the slot and
-logs a reason, so the schedule sits there looking active and silently never trades, which is a worse
-answer than a refusal at the moment someone typed the number. The two cases it does not block are
-`applyNew`'s own, matched rather than reinvented — a percent-of-balance amount is not priceable
-until execution, and a null price feed is a transient outage that must not block an edit.
+**The minimum buy applies to an EDIT, not only to a creation.** It used to be checked in `applyNew`
+and again at execution and nowhere in between, so create high, edit low, and it was gone — from the
+panel, and over this bridge the moment it could write. `applyAmount` now holds the new amount
+against the same floor and refuses in `applyNew`'s exact words. The execution-time skip was never a
+substitute: it advances the slot and logs a reason, so the schedule sits there looking active and
+silently never trades, which is a worse answer than a refusal at the moment someone typed the
+number. The one case it does not block is `applyNew`'s own, matched rather than reinvented — a
+percent-of-balance amount is basis points, not lamports, so there is no SOL figure to compare.
+
+**The floor is 0.001 SOL, and it is denominated in SOL — not USD.** It was `$1`, priced through the
+live SOL/USD feed at every surface. A schedule's buy amount *is* lamports, so the SOL floor compares
+against the number the person typed, in the unit they typed it in, and `meetsMinBuy` in
+`trade/executor.ts` is the one place the rule exists — panel, site bridge and scheduler all call it.
+Changing denomination closed a hole rather than moving one: a null price feed used to skip the check
+entirely (a deliberate call — a transient outage must not block an edit), so the floor was absent
+exactly when the feed was down. Nothing consults a price to enforce it now, which is why `solUsd` is
+gone from `ApplyIntentOptions`, `TradePanelDeps` and the `apply*` signatures.
 
 **The gauntlet, in order, per request:**
 

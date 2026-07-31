@@ -324,7 +324,7 @@ describe('the Mini App server path holds no key and cannot sign', () => {
    * discovered later.
    *
    * Note what this does NOT claim. `trade-panel/commands.ts` itself imports `trade/executor.ts` for
-   * the $1 minimum-buy constant, so the module graph reachable from the bridge does now include
+   * the minimum-buy floor, so the module graph reachable from the bridge does now include
    * trading code. That is not what keeps a key safe and never was: the bot has always loaded the
    * signer, and what stops the bridge signing is that it holds no passphrase, unlocks nothing and
    * calls nothing that could. The greps above stay pointed at the thing that would actually change

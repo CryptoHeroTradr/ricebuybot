@@ -389,7 +389,7 @@ function confirmExecutor(): Executor {
   return async (plan): Promise<ExecutionOutcome> => ({ state: 'confirmed', usdValue: plan.usdValue });
 }
 
-describe('lifetime cap and the $1 minimum buy', () => {
+describe('lifetime cap and the 0.001 SOL minimum buy', () => {
   // Record a prior settled execution for (USER, MINT), then park its schedule so the tick ignores
   // it. Its spend STILL counts toward the lifetime sum (which joins on mint, regardless of state).
   async function priorSpend(usd: number, state: 'confirmed' | 'UNKNOWN'): Promise<void> {
@@ -438,14 +438,40 @@ describe('lifetime cap and the $1 minimum buy', () => {
     expect(outcomes.some((o) => o.kind === 'fired')).toBe(true);
   });
 
-  it('a buy resolving below $1 SKIPS (min-buy) — not an error, not a halt, no claim', async () => {
+  it('a percent-of-balance buy SKIPS (min-buy) — not an error, not a halt, no claim', async () => {
     const id = await seed({ amountKind: 'percent_of_balance', amountRaw: 5000n });
     await repo.setCaps({ userId: USER, mint: MINT, maxPerExecUsd: 1000, maxPerDayUsd: 10_000 });
-    // The real valuer returns 0 for a percent buy; the harness valuer mimics that with usd: 0.
+    // Basis points, not lamports: there is no SOL amount to hold against the floor at all.
     const outcomes = await tickWith(0);
     expect(outcomes.find((o) => o.kind === 'min-buy-skipped')).toBeDefined();
     expect((await repo.getSchedule(id))!.state).toBe('active'); // skipped, stays active
     expect(countExecutions()).toBe(0); // never claimed
+  });
+
+  it('a buy below 0.001 SOL SKIPS, and 0.001 SOL exactly FIRES — the floor is `<`, not `<=`', async () => {
+    await repo.setCaps({ userId: USER, mint: MINT, maxPerExecUsd: 1000, maxPerDayUsd: 10_000 });
+
+    const dust = await seed({ amountRaw: 999_999n }); // one lamport short
+    const skipped = await tickWith(50);
+    expect(skipped.find((o) => o.kind === 'min-buy-skipped')).toBeDefined();
+    expect((await repo.getSchedule(dust))!.state).toBe('active'); // skipped, stays active
+    expect(countExecutions()).toBe(0);
+    await repo.pauseSchedule(dust);
+
+    const atFloor = await seed({ amountRaw: 1_000_000n });
+    const fired = await tickWith(50);
+    expect(fired.find((o) => o.kind === 'fired')).toBeDefined();
+    expect((await repo.getSchedule(atFloor))!.state).toBe('active');
+  });
+
+  /** The floor is on lamports, so it needs no price. A dust buy skips as MIN-BUY even with the feed
+   *  face-down — it is not left to be reported as merely unpriceable, which would read as transient. */
+  it('holds with the SOL feed down — a dust buy is min-buy-skipped, not unpriceable-skipped', async () => {
+    await seed({ amountRaw: 999_999n });
+    await repo.setCaps({ userId: USER, mint: MINT, maxPerExecUsd: 1000, maxPerDayUsd: 10_000 });
+    const outcomes = await tickWith(null); // null usdValue = the feed is down
+    expect(outcomes.find((o) => o.kind === 'min-buy-skipped')).toBeDefined();
+    expect(outcomes.find((o) => o.kind === 'unpriceable-skipped')).toBeUndefined();
   });
 });
 

@@ -3,7 +3,7 @@ import type { ConfirmedTx } from '../ingest/solana-types.js';
 import type { Mint } from '../core/types.js';
 import type { Logger } from '../ops/logger.js';
 import { frameTransaction, encodeBase58 } from './signer.js';
-import type { Caps, ExecutionOutcome, ExecutionRecord, PlannedTrade, Schedule } from './scheduler.js';
+import type { AmountKind, Caps, ExecutionOutcome, ExecutionRecord, PlannedTrade, Schedule } from './scheduler.js';
 
 /**
  * PHASE 14 — execute the swaps the scheduler decided on, via Jupiter. The scheduler decides WHAT
@@ -59,7 +59,32 @@ export interface ExecutorConfig {
  */
 export const HARD_MAX_SLIPPAGE_BPS = 1000; // 10%. Above that you are not trading, you are donating.
 export const HARD_MIN_INTERVAL_MINUTES = 1; // a sub-minute DCA is a bot fighting its own confirmations.
-export const HARD_MIN_BUY_USD = 1; // below $1 a buy is dust — skipped-with-reason, never executed.
+/**
+ * MIN BUY — denominated in SOL, not USD. Below this a buy is dust: refused at create/edit,
+ * skipped-with-reason at execution, never executed.
+ *
+ * It used to be $1, priced through the live SOL feed. A schedule's buy amount IS lamports, so a SOL
+ * floor compares against the number the person actually typed: it needs no price feed (it therefore
+ * still holds while the feed is down, which the USD floor did not), it cannot drift with the market,
+ * and the refusal quotes the same unit as the input. The lamports value is the authority — the
+ * decimal exists only so a message can print `0.001` rather than `1000000`.
+ */
+export const HARD_MIN_BUY_LAMPORTS = 1_000_000n; // 0.001 SOL
+export const HARD_MIN_BUY_SOL = Number(HARD_MIN_BUY_LAMPORTS) / LAMPORTS_PER_SOL;
+
+/**
+ * THE min-buy rule, in one place — the panel and the site refuse a create/edit with it, the
+ * scheduler skips a slot with it. Two implementations of the same floor is how a surface starts
+ * accepting an amount another surface will silently never trade.
+ *
+ * A `percent_of_balance` amount is BASIS POINTS, not lamports, so there is no SOL figure to compare
+ * and this is false for it. That is not a rejection of percents in general: it is only ever consulted
+ * for a BUY, and a percent buy has no meaning (the executor refuses one outright — it is a sell
+ * concept, and `parseAmount` will not build one).
+ */
+export function meetsMinBuy(amount: { readonly amountRaw: bigint; readonly amountKind: AmountKind }): boolean {
+  return amount.amountKind === 'absolute' && amount.amountRaw >= HARD_MIN_BUY_LAMPORTS;
+}
 
 export const DEFAULT_EXECUTOR_CONFIG: ExecutorConfig = {
   maxPriceImpactPct: 0.03,

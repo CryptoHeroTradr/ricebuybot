@@ -54,9 +54,11 @@ const USER_TWIN = 333;
 const SOL = 1_000_000_000n;
 const DAY_CEILING = 500;
 const LIFETIME_CEILING = 5_000;
-/** Live SOL/USD for the tests. Chosen so the $1 minimum buy lands on round numbers: at $200/SOL,
- *  0.005 SOL is EXACTLY $1 (the boundary), and 0.004 SOL is $0.80 (below it). */
-const SOL_USD = 200;
+/** The minimum buy, in the unit it is denominated in: 0.001 SOL is the boundary (which belongs to
+ *  the user) and 0.0005 SOL is below it. No SOL/USD price is needed to say either — that is the
+ *  point of the floor being SOL-denominated on both surfaces. */
+const MIN_BUY_SOL = '0.001';
+const BELOW_MIN_SOL = '0.0005';
 const log = createLogger('silent' as 'info', false);
 
 function makeWallet(): { address: string; sign: (m: string) => string } {
@@ -127,9 +129,9 @@ beforeEach(async () => {
       defaultMint: MINT,
       maxPerDayUsdCeiling: DAY_CEILING,
       maxLifetimeUsdCeiling: LIFETIME_CEILING,
-      // The SAME price feed the panel prices an edit against — see index.ts, which passes
-      // `() => feed.solUsd()` here. A different price per surface would be a different guard.
-      solUsd: () => SOL_USD,
+      // The SAME ceilings the panel is registered with — see index.ts. A different ceiling per
+      // surface would be a different guard. The minimum buy needs nothing passed at all: it is
+      // SOL-denominated and compares against the lamports being written.
     },
   });
   route = r as unknown as (req: unknown, res: unknown) => boolean;
@@ -333,7 +335,7 @@ describe('site bridge WRITE — off unless the operator turns it on', () => {
       repo, codes, nonces, secret: SECRET, log, now: () => clock,
       dashboard: { tradeLive: false, defaultMint: MINT },
       write: writes
-        ? { repo, access: repo, defaultMint: MINT, maxPerDayUsdCeiling: DAY_CEILING, maxLifetimeUsdCeiling: LIFETIME_CEILING, solUsd: () => SOL_USD }
+        ? { repo, access: repo, defaultMint: MINT, maxPerDayUsdCeiling: DAY_CEILING, maxLifetimeUsdCeiling: LIFETIME_CEILING }
         : undefined,
     });
     route = r as unknown as (req: unknown, res: unknown) => boolean;
@@ -517,7 +519,7 @@ describe('site bridge WRITE — a guard that blocks the panel blocks the site, i
 
     for (const bad of ['0', '-1', 'abc']) {
       const site = await signedWrite(wallet, 'amount', { scheduleId: mine, amount: bad });
-      const panel = await applyAmount(repo, USER_TWIN, theirs, bad, SOL_USD);
+      const panel = await applyAmount(repo, USER_TWIN, theirs, bad);
       expect(site.status).toBe(400);
       expect(site.json.error).toBe(panel.message);
     }
@@ -525,25 +527,25 @@ describe('site bridge WRITE — a guard that blocks the panel blocks the site, i
   });
 
   /**
-   * THE $1 MINIMUM BUY, ON AN EDIT.
+   * THE 0.001 SOL MINIMUM BUY, ON AN EDIT.
    *
-   * This test used to assert that the two surfaces AGREED — and they did, on accepting a sub-$1
+   * This test used to assert that the two surfaces AGREED — and they did, on accepting a sub-floor
    * edit, because the floor was checked at creation and at execution but nowhere in between. That
-   * made create-at-$2/edit-to-$0.50 a way around it from either surface. The agreement was real and
-   * the behaviour was wrong; now they agree on REFUSING, which is what the assertion says.
+   * made create-high/edit-low a way around it from either surface. The agreement was real and the
+   * behaviour was wrong; now they agree on REFUSING, which is what the assertion says.
    */
-  it('a sub-$1 amount edit is REFUSED, identically on both surfaces', async () => {
+  it('a sub-minimum amount edit is REFUSED, identically on both surfaces', async () => {
     const mine = await seedSchedule(USER_A);
     const theirs = await twin();
 
-    const dust = '0.004'; // $0.80 at $200/SOL
+    const dust = BELOW_MIN_SOL;
     const site = await signedWrite(wallet, 'amount', { scheduleId: mine, amount: dust });
-    const panel = await applyAmount(repo, USER_TWIN, theirs, dust, SOL_USD);
+    const panel = await applyAmount(repo, USER_TWIN, theirs, dust);
 
     expect(site.status).toBe(400);
     expect(panel.ok).toBe(false);
     expect(site.json.error).toBe(panel.message);
-    expect(String(site.json.error)).toContain('below the $1 minimum buy');
+    expect(String(site.json.error)).toContain('below the 0.001 SOL minimum buy');
     // Neither schedule moved: a refused edit writes nothing on either surface.
     expect((await repo.getSchedule(mine))!.amountRaw).toBe(SOL / 10n);
     expect((await repo.getSchedule(theirs))!.amountRaw).toBe(SOL / 10n);
@@ -552,9 +554,9 @@ describe('site bridge WRITE — a guard that blocks the panel blocks the site, i
   it('an edit AT or ABOVE the minimum still succeeds — the floor is `<`, not `<=`', async () => {
     const mine = await seedSchedule(USER_A);
 
-    // Exactly $1.00 at $200/SOL. The boundary belongs to the user.
-    expect((await signedWrite(wallet, 'amount', { scheduleId: mine, amount: '0.005' })).status).toBe(200);
-    expect((await repo.getSchedule(mine))!.amountRaw).toBe(5_000_000n);
+    // Exactly the floor. The boundary belongs to the user.
+    expect((await signedWrite(wallet, 'amount', { scheduleId: mine, amount: MIN_BUY_SOL })).status).toBe(200);
+    expect((await repo.getSchedule(mine))!.amountRaw).toBe(1_000_000n);
 
     expect((await signedWrite(wallet, 'amount', { scheduleId: mine, amount: '0.05' })).status).toBe(200);
     expect((await repo.getSchedule(mine))!.amountRaw).toBe(50_000_000n);
@@ -562,8 +564,8 @@ describe('site bridge WRITE — a guard that blocks the panel blocks the site, i
 
   it('creating below the floor and editing below it now refuse in the SAME words', async () => {
     const mine = await seedSchedule(USER_A);
-    const created = await applyNew(repo, USER_TWIN, MINT, 'buy', '0.004', '60', clock, SOL_USD);
-    const edited = await signedWrite(wallet, 'amount', { scheduleId: mine, amount: '0.004' });
+    const created = await applyNew(repo, USER_TWIN, MINT, 'buy', BELOW_MIN_SOL, '60', clock);
+    const edited = await signedWrite(wallet, 'amount', { scheduleId: mine, amount: BELOW_MIN_SOL });
     expect(created.ok).toBe(false);
     expect(edited.json.error).toBe(created.message); // one sentence, one rule, two moments
   });

@@ -67,8 +67,6 @@ export interface TradePanelDeps {
   readonly maxPerDayUsdCeiling?: number;
   /** Env lifetime-cap ceiling — /trade caps refuses a lifetime budget above it. */
   readonly maxLifetimeUsdCeiling?: number;
-  /** Live SOL/USD, to refuse a below-$1 buy at creation time. Null when the feed is down. */
-  readonly solUsd?: () => number | null;
   readonly log: Logger;
   /** THE shared DM input arbiter — one awaiting state per user across all handlers. */
   readonly arbiter: InputArbiter;
@@ -249,7 +247,7 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
     const tokens = args.split(/\s+/);
     // stop and the id-taking subcommands all funnel through the shared dispatcher, THEN re-render.
     const contract = await contractOf(userId);
-    const r = await dispatchTradeCommand(repo, userId, contract, tokens, now(), deps.maxPerDayUsdCeiling ?? Infinity, deps.maxLifetimeUsdCeiling ?? Infinity, deps.solUsd?.() ?? null);
+    const r = await dispatchTradeCommand(repo, userId, contract, tokens, now(), deps.maxPerDayUsdCeiling ?? Infinity, deps.maxLifetimeUsdCeiling ?? Infinity);
     await sendPanel(ctx, userId, r.ok ? `✅ ${r.message}` : `⚠️ ${r.message}`);
   });
 
@@ -365,7 +363,7 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
 
     const text = ctx.message.text.trim();
     const contract = await contractOf(userId);
-    const r = await completePrompt(repo, userId, awaiting.verb, text, contract, now(), deps.maxPerDayUsdCeiling ?? Infinity, deps.maxLifetimeUsdCeiling ?? Infinity, deps.solUsd?.() ?? null);
+    const r = await completePrompt(repo, userId, awaiting.verb, text, contract, now(), deps.maxPerDayUsdCeiling ?? Infinity, deps.maxLifetimeUsdCeiling ?? Infinity);
 
     const chatId = ctx.chat?.id;
     if (chatId !== undefined) {
@@ -392,7 +390,7 @@ const PROMPTS: Partial<Record<PanelVerb, string>> = {
  */
 export async function completePrompt(
   repo: PanelRepo, userId: number, verb: PanelVerb, text: string, contract: Mint, now: number,
-  maxPerDayUsdCeiling = Infinity, maxLifetimeUsdCeiling = Infinity, solUsd: number | null = null,
+  maxPerDayUsdCeiling = Infinity, maxLifetimeUsdCeiling = Infinity,
 ): Promise<ApplyResult> {
   const parts = text.split(/\s+/).filter(Boolean);
   const schedules = await repo.listSchedules(userId);
@@ -406,11 +404,11 @@ export async function completePrompt(
 
   switch (verb) {
     case 'new': {
-      return applyNew(repo, userId, contract, parts[0] ?? '', parts[1] ?? '', parts[2] ?? '', now, solUsd);
+      return applyNew(repo, userId, contract, parts[0] ?? '', parts[1] ?? '', parts[2] ?? '', now);
     }
     case 'amount': {
       const { id, value } = idAndValue();
-      return applyAmount(repo, userId, id, value, solUsd);
+      return applyAmount(repo, userId, id, value);
     }
     case 'interval': {
       const { id, value } = idAndValue();

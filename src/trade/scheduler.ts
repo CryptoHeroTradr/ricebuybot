@@ -2,7 +2,9 @@ import type { Mint } from '../core/types.js';
 import type { Logger } from '../ops/logger.js';
 // Value import of a hard-limit constant only. executor.ts imports scheduler with `import type`
 // (erased), so there is no runtime cycle.
-import { HARD_MIN_BUY_USD } from './executor.js';
+import { HARD_MIN_BUY_SOL, meetsMinBuy } from './executor.js';
+
+const LAMPORTS_PER_SOL = 1_000_000_000;
 
 /**
  * PHASE 13 — the DCA scheduler. It decides WHAT should happen and WHEN, and logs it.
@@ -371,6 +373,28 @@ export class Scheduler {
       return { kind: 'gap-skipped', plannedAt, slotsSkipped, newNextRunAt };
     }
 
+    // --- MIN BUY (hard limit): a buy below 0.001 SOL is dust — SKIP the slot, do not halt.
+    //     The floor is on the LAMPORTS the schedule holds, so it is the same comparison the panel
+    //     and the site made when the amount was typed, and it does not move with the SOL price.
+    //     It is therefore checked BEFORE pricing: a dust schedule is dust whether or not the feed is
+    //     up, and there is no reason to ask for a price to find that out.
+    //     A percent-of-balance buy still lands here: its amount is basis points, not lamports, so
+    //     there is no SOL figure to hold against the floor at all (the executor refuses a percent
+    //     BUY outright — it is a sell concept). This is a skip, not an error, and only buys are
+    //     min-buy-limited (sells have no SOL amount either, and are priced in the executor). ---
+    if (schedule.side === 'buy' && !meetsMinBuy(schedule)) {
+      await this.#advanceOnly(schedule, plannedAt, intervalMs);
+      const reason =
+        schedule.amountKind === 'absolute'
+          ? `per-exec ${Number(schedule.amountRaw) / LAMPORTS_PER_SOL} SOL is below the ${HARD_MIN_BUY_SOL} SOL minimum buy`
+          : 'a percent-of-balance buy has no SOL amount to hold against the minimum buy';
+      this.#log.warn(
+        { scheduleId: schedule.id, userId: schedule.userId, plannedAt, reason },
+        `autotrader scheduler: MIN-BUY skip — below ${HARD_MIN_BUY_SOL} SOL, not fired`,
+      );
+      return { kind: 'min-buy-skipped', plannedAt, reason };
+    }
+
     // --- CAP CHECKS run BEFORE the claim; both the per-exec and 24h caps must pass ---------
     const caps = await this.#repo.getCaps(schedule.userId, schedule.mint);
 
@@ -384,21 +408,6 @@ export class Scheduler {
         'autotrader scheduler: slot UNPRICEABLE — skipped, not fired (cannot verify caps)',
       );
       return { kind: 'unpriceable-skipped', plannedAt };
-    }
-
-    // --- MIN BUY (hard limit): a buy resolving below $1 is dust — SKIP the slot, do not halt.
-    //     A percent-of-balance buy is unpriced here (the valuer returns 0), so it always lands
-    //     here; an absolute buy whose SOL value has fallen below $1 skips too. This is a skip,
-    //     not an error, and only buys are min-buy-limited (sells value at 0 here but are priced
-    //     in the executor). ---
-    if (schedule.side === 'buy' && usdValue < HARD_MIN_BUY_USD) {
-      await this.#advanceOnly(schedule, plannedAt, intervalMs);
-      const reason = `per-exec $${usdValue.toFixed(2)} is below the $${HARD_MIN_BUY_USD} minimum buy`;
-      this.#log.warn(
-        { scheduleId: schedule.id, userId: schedule.userId, plannedAt, reason },
-        'autotrader scheduler: MIN-BUY skip — below $1, not fired',
-      );
-      return { kind: 'min-buy-skipped', plannedAt, reason };
     }
 
     if (caps) {

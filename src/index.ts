@@ -215,9 +215,10 @@ async function main(): Promise<void> {
          * decision, and an upgrade must not make it on the operator's behalf.
          *
          * When it IS on: `repo` and `access` are THE SAME objects the Telegram panel is registered
-         * with below, and the ceilings and the price feed are the same values, because a guard that
-         * reads a different ceiling — or a different SOL price — per surface is two guards. The
-         * panel's apply* functions do the work; this only hands them the same world.
+         * with below, and the ceilings are the same values, because a guard that reads a different
+         * ceiling per surface is two guards. The panel's apply* functions do the work; this only
+         * hands them the same world. (The minimum buy needs nothing handed to it at all — it is
+         * denominated in SOL and compares against the lamports being written.)
          */
         write: cfg.SITE_BRIDGE_WRITES
           ? {
@@ -226,7 +227,6 @@ async function main(): Promise<void> {
               defaultMint: cfg.DEFAULT_MINT,
               maxPerDayUsdCeiling: cfg.MAX_PER_DAY_USD_CEILING,
               maxLifetimeUsdCeiling: cfg.MAX_LIFETIME_USD_CEILING,
-              solUsd: () => feed.solUsd(),
             }
           : undefined,
       }),
@@ -748,7 +748,6 @@ async function main(): Promise<void> {
         ...(cfg.MINI_APP_URL !== undefined ? { miniAppUrl: cfg.MINI_APP_URL } : {}),
         maxPerDayUsdCeiling: cfg.MAX_PER_DAY_USD_CEILING,
         maxLifetimeUsdCeiling: cfg.MAX_LIFETIME_USD_CEILING,
-        solUsd: () => feed.solUsd(),
         log,
         arbiter: inputArbiter,
       });

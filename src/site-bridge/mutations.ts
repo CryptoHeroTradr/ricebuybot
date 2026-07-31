@@ -213,16 +213,6 @@ export interface ApplyIntentOptions {
   readonly defaultMint: string;
   readonly maxPerDayUsdCeiling?: number | undefined;
   readonly maxLifetimeUsdCeiling?: number | undefined;
-  /**
-   * Live SOL/USD, so an amount edit can be priced against the $1 minimum buy — the same guard, from
-   * the same feed, as the panel's. Null when the feed is down, which is the panel's behaviour too:
-   * a transient outage does not block an edit, and the execution-time skip is the backstop.
-   *
-   * A FUNCTION, not a number, because the deps are built once at boot and the price is not a
-   * constant. Capturing it at mount time would price every future edit at whatever SOL cost the day
-   * the process started.
-   */
-  readonly solUsd?: (() => number | null) | undefined;
 }
 
 /**
@@ -249,7 +239,7 @@ export async function applyIntent(
     case 'stop-all':
       return applyStopAll(repo, userId);
     case 'amount':
-      return applyAmount(repo, userId, id, arg(0), opts.solUsd?.() ?? null);
+      return applyAmount(repo, userId, id, arg(0));
     case 'interval':
       return applyInterval(repo, userId, id, arg(0));
     case 'caps': {

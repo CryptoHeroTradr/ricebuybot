@@ -44,8 +44,10 @@ const MINT2 = 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263' as Mint;
 const A = 111;
 const B = 222;
 const SOL = 1_000_000_000n;
-/** Live SOL/USD. At $200/SOL the $1 minimum buy is exactly 0.005 SOL, and 0.004 SOL is $0.80. */
-const SOL_USD = 200;
+/** The minimum buy is 0.001 SOL. 0.0005 SOL is half of it; 0.001 is the boundary, which belongs to
+ *  the user. No SOL/USD price appears in these tests because the floor no longer consults one. */
+const MIN_BUY_SOL = '0.001';
+const BELOW_MIN_SOL = '0.0005';
 
 let dir: string;
 let repo: SqliteRepo;
@@ -269,72 +271,76 @@ describe('stop / contract / wallet', () => {
 });
 
 // ===========================================================================================
-// THE $1 MINIMUM BUY APPLIES TO AN EDIT, NOT ONLY TO A CREATION
+// THE 0.001 SOL MINIMUM BUY APPLIES TO AN EDIT, NOT ONLY TO A CREATION
 // ===========================================================================================
 
 /**
  * The floor used to be checked in `applyNew` and again at execution, and nowhere in between — so
- * create at $2, edit to $0.50, and it was gone. From the panel, and over the site's write bridge,
- * since both reach `applyAmount`.
+ * create at 0.05 SOL, edit to 0.0005, and it was gone. From the panel, and over the site's write
+ * bridge, since both reach `applyAmount`.
  *
  * The execution-time skip did not make that acceptable. It advances the slot and logs a reason, so
  * the schedule sits there looking active and silently never trades, and nobody is told. Refusing
- * the edit is the difference between "that is below the $1 minimum" and a DCA that does nothing.
+ * the edit is the difference between "that is below the 0.001 SOL minimum" and a DCA that does
+ * nothing.
  */
 describe('applyAmount enforces the minimum buy', () => {
-  it('refuses an edit that would put the buy below $1, in applyNew’s exact words', async () => {
+  it('refuses an edit that would put the buy below 0.001 SOL, in applyNew’s exact words', async () => {
     const id = await seed(A);
     const before = (await repo.getSchedule(id))!.amountRaw;
 
-    const r = await applyAmount(repo, A, id, '0.004', SOL_USD); // $0.80
+    const r = await applyAmount(repo, A, id, BELOW_MIN_SOL);
     expect(r.ok).toBe(false);
-    expect(r.message).toContain('below the $1 minimum buy');
+    expect(r.message).toContain('below the 0.001 SOL minimum buy');
     expect((await repo.getSchedule(id))!.amountRaw).toBe(before); // nothing written
 
     // The same sentence a creation gets, because it is the same sentence.
-    const created = await applyNew(repo, A, MINT, 'buy', '0.004', '15', 1_000_000, SOL_USD);
+    const created = await applyNew(repo, A, MINT, 'buy', BELOW_MIN_SOL, '15', 1_000_000);
     expect(r.message).toBe(created.message);
   });
 
-  it('closes the create-at-$2-then-edit-to-$0.50 hole end to end', async () => {
-    const created = await applyNew(repo, A, MINT, 'buy', '0.01', '15', 1_000_000, SOL_USD); // $2 — fine
+  it('closes the create-above-then-edit-below hole end to end', async () => {
+    const created = await applyNew(repo, A, MINT, 'buy', '0.01', '15', 1_000_000); // 0.01 SOL — fine
     expect(created.ok).toBe(true);
     const id = (await repo.listSchedules(A))[0]!.id;
 
-    const edited = await applyAmount(repo, A, id, '0.0025', SOL_USD); // $0.50 — the old way through
+    const edited = await applyAmount(repo, A, id, BELOW_MIN_SOL); // the old way through
     expect(edited.ok).toBe(false);
-    expect((await repo.getSchedule(id))!.amountRaw).toBe(10_000_000n); // still the $2 amount
+    expect((await repo.getSchedule(id))!.amountRaw).toBe(10_000_000n); // still the 0.01 SOL amount
   });
 
   it('allows the boundary and anything above it — the floor is `<`, not `<=`', async () => {
     const id = await seed(A);
-    expect((await applyAmount(repo, A, id, '0.005', SOL_USD)).ok).toBe(true); // exactly $1.00
-    expect((await repo.getSchedule(id))!.amountRaw).toBe(5_000_000n);
-    expect((await applyAmount(repo, A, id, '0.5', SOL_USD)).ok).toBe(true);
+    expect((await applyAmount(repo, A, id, MIN_BUY_SOL)).ok).toBe(true); // exactly 0.001 SOL
+    expect((await repo.getSchedule(id))!.amountRaw).toBe(1_000_000n);
+    expect((await applyAmount(repo, A, id, '0.5')).ok).toBe(true);
   });
 
-  it('does NOT block what applyNew does not block: a percent sell, or a dead price feed', async () => {
-    // A percent-of-balance amount is not priceable until execution — applyNew skips the check for
-    // it, so this does too. Inventing a stricter rule here is how two surfaces start disagreeing.
+  it('does NOT block what applyNew does not block: a percent sell', async () => {
+    // A percent-of-balance amount is basis points, not lamports — there is no SOL figure to hold
+    // against the floor, and applyNew skips the check for it too. Inventing a stricter rule here is
+    // how two surfaces start disagreeing.
     const sell = await seed(A, { side: 'sell' });
-    expect((await applyAmount(repo, A, sell, '10%', SOL_USD)).ok).toBe(true);
-
-    // solUsd === null is the feed being down. A transient outage must not block an edit; the
-    // execution-time skip is the backstop, exactly as at creation.
-    const buy = await seed(A);
-    expect((await applyAmount(repo, A, buy, '0.004', null)).ok).toBe(true);
+    expect((await applyAmount(repo, A, sell, '10%')).ok).toBe(true);
   });
 
-  it('the typed command and the button prompt both price the edit', async () => {
+  /** The floor is SOL-denominated, so a dead SOL/USD feed cannot switch it off. It used to: a null
+   *  price skipped the check, which is the one hole this denomination closes rather than moves. */
+  it('holds with no price feed anywhere in reach — nothing here consults one', async () => {
+    const buy = await seed(A);
+    expect((await applyAmount(repo, A, buy, BELOW_MIN_SOL)).ok).toBe(false);
+  });
+
+  it('the typed command and the button prompt both enforce the floor', async () => {
     const id = await seed(A);
 
     // /trade amount <id> <amt>
-    const typed = await dispatchTradeCommand(repo, A, MINT, ['amount', String(id), '0.004'], 1_000_000, Infinity, Infinity, SOL_USD);
+    const typed = await dispatchTradeCommand(repo, A, MINT, ['amount', String(id), BELOW_MIN_SOL], 1_000_000, Infinity, Infinity);
     expect(typed.ok).toBe(false);
     expect(typed.message).toContain('minimum buy');
 
     // 💰 Amount button -> prompt -> reply. Single schedule, so the bare value form applies.
-    const prompted = await completePrompt(repo, A, 'amount', '0.004', MINT, 1_000_000, Infinity, Infinity, SOL_USD);
+    const prompted = await completePrompt(repo, A, 'amount', BELOW_MIN_SOL, MINT, 1_000_000, Infinity, Infinity);
     expect(prompted.ok).toBe(false);
     expect(prompted.message).toContain('minimum buy');
     expect((await repo.getSchedule(id))!.amountRaw).toBe(SOL / 20n);
@@ -495,7 +501,7 @@ describe('validate-before-write and user isolation', () => {
     // Alice tries to change Bob's schedule by id.
     for (const attempt of [
       () => applyInterval(repo, A, bId, '99'),
-      () => applyAmount(repo, A, bId, '0.5', SOL_USD),
+      () => applyAmount(repo, A, bId, '0.5'),
       () => applyPause(repo, A, bId),
     ]) {
       const r = await attempt();

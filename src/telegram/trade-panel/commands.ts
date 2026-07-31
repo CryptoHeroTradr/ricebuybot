@@ -1,7 +1,7 @@
 import type { Mint } from '../../core/types.js';
 import type { AmountKind, Caps, ExecutionRecord, Schedule, Side } from '../../trade/scheduler.js';
 import type { SettingChangeInput } from '../../trade/audit.js';
-import { HARD_MIN_BUY_USD } from '../../trade/executor.js';
+import { HARD_MIN_BUY_SOL, meetsMinBuy } from '../../trade/executor.js';
 
 /**
  * PHASE 15 — the command layer behind BOTH the typed commands and the buttons. Everything here is:
@@ -78,9 +78,11 @@ async function audit(repo: PanelRepo, entry: SettingChangeInput): Promise<void> 
 }
 
 /** The one sentence for a sub-minimum buy, so creating one and editing into one read alike — and
- *  so the two surfaces cannot drift, since both reach it through the same apply*. */
-function belowMinBuy(usd: number): string {
-  return `that buy is about $${usd.toFixed(2)} — below the $${HARD_MIN_BUY_USD} minimum buy. Increase the amount.`;
+ *  so the two surfaces cannot drift, since both reach it through the same apply*. It quotes SOL
+ *  because SOL is what was typed: a refusal in a unit the person did not enter makes them do the
+ *  conversion to find out what number would have worked. */
+function belowMinBuy(amountRaw: bigint): string {
+  return `that buy is ${Number(amountRaw) / LAMPORTS_PER_SOL} SOL — below the ${HARD_MIN_BUY_SOL} SOL minimum buy. Increase the amount.`;
 }
 
 /** Human-readable rendering of a schedule amount, for the audit trail (never for arithmetic). */
@@ -143,7 +145,6 @@ export function isPlausibleMint(mint: string): boolean {
 
 export async function applyNew(
   repo: PanelRepo, userId: number, contract: Mint, sideRaw: string, amountRaw: string, intervalRaw: string, now: number,
-  solUsd: number | null = null,
 ): Promise<ApplyResult> {
   const side = parseSide(sideRaw);
   if (!side) return err('side must be buy or sell, e.g. /trade new buy 0.05 15');
@@ -151,13 +152,12 @@ export async function applyNew(
   if ('error' in amt) return err(amt.error);
   const iv = parseInterval(intervalRaw);
   if (typeof iv !== 'number') return err(iv.error);
-  // MIN BUY (hard limit): refuse a buy that resolves below $1 at creation, when it can be priced.
-  // A percent buy is not priceable until execution (the scheduler skips it there); solUsd === null
-  // means the feed is down, so don't block creation on a transient outage — the execution-time skip
-  // is the backstop.
-  if (side === 'buy' && amt.amountKind === 'absolute' && solUsd != null) {
-    const usd = (Number(amt.amountRaw) / LAMPORTS_PER_SOL) * solUsd;
-    if (usd < HARD_MIN_BUY_USD) return err(belowMinBuy(usd));
+  // MIN BUY (hard limit): refuse a buy below 0.001 SOL at creation. The floor is on the lamports
+  // just parsed, so — unlike the USD floor this replaced — it needs no price feed and holds while
+  // the feed is down. A percent buy has no SOL amount at all; it is refused by `parseAmount` for a
+  // buy and skipped by the scheduler if a legacy row still holds one.
+  if (side === 'buy' && amt.amountKind === 'absolute' && !meetsMinBuy(amt)) {
+    return err(belowMinBuy(amt.amountRaw));
   }
   const id = await repo.createSchedule({
     userId, mint: contract, side, amountRaw: amt.amountRaw, amountKind: amt.amountKind,
@@ -176,37 +176,32 @@ export async function applyNew(
  * THE MINIMUM BUY APPLIES TO AN EDIT, NOT ONLY TO A CREATION.
  *
  * It used to be checked in `applyNew` and again at execution, and nowhere in between — so create at
- * $2, edit to $0.50, and the floor was gone. From the panel, and (once the site could write) over
- * the bridge, since both reach this one function.
+ * 0.05 SOL, edit to 0.0001, and the floor was gone. From the panel, and (once the site could write)
+ * over the bridge, since both reach this one function.
  *
  * The execution-time skip is not a substitute for refusing here. It advances the slot and logs a
  * reason, so the schedule sits there looking active and silently never trades, and the person who
  * set it is told nothing. A clean refusal at the moment they typed the number is the whole
- * difference between "that is below the $1 minimum" and a DCA that mysteriously does nothing.
+ * difference between "that is below the 0.001 SOL minimum" and a DCA that mysteriously does nothing.
  *
- * `solUsd` HAS NO DEFAULT, unlike `applyNew`'s trailing one. A default would be `null`, and a call
- * site that forgot to thread it would silently disable the floor again — which is precisely the bug
- * being closed. Making it required means the compiler names every caller that has to care.
- *
- * The two cases it does NOT block are `applyNew`'s, matched deliberately rather than reinvented:
- * a PERCENT-OF-BALANCE amount is not priceable until execution (the scheduler skips it there), and
- * a NULL solUsd means the price feed is down — a transient outage must not block an edit, and the
- * execution-time skip is the backstop for both.
+ * The floor is SOL-denominated (`meetsMinBuy`), so this no longer takes — or needs — a live SOL/USD
+ * price. That closed a hole rather than opening one: a null feed used to skip the check entirely,
+ * which is why the parameter was once mandatory. The one case it still does not block is
+ * `applyNew`'s, matched deliberately rather than reinvented: a PERCENT-OF-BALANCE amount is a sell
+ * concept with no SOL figure to compare, and `parseAmount` already refuses one for a buy.
  */
 export async function applyAmount(
   repo: PanelRepo,
   userId: number,
   id: number,
   amountRaw: string,
-  solUsd: number | null,
 ): Promise<ApplyResult> {
   const s = await ownedSchedule(repo, userId, id);
   if (isErr(s)) return s;
   const amt = parseAmount(amountRaw, s.side);
   if ('error' in amt) return err(amt.error);
-  if (s.side === 'buy' && amt.amountKind === 'absolute' && solUsd != null) {
-    const usd = (Number(amt.amountRaw) / LAMPORTS_PER_SOL) * solUsd;
-    if (usd < HARD_MIN_BUY_USD) return err(belowMinBuy(usd));
+  if (s.side === 'buy' && amt.amountKind === 'absolute' && !meetsMinBuy(amt)) {
+    return err(belowMinBuy(amt.amountRaw));
   }
   await repo.setScheduleAmount(id, amt.amountRaw, amt.amountKind);
   await audit(repo, {
@@ -421,13 +416,13 @@ export async function haltForWalletChange(repo: PanelRepo, userId: number): Prom
  */
 export async function dispatchTradeCommand(
   repo: PanelRepo, userId: number, contract: Mint, tokens: readonly string[], now: number,
-  maxPerDayUsdCeiling = Infinity, maxLifetimeUsdCeiling = Infinity, solUsd: number | null = null,
+  maxPerDayUsdCeiling = Infinity, maxLifetimeUsdCeiling = Infinity,
 ): Promise<ApplyResult> {
   const sub = tokens[0] ?? '';
   const a = (i: number): string => tokens[i] ?? '';
   switch (sub) {
-    case 'new': return applyNew(repo, userId, contract, a(1), a(2), a(3), now, solUsd);
-    case 'amount': return applyAmount(repo, userId, Number(a(1)), a(2), solUsd);
+    case 'new': return applyNew(repo, userId, contract, a(1), a(2), a(3), now);
+    case 'amount': return applyAmount(repo, userId, Number(a(1)), a(2));
     case 'interval': return applyInterval(repo, userId, Number(a(1)), a(2));
     case 'slippage': return applySlippage(repo, userId, Number(a(1)), a(2));
     case 'pause': return applyPause(repo, userId, Number(a(1)));
