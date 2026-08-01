@@ -95,14 +95,27 @@ echo
 echo "=============================================================================="
 echo " CAPS — a buy is refused if it breaches any of these"
 echo "=============================================================================="
+# NULL AND ZERO ARE OPPOSITES HERE, and printf renders both as '0.00'.
+#
+# `caps.max_lifetime_usd` is checked with `!= null`: NULL means NO lifetime cap, while 0 means a
+# budget of nothing — which HALTS the schedule on its first buy, with "lifetime budget of $0.00
+# reached". Those two states must never share a rendering, so this asks IS NULL explicitly rather
+# than leaning on COALESCE, which never fires because printf('%.2f', NULL) returns the string
+# '0.00' rather than NULL.
 q "
   SELECT user_id AS uid, substr(mint,1,6)||'…' AS mint,
          printf('\$%.2f', max_per_exec_usd) AS per_exec,
          printf('\$%.2f', max_per_day_usd) AS per_day,
-         COALESCE(printf('\$%.2f', max_lifetime_usd),'—') AS lifetime,
+         CASE WHEN max_lifetime_usd IS NULL THEN 'none'
+              WHEN max_lifetime_usd = 0     THEN '\$0 !! HALTS ON FIRST BUY'
+              ELSE printf('\$%.2f', max_lifetime_usd) END AS lifetime,
          printf('%.6f SOL', CAST(min_sol_reserve_lamports AS REAL)/1000000000.0) AS sol_reserve
   FROM caps ORDER BY user_id;
 "
+echo
+echo "  A cap breach HALTS the schedule — it never shrinks the buy to fit. The daily cap is"
+echo "  rolling-24h over confirmed AND unknown spend, so a fast schedule stops itself partway"
+echo "  through the day and needs a manual resume."
 
 echo
 echo "=============================================================================="
