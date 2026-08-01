@@ -682,7 +682,29 @@ not an exotic case; it is an ordinary user paying from the stablecoin they alrea
 were being silently eaten. `test/fixtures/buy-usdc-quoted.json` is a real one, and there is a test
 asserting the buyer's SOL delta really is 0 — i.e. that the old rule genuinely had nothing to see.
 
-**DOMINANT QUOTE — never a sum.** The quote is the single **largest** negative leg by USD value.
+**THE QUOTE IS MEASURED AT THE FILL, NOT AT THE WALLET.** `quoteRaw` is what the POOL took in, not
+what left the buyer. A buyer also pays for things that buy no tokens — an aggregator's platform
+fee, a Jito tip, the rent on a token account they did not own yet — and all of it used to be
+divided by `tokensRaw`, so it inflated `priceUsd` and with it **market cap, the whale test and the
+cost basis**: one line item, three wrong numbers.
+
+Found in production on treasury buy back `eghFg4i7…`. The wallet's net SOL delta was 0.022405, of
+which `meta.fee` was 0.000205 (already added back) and a further 0.0022 went to two service
+accounts. Only **0.01980237 SOL reached the pool** — so the card published **$84K against a real
+~$75K**, 12.1% high. Pricing the fill gives $74,981.
+
+`fillQuote` reads it off the other side of the same balance diff: whoever paid out the mint took
+the quote in. **The quantity match is the guard** — the fill is used only when the sources gave up
+EXACTLY the tokens this buyer gained, in raw units, which is what proves the quote belongs to THIS
+fill and not to a second trade sharing the transaction. Summed across sources, because a split
+route fills from several pools. When it does not match, we fall back to the buyer's own leg and log
+it. Still pure balance-delta (INVARIANT 1): no program id, no pool registry, no RPC call.
+
+`scripts/replay-card.ts` (`pnpm card:replay <signature>`) settles any "the card said X, the chart
+says Y" report by replaying the signature through the real parser and pricer.
+
+**DOMINANT QUOTE — never a sum.** The quote is the single **largest** leg by USD value on the side
+being measured.
 Do NOT sum the legs: a buyer paying in USDC also burns a couple of million lamports on ATA rent, and
 summing would book that dust as part of what they spent. That corrupts `priceUsd`, which feeds market
 cap **and** the whale test — one bad line item poisons three numbers.
@@ -720,7 +742,7 @@ from the buy itself:
 ```
 quoteUsd    = quoteRaw / 10^quoteDecimals * priceOf(quoteMint)
 usdIn       = quoteUsd
-priceUsd    = usdIn / (tokensRaw / 10^decimals)        <- execution price, from THIS trade
+priceUsd    = usdIn / (tokensRaw / 10^decimals)        <- the price THIS FILL PAID, not the wallet's outlay
 marketCap   = priceUsd * (supplyRaw / 10^decimals)
 holdingsUsd = priceUsd * (balanceAfterRaw / 10^decimals)   <- the whale test
 ```

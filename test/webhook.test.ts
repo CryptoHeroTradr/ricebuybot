@@ -80,7 +80,9 @@ describe('HeliusWebhookIngestor', () => {
 
     expect(buys.length).toBe(1);
     expect(buys[0]?.tokensRaw).toBe(27_305_176_224n);
-    expect(buys[0]?.quoteRaw).toBe(38_110_479n);
+    // The FILL leg — what the pool took in. The wallet paid 38_110_479, the extra being
+    // token-account rent and fee accounts. See fillQuote in normalize.ts.
+    expect(buys[0]?.quoteRaw).toBe(35_405_298n);
     expect(buys[0]?.balanceAfterRaw).toBe(27_305_176_224n);
   });
 

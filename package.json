@@ -19,6 +19,7 @@
     "media:tier": "node scripts/tier.ts",
     "verify:live": "DRY_RUN=true timeout 60 node --env-file-if-exists=.env dist/src/index.js",
     "cards:dry": "node dist/scripts/dry-run-cards.js",
+    "card:replay": "node dist/scripts/replay-card.js",
     "cards:fixtures": "pnpm build && node dist/scripts/dry-run-cards.js --fixtures",
     "audit:network": "node scripts/audit-network.mjs",
     "deploy:bot": "bash scripts/setup-bot.sh",

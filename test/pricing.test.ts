@@ -346,17 +346,24 @@ describe('integration: real buy reproduces correct USD and market cap (within 1%
    * The expected outputs were computed independently with Python's Decimal
    * (exact rational arithmetic, no float), NOT by running this code:
    *
-   *   usdIn        $2.921549
-   *   priceUsd     $0.000106996172
-   *   marketCapUsd $105,075.43
+   *   usdIn        $2.714170
+   *   priceUsd     $0.000099401305
+   *   marketCapUsd $97,616.90
+   *
+   * THESE NUMBERS MOVED 7.1% DOWN, and that move is the point of the change that moved them.
+   * They were pinned off the buyer's WALLET outflow (38,110,479 lamports), which on this fixture
+   * includes 2,705,181 lamports of token-account rent and fee-account transfers — money that never
+   * reached the pool and bought nothing. Only 35,405,298 did, and that is what the quote is now
+   * (see fillQuote in normalize.ts). The old pins were arithmetically exact and semantically
+   * wrong: the same 7% that published an $84K market cap for a token trading at ~$75K.
    */
   const PINNED_SOL_USD = 76.66;
   const RICE_SUPPLY_RAW = 982_048_494_777_792n;
   const RICE_DECIMALS = 6;
 
-  const EXPECT_USD_IN = 2.921549;
-  const EXPECT_PRICE_USD = 0.000106996172;
-  const EXPECT_MARKET_CAP = 105_075.43;
+  const EXPECT_USD_IN = 2.714170;
+  const EXPECT_PRICE_USD = 0.000099401305;
+  const EXPECT_MARKET_CAP = 97_616.90;
 
   const fx = JSON.parse(
     readFileSync(join(import.meta.dirname, 'fixtures', 'buy-pumpswap.json'), 'utf8'),
@@ -542,11 +549,12 @@ describe('Pricer — SOL staleness guard is scoped to SOL-quoted buys', () => {
     expect(out.status).toBe('priced'); // NOT held, despite solUsd() === null
     if (out.status !== 'priced') throw new Error('unreachable');
 
-    // 20.000000 USDC at $1.00.
-    expect(out.pricing.usdIn).toBeCloseTo(20, 6);
+    // 19.980000 USDC at $1.00 — the two pools' intake. The wallet paid 20.000000 and 0.020000 went
+    // to a platform-fee account, which bought no tokens and so is not part of the price.
+    expect(out.pricing.usdIn).toBeCloseTo(19.98, 6);
 
-    // priceUsd = 20 / (29200568 / 1e6) = $0.000684918…
-    expect(out.pricing.priceUsd).toBeCloseTo(20 / (29_200_568 / 1e6), 9);
+    // priceUsd = 19.98 / (29200568 / 1e6) = $0.000684233…
+    expect(out.pricing.priceUsd).toBeCloseTo(19.98 / (29_200_568 / 1e6), 9);
     expect(pricer.heldCount).toBe(0);
   });
 

@@ -32,7 +32,11 @@ interface Expectation {
   kind: 'buy' | 'sell';
   who: string;
   tokensRaw: bigint;
+  /** THE FILL LEG — what the pool took in. This is `quoteRaw`, and it is the price of the trade. */
   quoteRaw: bigint;
+  /** What left the WALLET: the trade plus fees, tips and rent. Documentation, and the subject of
+   *  the fill-leg test below — never an expected `quoteRaw`. */
+  walletPaidRaw?: bigint;
   quoteSymbol: string;
   balanceBeforeRaw: bigint;
   balanceAfterRaw: bigint;
@@ -74,7 +78,12 @@ const EXPECTED: Record<string, Expected> = {
     kind: 'buy',
     who: '2jyhLnupSCduevsTBoA7hdpyz9CBnoKHbDfcEXa3Hkc5',
     tokensRaw: 5_460_328_478_971n,
-    quoteRaw: 453_162_403n,
+    // THE FILL LEG: what the bonding curve actually took in. The wallet's net outflow was
+    // 453_162_403 — 8_717_960 lamports (1.9%) more, being pump's fee and the token-account rent,
+    // neither of which bought a token. Pricing the wallet inflated priceUsd and market cap by that
+    // much. See fillQuote in normalize.ts.
+    quoteRaw: 444_444_443n,
+    walletPaidRaw: 453_162_403n,
     quoteSymbol: 'SOL',
     balanceBeforeRaw: 0n,
     balanceAfterRaw: 5_460_328_478_971n,
@@ -83,7 +92,10 @@ const EXPECTED: Record<string, Expected> = {
     kind: 'buy',
     who: 'BfEhdonWCqQa3qxucTevNCizBnnaSJ7kJY4D1qSgiicQ',
     tokensRaw: 27_305_176_224n,
-    quoteRaw: 38_110_479n,
+    // The pool took 35_405_298; the wallet paid 38_110_479. The 2_705_181 lamport gap (7.6% — this
+    // is a small buy, so rent dominates) went to a new token account's rent and four fee accounts.
+    quoteRaw: 35_405_298n,
+    walletPaidRaw: 38_110_479n,
     quoteSymbol: 'SOL',
     balanceBeforeRaw: 0n,
     balanceAfterRaw: 27_305_176_224n,
@@ -222,6 +234,79 @@ describe('normalizeSwap — real mainnet fixtures (INVARIANT 1: balance-delta on
   });
 
   /**
+   * THE QUOTE IS THE FILL LEG, NOT THE WALLET OUTFLOW.
+   *
+   * A buyer pays for more than the trade: an aggregator's platform fee, a Jito tip, the rent for a
+   * token account they did not own yet. None of it reaches the pool and none of it buys a token —
+   * but all of it used to be divided by `tokensRaw`, so it inflated `priceUsd` and with it MARKET
+   * CAP, the whale test and the cost basis.
+   *
+   * Found in production on treasury buy back eghFg4i7…: the wallet's net SOL delta was 0.0224 and
+   * only 0.0198 reached the pool, so the card published an $84K market cap against a real ~$75K.
+   *
+   * These three fixtures are the same bug at three different sizes, and the gap is the fee — never
+   * zero, and biggest on the smallest buy, where a fixed 0.00204 SOL of account rent is 5% of the
+   * trade. That is why "just use the wallet delta" cannot be rescued with a tolerance.
+   */
+  it.each([
+    ['buy-pumpfun-bonding-curve', 444_444_443n, 453_162_403n, 'pump fee + account rent'],
+    ['buy-pumpswap', 35_405_298n, 38_110_479n, 'account rent + four fee accounts'],
+    ['buy-usdc-quoted', 19_980_000n, 20_000_000n, 'a 0.1% platform fee'],
+  ])('%s prices the fill, not the wallet (%s)', (name, fill, wallet) => {
+    const fx = load(name);
+    const { event } = normalizeSwap(fx.tx, fx.mint as Mint, { solUsd: 150 });
+
+    expect(event?.kind).toBe('buy');
+    expect((event as { quoteRaw: bigint }).quoteRaw).toBe(fill);
+    // The wallet really did part with more than that. Both numbers are true; only one of them is
+    // the price of the tokens, and dividing the other by `tokensRaw` is what published $84K.
+    expect(fill).toBeLessThan(wallet);
+  });
+
+  /**
+   * THE GUARD: only price the fill when the fill IS this buy.
+   *
+   * The quantity match is what makes reading the counterparty's side safe without a per-DEX decoder
+   * (INVARIANT 1). Here a second trade shares the transaction — the sources give up MORE of the
+   * mint than this buyer received — so the quote on that side is not this buy's price, and the
+   * parser falls back to the buyer's own leg rather than guessing.
+   */
+  it('falls back to the buyer leg when the fill does not match the tokens bought', () => {
+    const BUYER = 'BuyerWa11etAddressAAAAAAAAAAAAAAAAAAAAAAAAAA';
+    const POOL = 'Poo1Acc0untAddressAAAAAAAAAAAAAAAAAAAAAAAAAA';
+    const MINT_X = 'MintXAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' as Mint;
+    const WSOL = 'So11111111111111111111111111111111111111112';
+    const tokenBal = (index: number, mint: string, owner: string, amount: string) => ({
+      accountIndex: index, mint, owner, uiTokenAmount: { amount, decimals: 6, uiAmountString: amount },
+    });
+
+    const tx = {
+      slot: 1,
+      blockTime: 1,
+      transaction: {
+        signatures: ['sig-two-trades'],
+        message: { accountKeys: [{ pubkey: BUYER, signer: true, writable: true }, { pubkey: POOL, signer: false, writable: true }] },
+      },
+      meta: {
+        err: null,
+        fee: 5000,
+        preBalances: [1_000_000_000, 0],
+        postBalances: [990_000_000, 0], // buyer paid 0.01 SOL (minus the fee, added back)
+        preTokenBalances: [tokenBal(2, MINT_X, BUYER, '0'), tokenBal(3, MINT_X, POOL, '5000'), tokenBal(4, WSOL, POOL, '0')],
+        postTokenBalances: [tokenBal(2, MINT_X, BUYER, '1000'), tokenBal(3, MINT_X, POOL, '3000'), tokenBal(4, WSOL, POOL, '8000000')],
+      },
+    } as unknown as Parameters<typeof normalizeSwap>[0];
+
+    // The pool gave up 2000 of the mint; this buyer received 1000. Somebody else took the rest, so
+    // the pool's 0.008 SOL intake is not the price of THIS fill.
+    const { event } = normalizeSwap(tx, MINT_X, { solUsd: 150 });
+    expect(event?.kind).toBe('buy');
+    // The buyer's own leg: 0.01 SOL left the wallet, of which 5_000 lamports was gas — added
+    // back, because gas is not buying pressure — leaving 9_995_000.
+    expect((event as { quoteRaw: bigint }).quoteRaw).toBe(9_995_000n);
+  });
+
+  /**
    * THE PHASE 2.5 BUG, as a fixture.
    *
    * A real Jupiter swap paid from a USDC balance. The route goes through SOL
@@ -241,7 +326,9 @@ describe('normalizeSwap — real mainnet fixtures (INVARIANT 1: balance-delta on
 
     expect(buy.quoteSymbol).toBe('USDC');
     expect(buy.quoteMint).toBe('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
-    expect(buy.quoteRaw).toBe(20_000_000n); // 20.000000 USDC at 6dp
+    // 19.980000 USDC — what the two pools took in. The buyer's wallet paid exactly 20.000000 and
+    // 0.020000 went to a platform-fee account, which bought nothing. See fillQuote.
+    expect(buy.quoteRaw).toBe(19_980_000n);
     expect(buy.tokensRaw).toBe(29_200_568n);
     expect(buy.buyer).toBe('5QLpP6UH7jEXEnZUrxZmRTWGa6Ajmum5ei62JvBHFCiL');
 

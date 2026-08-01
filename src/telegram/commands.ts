@@ -4,6 +4,7 @@ import type { Logger } from 'pino';
 import type { ChatId, ChatToken, MediaKind, Mint, Signature, Wallet } from '../core/types.js';
 import { TIERS, isTierName, type TierName } from '../core/tiers.js';
 import { symbol as displaySymbol } from '../render/format.js';
+import { rawAmount, toFloat } from '../core/money.js';
 import type { Repo } from '../db/index.js';
 import type { MediaPool } from '../media/index.js';
 import { renderCard } from '../render/card.js';
@@ -951,7 +952,12 @@ export function registerCommands(bot: Bot, deps: CommandDeps): void {
     const caps = await capsOf(repo, ct.chatId); // consults PLAN_WHITELIST
     const eff = effective(ct, caps, DEFAULT_LINKS);
 
+    // The preview's market cap is DERIVED from its own invented price and the token's REAL supply,
+    // exactly as a live card derives it (pricing/derive.ts). It used to be a hardcoded $1,000,000,
+    // which made the one number on the card that people sanity-check against a chart a number that
+    // could never match — and left `spent / got` disagreeing with the market cap it sat next to.
     const priceUsd = 0.0001;
+    const previewMarketCapUsd = priceUsd * toFloat(rawAmount(token.supplyRaw, token.decimals));
     const card = renderCard({
       signature: 'preview' as Signature,
       mint: ct.mint,
@@ -964,7 +970,7 @@ export function registerCommands(bot: Bot, deps: CommandDeps): void {
       quoteAmount: usdIn / 150,
       quoteSymbol: 'SOL',
       tokensOut: usdIn / priceUsd,
-      marketCapUsd: 1_000_000,
+      marketCapUsd: previewMarketCapUsd,
       whaleValueUsd: holdingsUsd,
       position: null,
       emoji: ct.emoji,

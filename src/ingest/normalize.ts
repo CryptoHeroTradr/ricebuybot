@@ -311,12 +311,39 @@ export function normalizeSwap(tx: ConfirmedTx, mint: Mint, opts: NormalizeOpts =
     const owner = pickOwner(buyers, signers);
     const d = mintDeltas.get(owner) as OwnerDelta;
 
-    let quote = dominantQuote(legsOf(owner), 'out', solUsd, { signature, mint, owner }, log);
+    const buyerLeg = dominantQuote(legsOf(owner), 'out', solUsd, { signature, mint, owner }, log);
+
+    // PRICE THE FILL, NOT THE WALLET. What left the buyer includes tips, aggregator fees and
+    // token-account rent, none of which bought a token; what the pool took in is the trade. Falls
+    // back to the buyer's leg whenever the fill cannot be matched to this buy. See fillQuote.
+    const fill = fillQuote(mintDeltas, legsOf, owner, d.delta, solUsd, { signature, mint }, log);
+    let quote = fill ?? buyerLeg;
+
+    if (fill && buyerLeg) {
+      const paid = approxUsd(buyerLeg.def, buyerLeg.raw, solUsd);
+      const swapped = approxUsd(fill.def, fill.raw, solUsd);
+      // Worth a line when the gap is real: it is the fee the buyer paid to somebody who is not the
+      // pool, and it is the difference between the card's figure and the one they will see on a
+      // chart. Under 2% is ordinary rent-and-dust and would only be noise.
+      if (paid > 0 && swapped > 0 && paid / swapped - 1 > 0.02) {
+        log?.info(
+          {
+            signature,
+            mint,
+            owner,
+            walletPaidUsd: Number(paid.toFixed(4)),
+            reachedPoolUsd: Number(swapped.toFixed(4)),
+            overheadPct: Number(((paid / swapped - 1) * 100).toFixed(2)),
+          },
+          'buy priced from the fill leg — the wallet paid more than reached the pool (tip/platform fee/rent)',
+        );
+      }
+    }
 
     // Did they pay in a token the registry cannot price? Then the registry outflow above is
     // NOT the payment — it is routing dust — and the real figure is on the other side of the
-    // fill. See routedQuote.
-    if (counterLegs(preTok, postTok, mint, owner).some((c) => c.delta < 0n)) {
+    // fill. See routedQuote. Only reachable when fillQuote declined (its quantity match failed).
+    if (!fill && counterLegs(preTok, postTok, mint, owner).some((c) => c.delta < 0n)) {
       const routed = routedQuote(mintDeltas, legsOf, owner, solUsd, { signature, mint }, log);
       const dust = quote ? approxUsd(quote.def, quote.raw, solUsd) : 0;
       const filled = routed ? approxUsd(routed.def, routed.raw, solUsd) : 0;
@@ -476,6 +503,75 @@ function counterLegs(
   for (const b of post) bump(b, 1n);
 
   return [...totals].filter(([, delta]) => delta !== 0n).map(([m, delta]) => ({ mint: m, delta }));
+}
+
+/**
+ * THE SWAP LEG IS MEASURED AT THE FILL, NOT AT THE BUYER'S WALLET.
+ *
+ * What leaves a buyer's wallet is the trade PLUS everything else the transaction made them pay:
+ * an aggregator's platform fee, a Jito tip, the rent for a token account they did not have yet.
+ * None of that reached the pool, none of it bought a single token, and all of it used to be
+ * divided by `tokensRaw` — so it inflated `priceUsd`, and with it MARKET CAP, the whale test and
+ * the cost basis. One line item, three wrong numbers, exactly as the dominant-quote rule warned.
+ *
+ * Signature eghFg4i7… is a real treasury buy back: the wallet's net SOL delta was 0.022405, of
+ * which `meta.fee` accounted for 0.000205 (already added back) and a further 0.0022 went to two
+ * service accounts that are not the AMM. Only **0.01980237 SOL reached the pool**. The card was
+ * therefore priced 12.1% high and published a $84K market cap against a real ~$75K.
+ *
+ * The right number is on-chain, one row further down the same balance diff: whoever PAID OUT the
+ * mint took the quote IN, and that is the trade. Here, the pump AMM pool: -18,375.476441 RICE and
+ * +0.01980237 wSOL. Pricing off that gives $74,981 — the pool's own price, which is what a market
+ * cap is supposed to be.
+ *
+ * THE QUANTITY MATCH IS THE GUARD, and it is what makes this safe without a per-DEX decoder
+ * (INVARIANT 1). We use the fill only when the sources gave up EXACTLY the tokens this buyer
+ * gained, in raw units. That is what proves the quote we found belongs to THIS fill and not to a
+ * second trade sharing the transaction — an arb, a sandwich, two buyers in one route. When the
+ * numbers do not line up we do not guess: we fall back to the buyer's own leg, which is the
+ * behaviour that shipped for two years, and say so in the log.
+ *
+ * Summed across sources, because a split route fills from several pools and any single one of
+ * them is a fraction of the trade.
+ */
+function fillQuote(
+  mintDeltas: Map<string, OwnerDelta>,
+  legsOf: (owner: string) => QuoteLeg[],
+  buyer: string,
+  tokensGained: bigint,
+  solUsd: number | null,
+  ctx: { signature: string; mint: Mint },
+  log?: Logger,
+): { def: QuoteAssetDef; raw: bigint } | null {
+  const sources = [...mintDeltas.entries()].filter(([owner, d]) => owner !== buyer && d.delta < 0n);
+  if (sources.length === 0) return null;
+
+  const supplied = sources.reduce((sum, [, d]) => sum + abs(d.delta), 0n);
+  if (supplied !== tokensGained) {
+    // Not this buyer's fill alone. Could be a second trade in the same transaction, or a
+    // transfer-fee token where the pool debits more than the buyer receives. Either way the
+    // quote on that side is not the price of THIS buy.
+    log?.debug(
+      { ...ctx, buyer, tokensGained: tokensGained.toString(), supplied: supplied.toString() },
+      'fill leg does not match the tokens bought — pricing from the buyer leg instead',
+    );
+    return null;
+  }
+
+  // Sum each registry asset the fill side took IN, across every source.
+  const totals = new Map<Mint, bigint>();
+  for (const [owner] of sources) {
+    for (const leg of legsOf(owner)) {
+      if (leg.delta > 0n) totals.set(leg.def.mint, (totals.get(leg.def.mint) ?? 0n) + leg.delta);
+    }
+  }
+
+  const legs: QuoteLeg[] = [];
+  for (const [mint, delta] of totals) {
+    const def = QUOTE_REGISTRY.find((q) => q.mint === mint);
+    if (def) legs.push({ def, delta });
+  }
+  return dominantQuote(legs, 'in', solUsd, { ...ctx, owner: 'fill' }, log);
 }
 
 /**
