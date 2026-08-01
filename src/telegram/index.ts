@@ -16,7 +16,7 @@
  */
 export { TelegramSender, DryRunSender, type Sender, type Outbound } from './sender.js';
 export { DeliveryQueue, type Job, type QueueDeps } from './queue.js';
-export { fanOut, type Priced, type FanOutDeps, type CardSummary } from './fanout.js';
+export { fanOut, isTreasuryBuy, type Priced, type FanOutDeps, type CardSummary } from './fanout.js';
 export { classify, isCustomEmojiRejection, type Verdict } from './errors.js';
 export { registerCommands, type CommandDeps } from './commands.js';
 export { requireGroupAdmin, requireDmOwner, type Gate } from './admin.js';

@@ -1,5 +1,5 @@
 import type { MediaItem } from '../../core/types.js';
-import { TIERS, DCA_FOLDER, MEDIA_FOLDERS, type MediaFolder } from '../../core/tiers.js';
+import { TIERS, DCA_FOLDER, TREASURY_FOLDER, MEDIA_FOLDERS, type MediaFolder } from '../../core/tiers.js';
 import { cb } from './session.js';
 
 /**
@@ -16,12 +16,15 @@ export interface Button {
 }
 
 /**
- * The display name for a media folder. The four tiers have proper names; `dca` is a sibling on
- * the category axis, not a tier, so it has no TierSpec — it renders as "DCA". A folder that is
- * neither would fall through to its own string, but `isMediaFolder` gates every caller.
+ * The display name for a media folder. The four tiers have proper names; `dca` and `treasury` are
+ * siblings on the category axis, not tiers, so they have no TierSpec — they render as "DCA" and
+ * "Treasury". A folder that is none of those would fall through to its own string, but
+ * `isMediaFolder` gates every caller.
  */
+const CATEGORY_NAMES: Readonly<Record<string, string>> = { [DCA_FOLDER]: 'DCA', [TREASURY_FOLDER]: 'Treasury' };
+
 export function folderName(folder: MediaFolder): string {
-  return folder === DCA_FOLDER ? 'DCA' : (TIERS.find((t) => t.folder === folder)?.name ?? folder);
+  return CATEGORY_NAMES[folder] ?? TIERS.find((t) => t.folder === folder)?.name ?? folder;
 }
 
 export function boardText(symbol: string, counts: Readonly<Record<MediaFolder, number>>): string {
@@ -42,9 +45,9 @@ export function boardKeyboard(token: string, counts: Readonly<Record<MediaFolder
   return [
     [b(TIERS[0].folder), b(TIERS[1].folder)],
     [b(TIERS[2].folder), b(TIERS[3].folder)],
-    // dca is not a tier — it sits on its own row, below the size ladder, so the board reads as
-    // "four tiers, plus the DCA pool" and never as "five tiers".
-    [b(DCA_FOLDER)],
+    // dca and treasury are not tiers — they share a row BELOW the size ladder, so the board reads
+    // as "four tiers, plus two category pools" and never as "six tiers".
+    [b(DCA_FOLDER), b(TREASURY_FOLDER)],
   ];
 }
 

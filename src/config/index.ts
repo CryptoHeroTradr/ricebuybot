@@ -8,6 +8,9 @@ import { z } from 'zod';
 
 const BASE58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
+/** The flagship $RICE treasury. See TREASURY_WALLET below for why this has a default at all. */
+const DEFAULT_TREASURY_WALLET = '9uxQ6PxRPSNzTxWnXMssWE3er3a8bhYbD1TxMxmzks2h';
+
 const boolVar = (dflt: boolean) =>
   z
     .enum(['true', 'false', '1', '0'], { message: 'must be true or false' })
@@ -233,6 +236,32 @@ const EnvSchema = z
 
     /** Phase 16: the wallet whose DCA line renders as "Creator Fee" instead of an address. Optional. */
     CREATOR_FEE_WALLET: z.string().regex(BASE58, 'must be a base58 address').optional(),
+
+    /**
+     * PHASE 17 — the project's treasury wallet. Its buys card as a TREASURY BUY BACK.
+     *
+     * CONFIG WITH A SHIPPED DEFAULT, the same call as JUPITER_RECURRING_PROGRAM_IDS: which address
+     * holds a treasury is a fact about the deployment, not about this repo, so an operator must be
+     * able to change it without a patch — but the flagship's address is known, and a feature that
+     * silently does nothing until someone edits an env file is a feature that gets reported as
+     * broken. Set `TREASURY_WALLET=` (empty) to turn it off; then no buy is ever a buy back.
+     *
+     * It is matched by ADDRESS ALONE, on any mint this bot watches. That is deliberate and it is
+     * the narrow reading: this wallet buying some other group's token would card as a buy back
+     * there too. The alternative — scoping it to DEFAULT_MINT — would silently stop working the day
+     * the flagship's own mint changed, which is the worse failure of the two.
+     *
+     * THE OFF SWITCH IS THE LITERAL `off`, NOT AN EMPTY VALUE. `dropEmpty()` strips blank env vars
+     * before this schema ever sees them, so `TREASURY_WALLET=` reads as absent — which, with a
+     * default, means ON. A word that has to be typed cannot be produced by an accidentally blank
+     * line, and it is the only spelling that can mean "I have decided against this feature" rather
+     * than "this variable is unset". It normalises to '' here, which is the one value the fan-out
+     * treats as matching nothing.
+     */
+    TREASURY_WALLET: z
+      .union([z.literal('off'), z.string().regex(BASE58, "must be a base58 address, or 'off' to disable")])
+      .default(DEFAULT_TREASURY_WALLET)
+      .transform((v) => (v === 'off' ? '' : v)),
 
     /**
      * PHASE 7 — the Jupiter recurring-order programs that make a wallet-mode buy count as DCA.

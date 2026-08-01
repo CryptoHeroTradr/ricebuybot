@@ -1,5 +1,5 @@
 import type { ChatId, MediaItem, MediaKind, Mint } from '../core/types.js';
-import type { TierFolder, TierName } from '../core/tiers.js';
+import type { CardCategory, MediaFolder, TierFolder } from '../core/tiers.js';
 
 export { FsMediaPool } from './media-pool.js';
 export { LocalFsSource } from './source-local.js';
@@ -106,9 +106,10 @@ export interface PoolHealth {
 }
 
 export interface Pick {
-  readonly earnedTier: TierName;
+  /** One of the four tiers, or `Treasury` — the category the CARD's copy is rendered from. */
+  readonly earnedTier: CardCategory;
   /** The folder the art actually came from. Differs from earned when a tier is empty. */
-  readonly usedTier: TierFolder | null;
+  readonly usedTier: MediaFolder | null;
   /** Null when the pool has no art at all — Phase 7 falls back to static, then to text. */
   readonly item: MediaItem | null;
 }
@@ -157,6 +158,20 @@ export interface MediaPool {
    * A pool with nothing in it at all returns `item: null` and the post still goes out.
    */
   pick(mint: Mint, chatId: ChatId, usdIn: number, whaleValueUsd: number): Promise<Pick | null>;
+
+  /**
+   * PHASE 17 — art for a TREASURY BUY BACK, or null.
+   *
+   * The `treasury/` folder rotates on its OWN shuffle bag (keyed on the folder, so it never syncs
+   * with the tier bags) and NEVER borrows tier art. That is the same rule `dca` follows and for the
+   * same reason: the folder exists so a buy back is recognisable at a glance, and a buy back
+   * showing a `regular/` meme is exactly the thing it was separated out to avoid.
+   *
+   * An empty `treasury/` returns null and the card still goes out — fan-out falls through to the
+   * chat's static image and then to text (NEVER FAIL A POST FOR WANT OF ART). Nothing is
+   * misrepresented by that: the headline is a fact about the buyer, not about the folder.
+   */
+  pickTreasury(mint: Mint, chatId: ChatId): Promise<MediaItem | null>;
 
   /**
    * The Telegram file_id for an item, uploading the bytes ONCE on first use and caching

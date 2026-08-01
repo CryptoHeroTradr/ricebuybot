@@ -1,7 +1,7 @@
 import type { Logger } from 'pino';
 
 import type { ChatId, MediaItem, MediaKind, Mint } from '../core/types.js';
-import { TIER_BY_FOLDER, TIER_FOLDERS, DCA_FOLDER, pickTier, type TierFolder, type MediaFolder, type TierPolicy } from '../core/tiers.js';
+import { TIER_BY_FOLDER, TIER_FOLDERS, DCA_FOLDER, TREASURY_FOLDER, pickTier, type TierFolder, type MediaFolder, type TierPolicy } from '../core/tiers.js';
 import type { Repo } from '../db/index.js';
 import type { MediaPool, MediaSource, MediaUploader, Pick, PoolHealth } from './index.js';
 import { popFromBag } from './rotation.js';
@@ -223,6 +223,19 @@ export class FsMediaPool implements MediaPool {
     if (!item) return null;
     const fileId = await this.fileIdFor(item);
     return fileId ? { fileId, kind: item.kind } : null; // no file_id yet -> text-only this time
+  }
+
+  /**
+   * PHASE 17 — pick TREASURY BUY BACK art for a chat, or null.
+   *
+   * Same shape as `pickDca` and the same two rules: its own shuffle bag (keyed on the folder), and
+   * it NEVER borrows tier art. It returns the ITEM rather than a file_id because fan-out resolves
+   * media lazily inside the send job — a card dropped as stale must never have paid for an upload.
+   */
+  async pickTreasury(mint: Mint, chatId: ChatId): Promise<MediaItem | null> {
+    const live = await this.#repo.listMedia(mint, TREASURY_FOLDER);
+    if (live.length === 0) return null; // static/text fallback in fan-out; NEVER a tier meme
+    return this.#popFor(mint, chatId, TREASURY_FOLDER, live);
   }
 
   /** Live (= not removed; missing INCLUDED) items, grouped by tier. */

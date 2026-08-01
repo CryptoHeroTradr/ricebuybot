@@ -291,9 +291,11 @@ describe('DCA attribution from the buys table', () => {
 // ===========================================================================================
 
 describe('the dca folder is a sibling of the tiers, not one of them', () => {
-  it('TIER_FOLDERS stays four; MEDIA_FOLDERS is the five places media may live', () => {
+  it('TIER_FOLDERS stays four; MEDIA_FOLDERS is every place media may live', () => {
     expect(TIER_FOLDERS).toEqual(['regular', 'big', 'whale', 'massive']);
-    expect(MEDIA_FOLDERS).toEqual(['regular', 'big', 'whale', 'massive', 'dca']);
+    // The category folders sit AFTER the four tiers and are appended, never inserted: `dca` and
+    // `treasury` are siblings of the ladder, and the ladder itself has not moved.
+    expect(MEDIA_FOLDERS).toEqual(['regular', 'big', 'whale', 'massive', 'dca', 'treasury']);
     // dca is a media folder but NOT a tier — the size ladder is still four-way.
     expect(isMediaFolder('dca')).toBe(true);
     expect(isTierFolder('dca')).toBe(false);

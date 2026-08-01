@@ -10,7 +10,7 @@ import { createSiteBridgeRoute } from './site-bridge/routes.js';
 import { registerLinkSiteCommand } from './site-bridge/command.js';
 import { registerDcaCommand } from './telegram/dca-command.js';
 import { FsMediaPool, HttpManifestSource, LocalFsSource } from './media/index.js';
-import { DeliveryQueue, DryRunSender, TelegramSender, fanOut, registerCommands, type Sender } from './telegram/index.js';
+import { DeliveryQueue, DryRunSender, TelegramSender, fanOut, isTreasuryBuy, registerCommands, type Sender } from './telegram/index.js';
 import { Keystore } from './trade/keystore.js';
 import { registerTradeCommands } from './telegram/trade-commands.js';
 import { bootNotices, envUnlock } from './trade/unlock.js';
@@ -392,13 +392,26 @@ async function main(): Promise<void> {
     await applier.onSwap(e, outcome);
     if (outcome.status !== 'priced') return;
 
+    // PHASE 17 — A TREASURY BUY BACK OUTRANKS BOTH SUPPRESSION RULES BELOW, so it is asked first.
+    //
+    // Against DCA: `isDca` has a SIDE EFFECT — it attributes a wallet-mode fill so the aggregate
+    // can find it — so this cannot be a check on the fan-out side alone. If the treasury ever runs
+    // its buy backs through a recurring order, asking isDca first would file the buy into the
+    // window roll-up and the buy back card would never fire; asking treasury first keeps the buy
+    // out of the aggregate entirely, so it is disclosed exactly once, in the more specific shape.
+    //
+    // Against the burst digest: a buy back is the group's own news. Being buried in a "127 buys
+    // this minute" summary during the exact pump the treasury is supporting is the one moment the
+    // card most needs to be visible.
+    const treasuryBuy = isTreasuryBuy(e.buyer, cfg.TREASURY_WALLET);
+
     // DCA SUPPRESSION (Phase 16, widened in Phase 7): a buy that is a DCA never fans out as an
     // organic card — it is rolled into the per-window aggregate instead. Checked here, before
     // tiering/media, so a DCA buy still recorded in `buys` (for the aggregate) never also posts a
     // full buy card. Attribution does not wait for confirmation: a 'submitted'/'UNKNOWN' execution
     // still counts. Both halves of the set — our custodial sends AND a wallet-mode member's own
     // Jupiter recurring fills — answer through the one `isDca` above.
-    if (await dcaAttribution.isDca(e)) {
+    if (!treasuryBuy && (await dcaAttribution.isDca(e))) {
       log.debug({ signature: e.signature, mint: e.mint }, 'buy is a DCA — suppressed from organic fan-out, rolled into the aggregate');
       return;
     }
@@ -413,8 +426,11 @@ async function main(): Promise<void> {
 
     // Is this mint bursting? Record it and, if so, DO NOT fan out — the digest timer will
     // summarise the window. The buy is already ingested and folded; only the card is held.
+    // `burst.record` is called EITHER WAY — a buy back is a real buy and still counts toward
+    // whether the mint is bursting. Only the decision to hold the card is skipped for it.
     const tier = pickTier(pricing.usdIn, whaleValueUsd, DEFAULT_TIER_POLICY);
-    if (tier && burst.record(e.mint, { usdIn: pricing.usdIn, tier: tier.name })) {
+    const bursting = tier !== null && burst.record(e.mint, { usdIn: pricing.usdIn, tier: tier.name });
+    if (bursting && !treasuryBuy) {
       log.info(
         {
           sig: e.signature,
@@ -445,6 +461,7 @@ async function main(): Promise<void> {
           media: mediaPool,
           queue,
           log,
+          treasuryWallet: cfg.TREASURY_WALLET,
           onCard: (card) => {
             // THE one info-level line per buy. Everything a "why did that fire as a whale?"
             // question needs is here — earnedTier AND holdingsUsd — so it is answerable from

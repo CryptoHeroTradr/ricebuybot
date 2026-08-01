@@ -1,9 +1,9 @@
 import type { Logger } from 'pino';
 
 import type { BuyEvent, MediaKind, Mint } from '../core/types.js';
-import { TIER_BY_NAME } from '../core/tiers.js';
+import { TIER_BY_NAME, TREASURY_FOLDER, TREASURY_NAME } from '../core/tiers.js';
 import type { Repo } from '../db/index.js';
-import type { MediaPool } from '../media/index.js';
+import type { MediaPool, Pick } from '../media/index.js';
 import { renderCard, type CardInput } from '../render/card.js';
 import type { PositionView } from '../render/position.js';
 import type { DeliveryQueue } from './queue.js';
@@ -46,6 +46,15 @@ export interface FanOutDeps {
   readonly onCard?: (summary: CardSummary) => void;
   /** The ledger view for the Position line. Null when we have no basis to speak of. */
   readonly position?: (mint: Mint, buyer: string) => Promise<PositionView | null>;
+  /**
+   * PHASE 17 — the project's treasury wallet (cfg.TREASURY_WALLET). A buy FROM it cards as a
+   * TREASURY BUY BACK: same layout, its own headline, its own art folder.
+   *
+   * Absent (or empty) means the feature is off and no buy is ever a buy back — never that some
+   * default address is assumed here. The default lives in `config/`, where an operator can see it
+   * and override it; a second one hidden in the fan-out would be a rule nobody could find.
+   */
+  readonly treasuryWallet?: string | undefined;
 }
 
 /**
@@ -62,13 +71,24 @@ export async function fanOut(event: BuyEvent, priced: Priced, deps: FanOutDeps):
   const { repo, media, queue, log } = deps;
   const now = deps.now ?? Date.now;
 
+  // PHASE 17 — is this the treasury buying its own token back? Decided ONCE, here, for every
+  // watching chat: the answer is a fact about the buyer, and a per-chat re-test could only ever
+  // produce the same answer more expensively.
+  const isTreasury = isTreasuryBuy(event.buyer, deps.treasuryWallet);
+
   const watchers = await repo.chatTokensForMint(event.mint);
   let queued = 0;
   let last: Omit<CardSummary, 'chatsPosted'> | null = null;
 
   for (const ct of watchers) {
     if (!ct.enabled) continue;
-    if (priced.usdIn < ct.minBuyUsd) continue; // below this group's floor: no card at all
+    // A TREASURY BUY BACK IGNORES THE GROUP'S FLOOR, and it is the only thing that does.
+    //
+    // `min_buy_usd` exists to keep a feed of strangers' dust out of a chat. A buy back is not that:
+    // it is the project itself, and a group that has asked to be told when the treasury buys means
+    // it whether the treasury spent $4,000 or $4. Sizing it out would make the card silently
+    // conditional on a number set for an entirely different purpose.
+    if (!isTreasury && priced.usdIn < ct.minBuyUsd) continue; // below this group's floor: no card at all
 
     // PLAN GATE, at the point of USE (Phase 11).
     //
@@ -82,7 +102,17 @@ export async function fanOut(event: BuyEvent, priced: Priced, deps: FanOutDeps):
     const caps = capabilities(await planOf(repo, ct.chatId));
     const eff = effective(ct, caps, DEFAULT_LINKS);
 
-    const picked = await media.pick(event.mint, ct.chatId, priced.usdIn, priced.whaleValueUsd);
+    // Treasury art comes from its own folder and NEVER from a tier (see MediaPool.pickTreasury).
+    // Note what is not consulted for a buy back: the priority chain. A treasury buy is not a size
+    // of buy, so it has no tier to earn — including no Whale, which is why the card carries no
+    // wallet-value line even when the treasury is holding a fortune in SOL.
+    const picked: Pick | null = isTreasury
+      ? {
+          earnedTier: TREASURY_NAME,
+          usedTier: TREASURY_FOLDER,
+          item: await media.pickTreasury(event.mint, ct.chatId),
+        }
+      : await media.pick(event.mint, ct.chatId, priced.usdIn, priced.whaleValueUsd);
     if (!picked) continue; // pickTier said no — should be unreachable after the floor check
 
     const token = await repo.getToken(event.mint);
@@ -176,6 +206,17 @@ async function resolveMedia(
   // Pool had nothing usable. Static is the next best thing; text-only is still a post.
   if (staticFileId) return { fileId: staticFileId, kind: staticKind ?? 'photo' };
   return { fileId: null, kind: null };
+}
+
+/**
+ * Is this buy the treasury's own?
+ *
+ * Exact address match, and NOTHING else — no prefix, no case folding (base58 is case-sensitive and
+ * two addresses differing only in case are two different accounts). An unset or empty
+ * `treasuryWallet` matches nothing, so the feature is off rather than loose.
+ */
+export function isTreasuryBuy(buyer: string, treasuryWallet: string | undefined): boolean {
+  return treasuryWallet !== undefined && treasuryWallet !== '' && buyer === treasuryWallet;
 }
 
 export { TIER_BY_NAME };

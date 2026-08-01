@@ -527,6 +527,42 @@ last resort (a $12 buy showing a hand-curated banger spends the pool's best art 
 ordinary event there is). With no art at all the post STILL GOES OUT: the chat's
 `static_file_id`, then a text-only card. **Never fail a post because a folder is empty.**
 
+### The Treasury Buy Back card (Phase 17)
+
+**A buy from `TREASURY_WALLET` cards as `🏦 TREASURY BUY BACK!` — the organic layout exactly, its
+own art folder, and no tier.** It is identified by WHO bought, not by how big the buy was, so it
+sits beside the size ladder rather than on it: `treasury/` is a media folder like `dca` (migration
+021 widens the same two CHECK constraints 015 did, by the same FK-safe rebuild), `TIER_FOLDERS`
+stays four, and `tier_headlines` stays four. `CardCategory = TierName | 'Treasury'` is what a
+card's copy is rendered from; nothing that asks *which tier is this buy* can answer `Treasury`.
+
+Three consequences, each deliberate and each tested:
+
+- **It ignores the group's `min_buy_usd`, and it is the only thing that does.** That floor exists
+  to keep a feed of strangers' dust out of a chat. A buy back is the project itself, and a group
+  that asked to be told when the treasury buys means it at $4 as much as at $4,000.
+- **The art never falls back to a tier folder.** An empty `treasury/` goes to the chat's static
+  image and then to text (NEVER FAIL A POST FOR WANT OF ART) — but never sideways into `regular/`,
+  because a buy back wearing an organic meme is the exact thing the separate folder prevents.
+- **No wallet-value line, ever.** 💰 exists to explain why a WHALE card fired; a buy back fired
+  because of who bought, so the line would explain nothing and would publish the treasury's own
+  balance on every card. It falls out for free — `Treasury` is not `Whale`.
+
+**It outranks both suppression rules in the buy handler, and is therefore asked first.** Against
+DCA: `isDca()` has a side effect (it attributes a wallet-mode fill so the aggregate can find it),
+so if the treasury ever ran buy backs through a recurring order, asking DCA first would file the
+buy into a window roll-up and the card would never fire. Against the burst digest: being buried in
+a "127 buys this minute" summary during the exact pump the treasury is supporting is the one moment
+the card most needs to be visible. `burst.record()` is still called either way — a buy back is a
+real buy and still counts toward whether the mint is bursting.
+
+**The wallet is config with a shipped default** (`TREASURY_WALLET`, the flagship's address), the
+same call as `JUPITER_RECURRING_PROGRAM_IDS`: which address holds a treasury is a fact about the
+deployment, but a feature that does nothing until someone edits an env file gets reported as broken.
+**The off switch is the literal `off`, not an empty value** — `dropEmpty()` strips blank env vars
+before the schema sees them, so `TREASURY_WALLET=` reads as *unset*, which with a default means ON.
+Matching is exact and case-sensitive on the address alone, on any mint this bot watches.
+
 ### `missing` is an accident; `removed` is an instruction
 
 Both are "gone from the manifest". They are opposites, and the DB tells them apart:
@@ -553,7 +589,7 @@ then archive the bytes), and a refresh landing between them would otherwise resu
 | Price | Trade-implied (`quote_in_usd / tokens_out`). SOL/USD from Binance.US WS primary + Coinbase WS secondary + REST bootstrap — same pattern as arbbot. |
 | Market cap | `getTokenSupply` (cached, 5 min TTL) × trade price |
 | Position % | Weighted-average cost basis per (mint, wallet), maintained locally. Optional Helius backfill. |
-| Media pool | One folder on the VPS: `/srv/media/<mint>/{regular,big,whale,massive}/`, owned by the bot (invariant 4). Single source of truth, consumed by RiceBuybot, onegrainofrice and RiceDAO. |
+| Media pool | One folder on the VPS: `/srv/media/<mint>/{regular,big,whale,massive,dca,treasury}/`, owned by the bot (invariant 4). The last two are CATEGORY folders, not tiers. Single source of truth, consumed by RiceBuybot, onegrainofrice and RiceDAO. |
 | Media rotation | Tier picked by USD, then a shuffle bag within the tier so no meme repeats until that tier is exhausted. |
 | Media manifest | `scripts/build-manifest.ts` walks the tiers and writes `manifest.json` atomically. Deterministic: an unchanged pool yields byte-identical bytes, so there is no `generated_at`. systemd timer every 5 min, plus on every `tier` move. |
 | Media primitives | `src/media/pool.ts` — tier constants, content-addressed naming, `locateInTiers`, the manifest schema. Pure + `node:fs`. **No DB, no config/env, no network**, so the timer runs whether or not the bot is installed. Imported by the scripts AND by the bot (Phase 8.5's DM flow needs `locateInTiers`). |

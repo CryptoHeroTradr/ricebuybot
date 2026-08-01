@@ -118,6 +118,7 @@ and reports **all** problems at once.
 | `STABLE_USD` | no | `1.0` | What a USDC/USDT quote is worth. A depeg is real; we do not hide it. |
 | `WHALE_BASIS` | no | `post` | Default for new chats. Per-chat via `/whalebasis`. |
 | `DAILY_SEND_CAP` | no | *off* | Optional per-chat daily card cap. |
+| `TREASURY_WALLET` | no | the flagship treasury | Buys from it card as **🏦 TREASURY BUY BACK!**, from the `treasury/` media folder. Set to `off` to disable — a blank value reads as *unset*, which means the default. |
 | `INGEST_MODE` | no | `ws` | `webhook` is the fallback adapter. |
 | `WEBHOOK_SECRET` | if webhook | — | Min 16 chars. The endpoint is public — treat it as a password. |
 | `BACKFILL_POSITIONS` | no | `true` | Seed cost basis from Helius history. |

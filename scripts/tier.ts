@@ -296,7 +296,9 @@ async function main(): Promise<void> {
     else if (dest === null) {
       if (!isDestination(arg)) {
         throw new PoolError(
-          `unknown destination: ${arg}\n  The four tiers are fixed: ${TIER_DIRS.join(', ')}. Plus 'archive'.`,
+          `unknown destination: ${arg}\n` +
+            `  The four tiers are fixed: ${TIER_DIRS.join(', ')}.\n` +
+            `  Plus the category folders (${MEDIA_DIRS.filter((d) => !TIER_DIRS.includes(d as Tier)).join(', ')}) and 'archive'.`,
         );
       }
       dest = arg;

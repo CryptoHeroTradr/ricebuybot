@@ -1,5 +1,13 @@
 import type { MediaItem, Mint, Signature, TokenMeta, Wallet } from '../core/types.js';
-import { DEFAULT_HEADLINES, TIERS, renderHeadline, type TierFolder, type TierName } from '../core/tiers.js';
+import {
+  DEFAULT_HEADLINES,
+  TIERS,
+  TREASURY_HEADLINE,
+  TREASURY_NAME,
+  renderHeadline,
+  type CardCategory,
+  type MediaFolder,
+} from '../core/tiers.js';
 import { Caption, type MessageEntity } from './entities.js';
 import { buildLadder } from './emoji.js';
 import { buildKeyboard, buyerUrl, txUrl, type Button } from './links.js';
@@ -25,10 +33,13 @@ export interface CardInput {
   readonly buyer: Wallet;
   readonly token: TokenMeta;
 
-  /** The tier the BUY earned. The headline comes from this and nothing else. */
-  readonly earnedTier: TierName;
+  /**
+   * What the buy earned: one of the four tiers, or `Treasury` (Phase 17 — the buyer is the
+   * project's treasury wallet). The headline comes from this and nothing else.
+   */
+  readonly earnedTier: CardCategory;
   /** The folder the art actually came from. May differ; it changes NOTHING about the copy. */
-  readonly usedTier: TierFolder | null;
+  readonly usedTier: MediaFolder | null;
   readonly media: MediaItem | null;
 
   readonly usdIn: number;
@@ -61,18 +72,24 @@ export interface Card {
 }
 
 /**
- * The headline for the EARNED tier.
+ * The headline for the EARNED category.
  *
  * A malformed `tier_headlines` falls back to the defaults rather than posting nothing. A
  * group that typed a broken JSON array into a config command should get a slightly
  * generic card, not silence — and certainly not a crash on every buy, forever, until
  * someone reads the logs.
+ *
+ * `Treasury` is answered before the ladder is consulted at all: it is not on the ladder, has no
+ * index into `tier_headlines`, and its headline is a schema constant (see core/tiers.ts). Doing it
+ * here rather than at the call site keeps the rule that the headline is a function of the earned
+ * category and nothing else — including for the one category that is not a tier.
  */
 export function headlineFor(
-  earned: TierName,
+  earned: CardCategory,
   headlines: readonly string[],
   symbol: string | null,
 ): string {
+  if (earned === TREASURY_NAME) return renderHeadline(TREASURY_HEADLINE, symbol);
   const i = TIERS.findIndex((t) => t.name === earned);
   const raw = headlines[i];
   const template = typeof raw === 'string' && raw.length > 0 ? raw : (DEFAULT_HEADLINES[i] as string);

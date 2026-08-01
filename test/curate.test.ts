@@ -405,19 +405,23 @@ describe('the gallery', () => {
     expect(text).toContain('DCA         7');
   });
 
-  it('the board keyboard carries a DCA button, on its own row below the four tiers', () => {
-    const rows = view.boardKeyboard('tok', { regular: 5, big: 5, whale: 5, massive: 5, dca: 7 });
-    // Four tiers in the first two rows, dca alone on the last.
+  it('the board keyboard carries the category buttons on their own row below the four tiers', () => {
+    const rows = view.boardKeyboard('tok', { regular: 5, big: 5, whale: 5, massive: 5, dca: 7, treasury: 2 });
+    // Four tiers in the first two rows; dca and treasury share the last — they are not tiers.
     expect(rows).toHaveLength(3);
-    expect(rows[2]).toHaveLength(1);
+    expect(rows[2]).toHaveLength(2);
     expect(rows[2]![0]!.text).toBe('DCA 7');
     expect(rows[2]![0]!.callback_data).toContain('t:dca');
+    expect(rows[2]![1]!.text).toBe('Treasury 2');
+    expect(rows[2]![1]!.callback_data).toContain('t:treasury');
   });
 
-  it('renders the dca folder’s display name as "DCA", not the raw folder', () => {
+  it('renders the category folders’ display names, not the raw folder', () => {
     expect(view.folderName('dca')).toBe('DCA');
+    expect(view.folderName('treasury')).toBe('Treasury');
     expect(view.folderName('whale')).toBe('Whale');
     expect(view.galleryCaption('dca', 0, 3)).toBe('DCA — 1/3');
+    expect(view.galleryCaption('treasury', 0, 3)).toBe('Treasury — 1/3');
   });
 });
 

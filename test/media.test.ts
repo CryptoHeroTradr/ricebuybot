@@ -527,3 +527,49 @@ describe('pickDca — the DCA aggregate card art', () => {
     expect(bagB).toBeNull(); // CHAT_B has never drawn — its bag does not exist yet
   });
 });
+
+/**
+ * Phase 17: the TREASURY BUY BACK card draws from its OWN `treasury/` folder, on its own shuffle
+ * bag — and an EMPTY treasury/ returns null rather than borrowing tier art. Same two rules as
+ * `dca`, for the same reason: the folder exists so a buy back is recognisable, and a buy back
+ * wearing a `regular/` meme is exactly what it is there to prevent.
+ */
+describe('pickTreasury — the treasury buy back card art', () => {
+  const TREASURY_POOL: FakeItem[] = [
+    ...POOL,
+    ...Array.from({ length: 3 }, (_, i) => ({ sha: `tre${i}`, tier: 'treasury' as MediaFolder, kind: 'photo' as MediaKind })),
+  ];
+
+  it('draws from the treasury folder, rotating through every meme before repeating', async () => {
+    const { pool } = await makePool(TREASURY_POOL);
+
+    const drawn: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const item = await pool.pickTreasury(MINT, CHAT);
+      expect(item).not.toBeNull();
+      expect(item!.tier).toBe('treasury'); // NEVER a tier meme
+      drawn.push(item!.sha256);
+    }
+    expect(new Set(drawn).size).toBe(3); // a full cycle, no repeat until treasury/ is exhausted
+  });
+
+  it('returns null on an EMPTY treasury folder even when every tier is stocked', async () => {
+    const { pool } = await makePool(POOL); // four tiers full, treasury empty
+    expect(await pool.pickTreasury(MINT, CHAT)).toBeNull();
+  });
+
+  it('draws on its OWN bag — a treasury pick never advances a tier bag, or the dca one', async () => {
+    const { pool } = await makePool([
+      ...TREASURY_POOL,
+      ...Array.from({ length: 2 }, (_, i) => ({ sha: `dca${i}`, tier: 'dca' as MediaFolder, kind: 'photo' as MediaKind })),
+    ]);
+
+    await pool.pickTreasury(MINT, CHAT);
+
+    expect(await repo.getBag(MINT, CHAT, 'treasury')).toHaveLength(2); // 3 - 1 drawn
+    expect(await repo.getBag(MINT, CHAT, 'dca')).toBeNull();
+    for (const tier of ['regular', 'big', 'whale', 'massive'] as const) {
+      expect(await repo.getBag(MINT, CHAT, tier)).toBeNull();
+    }
+  });
+});

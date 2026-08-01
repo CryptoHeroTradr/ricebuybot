@@ -58,10 +58,47 @@ export function isTierFolder(v: unknown): v is TierFolder {
  * uses MEDIA_FOLDERS. A folder that is neither remains a hard error.
  */
 export const DCA_FOLDER = 'dca';
-export type MediaFolder = TierFolder | typeof DCA_FOLDER;
 
-/** Every folder media may live in: the four tiers PLUS `dca`. Not a tier list. */
-export const MEDIA_FOLDERS: readonly MediaFolder[] = Object.freeze([...TIER_FOLDERS, DCA_FOLDER]);
+/**
+ * THE treasury FOLDER IS NOT A FIFTH TIER EITHER (Phase 17).
+ *
+ * Same reasoning as `dca`, one axis over. A treasury buy back is identified by WHO BOUGHT — the
+ * project's own treasury wallet — not by how big the buy was, so it cannot sit on the size ladder
+ * and it never competes with one: a buy is a treasury buy back or it is tiered, never both.
+ *
+ * It gets its own folder because the art is the whole point of the distinction. A buyback drawn
+ * from `regular/` is indistinguishable from any other buy at a glance, and the card exists
+ * precisely so a group can see at a glance that the treasury is buying.
+ */
+export const TREASURY_FOLDER = 'treasury';
+
+/**
+ * The headline for a treasury buy back, and it is a SCHEMA CONSTANT, not per-chat config.
+ *
+ * `tier_headlines` is a four-element array with a CHECK constraint that says four (see
+ * migration 015's note); a fifth entry would make every tier-headline reader carry a special
+ * case for the one headline that is not on the ladder. The DCA card's title is hardcoded for
+ * the same reason.
+ */
+export const TREASURY_NAME = 'Treasury';
+export const TREASURY_HEADLINE = '🏦 TREASURY BUY BACK!';
+
+export type MediaFolder = TierFolder | typeof DCA_FOLDER | typeof TREASURY_FOLDER;
+
+/**
+ * What a card's copy is rendered FROM: one of the four tiers, or `Treasury`.
+ *
+ * Not a widening of `TierName` — nothing that asks "which tier is this buy?" may answer
+ * `Treasury`, and the priority chain still returns a `TierSpec` and only a `TierSpec`.
+ */
+export type CardCategory = TierName | typeof TREASURY_NAME;
+
+/** Every folder media may live in: the four tiers PLUS `dca` and `treasury`. Not a tier list. */
+export const MEDIA_FOLDERS: readonly MediaFolder[] = Object.freeze([
+  ...TIER_FOLDERS,
+  DCA_FOLDER,
+  TREASURY_FOLDER,
+]);
 
 export function isMediaFolder(v: unknown): v is MediaFolder {
   return typeof v === 'string' && (MEDIA_FOLDERS as readonly string[]).includes(v);
