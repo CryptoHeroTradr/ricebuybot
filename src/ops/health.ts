@@ -24,6 +24,18 @@ export interface HealthSnapshot {
   readonly mediaItems: number;
   readonly mediaUploaded: number;
   readonly mediaPending: number;
+  /** The autotrader is wired at all (AUTOTRADER). False = no schedule can ever tick. */
+  readonly autotrader: boolean;
+  /**
+   * REAL SWAPS EXECUTE (TRADE_LIVE). False = the scheduler runs, claims slots and marks every one
+   * of them `failed` with error `dry-run` — the wallet is never touched.
+   *
+   * It is here because that is the single most confusing state this process has: the schedules
+   * look active, the executions look like real attempts, and `/history` shows a column of
+   * failures. An operator asking "why is nothing trading?" must be able to answer it from the
+   * outside, without the env file and without reading a boot log line that scrolled away.
+   */
+  readonly tradeLive: boolean;
 }
 
 /**

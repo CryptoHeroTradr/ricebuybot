@@ -305,6 +305,10 @@ async function main(): Promise<void> {
       mediaItems: items,
       mediaUploaded: uploaded,
       mediaPending: items - uploaded,
+      // The two flags that decide whether a DCA schedule can do anything at all. See the field
+      // docs: `tradeLive:false` is why an execution history can be a column of `failed`.
+      autotrader: cfg.AUTOTRADER,
+      tradeLive: cfg.TRADE_LIVE,
     };
   });
   shutdown.register('health', () => health.close());

@@ -288,11 +288,22 @@ export function registerTradePanel(bot: Bot, deps: TradePanelDeps): void {
     const n = Math.min(Math.max(Number(head) || 10, 1), 50);
     const rows = await repo.listExecutionsForUser(userId, n);
     if (rows.length === 0) return void ctx.reply('No executions yet.');
+    // THE REASON IS THE POINT OF THE LINE, and it used to be missing.
+    //
+    // A failed execution rendered as `failed $0.36  —`: the em dash is the absent SIGNATURE, so
+    // the row said only "it did not trade" — the one thing the reader could already see. The
+    // `error` column has been on `executions` since Phase 13 and nothing surfaced it, so the
+    // difference between "the executor is in dry-run" and "the price impact was too high" was a
+    // journalctl away from anyone who could act on it.
+    //
+    // Scrubbed, like every other outbound string: an error can carry a URL with an API key in it
+    // (INVARIANT 5), and this one goes to a chat window.
     const lines = rows.map((e) => {
       const when = new Date(e.plannedAt).toISOString().replace('T', ' ').slice(0, 16);
       const sig = e.signature ? `${e.signature.slice(0, 8)}…` : '—';
       const usd = e.usdValue != null ? ` $${e.usdValue.toFixed(2)}` : '';
-      return `${when}  ${e.state}${usd}  ${sig}`;
+      const why = e.error ? `\n     ↳ ${scrub(e.error).slice(0, 160)}` : '';
+      return `${when}  ${e.state}${usd}  ${sig}${why}`;
     });
     await ctx.reply([`Your last ${rows.length} executions:`, '', ...lines].join('\n'));
   });
